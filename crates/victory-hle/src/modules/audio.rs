@@ -471,7 +471,8 @@ impl Xma {
         // The decoder writes the same words.
         let mut slot = lock(&self.voices[index as usize]);
         let size = context.field(0, 22, 5).max(1);
-        let read = (context.field(9, 0, 5) + blocks) % size;
+        // The count is the title's: reduced first, so the sum stays small.
+        let read = (context.field(9, 0, 5) + blocks % size) % size;
         context.set_field(9, 0, 5, read);
         if blocks > 0 {
             context.set_field(1, 31, 1, 1);
@@ -491,9 +492,10 @@ impl Xma {
         let start = Instant::now();
         let mut active = 0;
         for index in 0..self.voices.len() as u32 {
-            if let (Some(context), Some(voice)) =
-                (self.context(index), &mut *lock(&self.voices[index as usize]))
-            {
+            if let (Some(context), Some(voice)) = (
+                self.context(index),
+                &mut *lock(&self.voices[index as usize]),
+            ) {
                 pump(context, voice);
                 active += 1;
             }
@@ -642,7 +644,10 @@ fn dump_input(index: u32, context: Context) {
     );
     let _ = std::fs::create_dir_all(&dir);
     let _ = std::fs::write(dir.join(format!("{n:02}-{index}.ctx")), words);
-    let _ = std::fs::write(dir.join(format!("{n:02}-{index}.xma")), input.unwrap_or_default());
+    let _ = std::fs::write(
+        dir.join(format!("{n:02}-{index}.xma")),
+        input.unwrap_or_default(),
+    );
 }
 
 /// Starts the decoding thread on the first enabled voice, and has it fill
@@ -1061,6 +1066,13 @@ mod tests {
         assert_eq!(produced(&xma()), Some(26 * SAMPLES_PER_BLOCK));
         assert_eq!(context.field(0, 20, 2), 0, "input used up");
         assert_eq!(context.field(2, 26, 5), INPUT_INVALID);
+
+        // A count near `u32::MAX` wraps the read block like any other
+        // (3 + 0xffff_ffff blocks on a ring of four is block 2); the sum
+        // used to overflow.
+        context.set_field(9, 0, 5, 3);
+        submit(ADVANCE_XMA_READ, &[1, u32::MAX]);
+        assert_eq!(context.field(9, 0, 5), 2);
 
         submit(DISABLE_XMA, &[1]);
         assert_eq!(produced(&xma()), None);

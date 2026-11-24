@@ -10,7 +10,7 @@ It is built on <a href="https://github.com/Marvisak/VIctory">VIctory</a>, which 
 <p align="center">
 <img alt="Apple Silicon M1 or newer" src="https://img.shields.io/badge/Apple%20Silicon-M1%2B-555555">
 <img alt="macOS 15 or newer" src="https://img.shields.io/badge/macOS-15%2B-blue">
-<img alt="265 tests passed" src="https://img.shields.io/badge/tests-265%20passed-2ea44f">
+<img alt="343 tests passed" src="https://img.shields.io/badge/tests-343%20passed-2ea44f">
 <img alt="GPL-3.0 licence" src="https://img.shields.io/badge/licence-GPL--3.0-lightgrey">
 </p>
 
@@ -31,9 +31,9 @@ Every part of VIctory now runs on an Apple Silicon Mac, and its full test suite 
 | Console runtime | Stands in for the Xbox: memory, files, saves, input, audio and network rules | Works |
 | GPU layer | Turns the console's Direct3D 12.X into desktop Direct3D 12 | Works on Metal through D3DMetal |
 | Shader recompiler | Recompiles the console GPU's shaders, checked against the hardware's results | All 69 checks pass on Metal |
-| Test suite | 265 tests across every crate | 265 passed, 0 failed |
+| Test suite | 343 tests across every crate | 343 passed, 0 failed |
 
-<p align="center"><img src="docs/images/tests.svg" width="640" alt="Terminal output of the test suite under CrossOver Wine with D3DMetal on an Apple M4: 265 passed and 0 failed"></p>
+<p align="center"><img src="docs/images/tests.svg" width="640" alt="Terminal output of the test suite under CrossOver Wine with D3DMetal on an Apple M4: 343 passed and 0 failed"></p>
 
 This is the real result of a clean run of `./setup.sh` followed by the test suite on a MacBook with an M4 chip.
 

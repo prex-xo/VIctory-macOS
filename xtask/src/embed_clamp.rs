@@ -8,8 +8,9 @@ use anyhow::{Context, Result};
 
 /// FNV-1a, the same hash `victory-gpu` takes of the source.
 fn fnv(data: &[u8]) -> u64 {
-    data.iter()
-        .fold(0xcbf2_9ce4_8422_2325, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
+    data.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+    })
 }
 
 fn array(data: &[u8]) -> String {
@@ -43,6 +44,10 @@ pub fn run(root: &Path, folder: &Path) -> Result<()> {
         array(&dxbc)
     );
     std::fs::write(src.join("clamp_bytecode.rs"), text).context("writing clamp_bytecode.rs")?;
-    println!("embedded {} bytes of DXIL and {} of DXBC", dxil.len(), dxbc.len());
+    println!(
+        "embedded {} bytes of DXIL and {} of DXBC",
+        dxil.len(),
+        dxbc.len()
+    );
     Ok(())
 }

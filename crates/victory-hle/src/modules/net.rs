@@ -1059,27 +1059,27 @@ mod tests {
                 named.name
             );
         }
-        // Every override names a real export of its DLL.
-        // Exports that Wine's DLLs lack. Their overrides check at run time
-        // or never call the host.
+        // Every override names a real export of its DLL. Some exports only
+        // exist on newer Windows (WinHttpGetProxySettingsEx is absent from
+        // Windows 10's winhttp.dll), and Wine lacks a few more. The HLE
+        // supplies those itself or checks for them at run time, so skip them
+        // only when the host really lacks them.
+        const NEWER_WINDOWS_ONLY: &[&str] = &["WinHttpGetProxySettingsEx"];
+        const WINE_LACKS: &[&str] = &["WSAConnectByList", "GetAddrInfoExA"];
         let wine = crate::host::function("ntdll.dll", "wine_get_version").is_some();
-        let wine_lacks = ["WSAConnectByList", "GetAddrInfoExA", "WinHttpGetProxySettingsEx"];
-        for e in m
-            .exports
-            .iter()
-            .filter(|e| !e.name.starts_with('#'))
-            .filter(|e| !(wine && wine_lacks.contains(&e.name)))
-        {
+        for e in m.exports.iter().filter(|e| !e.name.starts_with('#')) {
             let dll = if e.name.starts_with("WinHttp") {
                 "winhttp.dll"
             } else {
                 "ws2_32.dll"
             };
-            assert!(
-                crate::host::function(dll, e.name).is_some(),
-                "{dll} lacks {}",
-                e.name
-            );
+            let present = crate::host::function(dll, e.name).is_some();
+            if !present
+                && (NEWER_WINDOWS_ONLY.contains(&e.name) || wine && WINE_LACKS.contains(&e.name))
+            {
+                continue;
+            }
+            assert!(present, "{dll} lacks {}", e.name);
         }
     }
 }

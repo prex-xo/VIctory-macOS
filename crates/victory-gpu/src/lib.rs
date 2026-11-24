@@ -17,6 +17,8 @@
 
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg(windows)]
+mod clamp_bytecode;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
@@ -29,8 +31,6 @@ pub mod fence;
 pub mod frame;
 #[cfg(windows)]
 mod host;
-#[cfg(windows)]
-mod clamp_bytecode;
 #[cfg(windows)]
 mod indirect;
 pub mod list;

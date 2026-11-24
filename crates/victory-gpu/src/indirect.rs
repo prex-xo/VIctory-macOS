@@ -53,9 +53,9 @@ fn clamp() -> Option<&'static Clamp> {
 
 /// FNV-1a of the shader source, which names the bytecode it was built into.
 pub(crate) fn source_hash() -> u64 {
-    SOURCE
-        .bytes()
-        .fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
+    SOURCE.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+    })
 }
 
 fn make() -> windows::core::Result<Clamp> {
@@ -94,7 +94,10 @@ fn make() -> windows::core::Result<Clamp> {
         if let Some(errors) = errors {
             // SAFETY: the blob's own bytes.
             let text = unsafe {
-                std::slice::from_raw_parts(errors.GetBufferPointer().cast::<u8>(), errors.GetBufferSize())
+                std::slice::from_raw_parts(
+                    errors.GetBufferPointer().cast::<u8>(),
+                    errors.GetBufferSize(),
+                )
             };
             tracing::warn!("argument clamp: {}", String::from_utf8_lossy(text));
         }
@@ -186,7 +189,9 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
         Anonymous: D3D12_RESOURCE_BARRIER_0 {
-            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                pResource: std::mem::ManuallyDrop::new(None),
+            }),
         },
     }
 }

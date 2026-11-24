@@ -4,7 +4,7 @@
 //! CPU, so the machine code needs no translation. What differs is the
 //! platform underneath, so the loader's job is to:
 //!
-//! 1. [`prepare`] a lightly patched copy of the image (pure, portable): mark
+//! 1. [`prepare()`] a lightly patched copy of the image (pure, portable): mark
 //!    it as a DLL, remove its entry point and import directory, and detach
 //!    its TLS callbacks, so the Windows loader maps it, relocates it,
 //!    allocates its static TLS and registers its unwind tables, but runs
@@ -36,12 +36,12 @@ mod tls;
 #[cfg(windows)]
 mod windows;
 
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use crash::save_on_crash;
 #[cfg(windows)]
 pub use crash::{
     locate, log_crash, log_crashes_to, note_title_output, report_crashes, report_unhandled,
 };
-#[cfg(all(windows, feature = "diagnostics"))]
-pub use crash::save_on_crash;
 pub use prepare::{PrepareError, PreparedImage, prepare};
 pub use resolve::{ImportResolver, Provenance, Resolution};
 #[cfg(all(windows, feature = "diagnostics"))]

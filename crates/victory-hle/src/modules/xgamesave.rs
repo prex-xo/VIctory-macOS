@@ -256,8 +256,9 @@ fn commit(
         match source {
             Source::Data(data) => write(path, data)?,
             // Files are never changed in place, so sharing one is safe.
-            Source::Kept(from) => std::fs::hard_link(from, &path)
-                .or_else(|_| std::fs::copy(from, &path).map(drop))?,
+            Source::Kept(from) => {
+                std::fs::hard_link(from, &path).or_else(|_| std::fs::copy(from, &path).map(drop))?
+            }
         }
         step();
     }
@@ -362,11 +363,14 @@ fn take<T>(handle: *mut T) {
 
 impl Provider {
     /// The provider for the only user and `config` (the service
-    /// configuration id), under `saves`.
+    /// configuration id), under `saves`. An empty id names no
+    /// configuration, like none: as a folder name it would be the user's
+    /// folder itself, where the other configurations' folders are.
     fn open(saves: &Path, config: Option<&str>) -> Result<Provider, HRESULT> {
+        let config = config.filter(|c| !c.is_empty()).unwrap_or("default");
         let root = saves
             .join(format!("{:016X}", xuser::XUID))
-            .join(file_name(config.unwrap_or("default")));
+            .join(file_name(config));
         std::fs::create_dir_all(&root).map_err(|_| NO_ACCESS)?;
         let _saves = saves_lock();
         containers(&root); // converts old containers now
@@ -391,6 +395,21 @@ fn remaining(root: &Path) -> u64 {
     QUOTA
         .saturating_sub(used_bytes(root))
         .min(storage::disk_free(root))
+}
+
+/// Why an update writing `written` bytes, `replaced` of them over blobs it
+/// replaces, does not fit: past the per-user quota (`used` bytes kept), or
+/// past the host disk's `free` bytes, which is not the user's quota (the
+/// new version is written before the old one goes, so nothing it replaces
+/// counts there).
+fn no_room(written: u64, replaced: u64, used: u64, free: u64) -> Option<HRESULT> {
+    if written > QUOTA.saturating_sub(used) + replaced {
+        Some(QUOTA_EXCEEDED)
+    } else if written > free {
+        Some(OUT_OF_LOCAL_STORAGE)
+    } else {
+        None
+    }
 }
 
 fn io_error(dir: &Path, e: &std::io::Error) -> HRESULT {
@@ -442,12 +461,15 @@ impl Update {
         }
         let replaced: u64 = current.as_ref().map_or(0, |v| {
             let sizes = v.sizes();
-            let changed = sizes.iter().filter(|(n, _)| self.changes.iter().any(|(c, _)| c == n));
+            let changed = sizes
+                .iter()
+                .filter(|(n, _)| self.changes.iter().any(|(c, _)| c == n));
             changed.map(|(_, size)| size).sum()
         });
         let root = self.dir.parent().unwrap_or(&self.dir);
-        if written as u64 > remaining(root) + replaced {
-            return QUOTA_EXCEEDED;
+        let free = storage::disk_free(root);
+        if let Some(hr) = no_room(written as u64, replaced, used_bytes(root), free) {
+            return hr;
         }
         let display = self.display.as_deref();
         let display = display.or(current.as_ref().map(|v| v.display.as_str()));
@@ -494,7 +516,11 @@ fn read(c: &Container, names: Option<Vec<String>>) -> Result<Vec<(String, Vec<u8
     names
         .into_iter()
         .map(|name| {
-            let i = version.blobs.iter().position(|b| *b == name).ok_or(BLOB_NOT_FOUND)?;
+            let i = version
+                .blobs
+                .iter()
+                .position(|b| *b == name)
+                .ok_or(BLOB_NOT_FOUND)?;
             let data = std::fs::read(version.blob(i)).map_err(|e| io_error(&c.dir, &e))?;
             Ok((name, data))
         })
@@ -554,7 +580,12 @@ pub struct BlobInfo {
 
 /// Calls `callback` with the information of each container that passes
 /// `keep` until it returns false; never under our lock (it may call us).
-fn report(root: &Path, keep: impl Fn(&str) -> bool, context: *mut c_void, callback: ContainerCallback) {
+fn report(
+    root: &Path,
+    keep: impl Fn(&str) -> bool,
+    context: *mut c_void,
+    callback: ContainerCallback,
+) {
     let infos: Vec<(CString, CString, u32, u64, i64)> = {
         let _saves = saves_lock();
         containers(root)
@@ -786,6 +817,11 @@ extern "system" fn read_result(
 ) -> HRESULT {
     let mut used = 0;
     let hr = xasync::XAsyncGetResult(block, (&raw const READ).cast(), size, out.cast(), &mut used);
+    // The documented error for a small buffer; the result stays for a
+    // retry with a larger one.
+    if hr == xasync::E_NOT_SUFFICIENT_BUFFER {
+        return BUFFER_TOO_SMALL;
+    }
     if hr < 0 {
         return hr;
     }
@@ -945,6 +981,20 @@ mod tests {
         }
     }
 
+    /// The per-user quota and the host disk fail with their own errors.
+    #[test]
+    fn a_full_disk_is_not_the_quota() {
+        let mb = 1 << 20;
+        assert_eq!(no_room(2 * mb, 0, 0, mb), Some(OUT_OF_LOCAL_STORAGE));
+        assert_eq!(
+            no_room(2 * mb, 0, QUOTA - mb, 100 * mb),
+            Some(QUOTA_EXCEEDED)
+        );
+        // Replacing a blob of the same size fits a full quota.
+        assert_eq!(no_room(mb, mb, QUOTA, 100 * mb), None);
+        assert_eq!(no_room(mb, 0, 0, mb), None);
+    }
+
     fn update(root: &Path, display: &str, changes: &[(&str, Option<&str>)]) -> HRESULT {
         Update {
             name: "Slot".into(),
@@ -968,18 +1018,28 @@ mod tests {
     }
 
     fn old_state() -> Option<(String, Vec<(String, String)>)> {
-        Some(("one".into(), vec![("a".into(), "old a".into()), ("b".into(), "old b".into())]))
+        Some((
+            "one".into(),
+            vec![("a".into(), "old a".into()), ("b".into(), "old b".into())],
+        ))
     }
 
     /// Run by the crash test in a child process; does nothing otherwise.
     #[test]
     fn crash_child() {
-        let (Ok(root), Ok(op)) = (std::env::var("VICTORY_SAVE_CHILD"), std::env::var("VICTORY_SAVE_OP")) else {
+        let (Ok(root), Ok(op)) = (
+            std::env::var("VICTORY_SAVE_CHILD"),
+            std::env::var("VICTORY_SAVE_OP"),
+        ) else {
             return;
         };
         let root = PathBuf::from(root);
         let hr = if op == "update" {
-            update(&root, "two", &[("a", Some("new a")), ("b", None), ("c", Some("new c"))])
+            update(
+                &root,
+                "two",
+                &[("a", Some("new a")), ("b", None), ("c", Some("new c"))],
+            )
         } else {
             delete(&root, "Slot")
         };
@@ -992,15 +1052,25 @@ mod tests {
     /// new one.
     #[test]
     fn a_kill_at_any_step_leaves_old_or_new() {
-        let new = Some(("two".into(), vec![("a".into(), "new a".into()), ("c".into(), "new c".into())]));
+        let new = Some((
+            "two".into(),
+            vec![("a".into(), "new a".into()), ("c".into(), "new c".into())],
+        ));
         for (op, after) in [("update", new), ("delete", None)] {
             let mut seen = (0, 0);
             for stop in 1.. {
                 let dir = tempfile::tempdir().unwrap();
                 let root = dir.path();
-                assert_eq!(update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]), S_OK);
+                assert_eq!(
+                    update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]),
+                    S_OK
+                );
                 let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-                    .args(["--exact", "modules::xgamesave::tests::crash_child", "--nocapture"])
+                    .args([
+                        "--exact",
+                        "modules::xgamesave::tests::crash_child",
+                        "--nocapture",
+                    ])
                     .args(["--test-threads=1"])
                     .env("VICTORY_SAVE_CHILD", root)
                     .env("VICTORY_SAVE_OP", op)
@@ -1045,16 +1115,35 @@ mod tests {
         for good in ["Profile/Slot_1", "a/b/Save-2.sav", "x", &"a".repeat(256)] {
             assert!(valid_container(good), "{good}");
         }
-        for bad in ["a b", "", "a/", "a.", "a..b", "a.b/c", "a-b/c", &"a".repeat(257)] {
+        for bad in [
+            "a b",
+            "",
+            "a/",
+            "a.",
+            "a..b",
+            "a.b/c",
+            "a-b/c",
+            &"a".repeat(257),
+        ] {
             assert!(!valid_container(bad), "{bad}");
         }
 
         // Containers and blobs differing only in case, reserved device
         // names, characters the host forbids, long names: all distinct.
         let dir = tempfile::tempdir().unwrap();
-        let p = Provider { root: dir.path().into() };
+        let p = Provider {
+            root: dir.path().into(),
+        };
         let long = "n".repeat(300);
-        let blobs = ["A", "a", "CON", "nul.txt", "x/y:z*?\"<>|", long.as_str(), "end. "];
+        let blobs = [
+            "A",
+            "a",
+            "CON",
+            "nul.txt",
+            "x/y:z*?\"<>|",
+            long.as_str(),
+            "end. ",
+        ];
         for container in ["Save", "save", "SAVE/CON.x"] {
             let c = p.container(container);
             let u = Update {
@@ -1086,7 +1175,10 @@ mod tests {
     #[test]
     fn the_old_layout_moves_over() {
         let saves = tempfile::tempdir().unwrap();
-        let root = saves.path().join(format!("{:016X}", xuser::XUID)).join("scid");
+        let root = saves
+            .path()
+            .join(format!("{:016X}", xuser::XUID))
+            .join("scid");
         let old = root.join("Player");
         std::fs::create_dir_all(&old).unwrap();
         std::fs::write(old.join("Save%20Game%20Data"), b"data").unwrap();
@@ -1106,6 +1198,31 @@ mod tests {
         );
         let v = current_named(&c.dir, "Player").unwrap().unwrap();
         assert_eq!((v.number, v.display.as_str()), (1, "Chapter 1"));
+    }
+
+    /// An empty configuration id names none. As a folder name it would be
+    /// the folder every configuration lives in, whose folders then look
+    /// like containers of the old layout and are converted away.
+    #[test]
+    fn an_empty_configuration_id_is_the_default_one() {
+        let saves = tempfile::tempdir().unwrap();
+        let scid = Provider::open(saves.path(), Some("scid")).unwrap();
+        assert_eq!(update(&scid.root, "one", &[("a", Some("kept"))]), S_OK);
+        let kept = Some(("one".into(), vec![("a".into(), "kept".into())]));
+        assert_eq!(state(&scid.root), kept);
+
+        let empty = Provider::open(saves.path(), Some("")).unwrap();
+        assert!(scid.root.is_dir(), "another configuration's saves are gone");
+        assert_eq!(state(&scid.root), kept);
+        let default = Provider::open(saves.path(), None).unwrap();
+        assert_eq!(empty.root, default.root);
+
+        // Named configurations stay apart, from it and from each other.
+        assert_ne!(empty.root, scid.root);
+        assert_eq!(state(&empty.root), None);
+        let other = Provider::open(saves.path(), Some("other")).unwrap();
+        assert_eq!(state(&other.root), None);
+        assert_eq!(state(&scid.root), kept);
     }
 
     #[test]
@@ -1154,7 +1271,10 @@ mod tests {
             S_OK
         );
         type Delete = extern "system" fn(This, *mut Update, *const c_char) -> HRESULT;
-        assert_eq!(method::<Delete>(&OBJECT, 0xd0)(this, update, c"gone".as_ptr()), S_OK);
+        assert_eq!(
+            method::<Delete>(&OBJECT, 0xd0)(this, update, c"gone".as_ptr()),
+            S_OK
+        );
         type Submit = extern "system" fn(This, *const Update, *mut AsyncBlock) -> HRESULT;
         let mut b = block();
         assert_eq!(method::<Submit>(&OBJECT, 0xe0)(this, update, &mut b), S_OK);
@@ -1209,6 +1329,10 @@ mod tests {
         );
         let mut buffer = vec![0u64; size.div_ceil(8)];
         let mut count = 0;
+        assert_eq!(
+            read_result(this, &mut b, 8, buffer.as_mut_ptr().cast(), &mut count),
+            BUFFER_TOO_SMALL
+        );
         assert_eq!(
             read_result(this, &mut b, size, buffer.as_mut_ptr().cast(), &mut count),
             S_OK

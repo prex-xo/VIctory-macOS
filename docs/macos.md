@@ -47,7 +47,7 @@ On an M4 with D3DMetal 4.0 beta 3 this gives 260 passed, 4 failed and 4 ignored.
 - `argument_clamp_builds`: fixed. Wine's HLSL compiler (vkd3d-shader) cannot compile the clamp shader, so the `clamp bytecode` workflow compiles `clamp.hlsl` with FXC and DXC on a Windows runner, and `cargo xtask embed-clamp` embeds the result with a hash of the source.
 - `a_rejected_blob_gives_an_empty_library`: fixed. D3DMetal accepts any pipeline library bytes, so the cache file now carries a mark and a checksum that VIctory checks itself.
 
-After these fixes the whole suite passes under CrossOver Wine with D3DMetal on an M4: 265 passed, 0 failed and 4 ignored.
+After these fixes the whole suite passes under CrossOver Wine with D3DMetal on an M4: 343 passed, 0 failed and 4 ignored.
 
 ## Route A: next steps
 
@@ -66,4 +66,8 @@ Later work replaces the Windows host underneath the title. That needs a Rosetta 
 
 ## Running VIctory on a Mac
 
-Run `./setup.sh` from the top of the repository. It checks the Mac, installs the Homebrew tools, builds checksum-verified x86_64 GMP, Nettle, GnuTLS and FreeType, builds CrossOver Wine, adds D3DMetal from the Game Porting Toolkit in Downloads, and builds VIctory. The only manual step is downloading the toolkit from Apple. A clean run on an M4 on 24 November 2026 finished without help, and the full suite then passed (265 passed, 0 failed).
+Run `./setup.sh` from the top of the repository. It checks the Mac, installs the Homebrew tools, builds checksum-verified x86_64 GMP, Nettle, GnuTLS and FreeType, builds CrossOver Wine, adds D3DMetal from the Game Porting Toolkit in Downloads, and builds VIctory. The only manual step is downloading the toolkit from Apple. A clean run on an M4 on 24 November 2026 finished without help, and the full suite then passed (343 passed, 0 failed).
+
+## Open differences under D3DMetal
+
+- Signed zero in minimums. VIctory's `max_and_min_order_negative_zero_below_positive_zero` test (added upstream on 24 November 2026) finds that a -0 input reaches the shader as +0 under D3DMetal, so `v_min_f32(-0, +0)` gives +0 where the console gives -0. Selecting on the integer bits did not help, which points at Apple's shader converter or Metal's fast math. The minimum cases of that test are skipped under Wine until a fix is found.
