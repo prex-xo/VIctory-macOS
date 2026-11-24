@@ -1,47 +1,92 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="400" viewBox="0 0 1280 400" role="img" aria-label="VIctory for macOS: an Xbox Series runtime on Apple Silicon, shown as a chip with three stacked layers">
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="440" viewBox="0 0 1280 440" role="img" aria-label="VIctory for macOS: a neon tropical sunset over the sea with palm trees, a coastal skyline and a MacBook on the shore">
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#0f1226"/>
-      <stop offset="0.55" stop-color="#11203a"/>
-      <stop offset="1" stop-color="#0d2f3a"/>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#12082e"/>
+      <stop offset="0.45" stop-color="#5b1a6b"/>
+      <stop offset="0.75" stop-color="#e0457b"/>
+      <stop offset="1" stop-color="#ff9a5a"/>
     </linearGradient>
-    <linearGradient id="chip" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#e9e7f5"/>
-      <stop offset="1" stop-color="#9d98c4"/>
+    <linearGradient id="sun" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffe08a"/>
+      <stop offset="0.6" stop-color="#ff8a5c"/>
+      <stop offset="1" stop-color="#ff4f8b"/>
     </linearGradient>
-    <linearGradient id="glow" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0" stop-color="#3ee0c2"/>
-      <stop offset="1" stop-color="#4f8dff"/>
+    <linearGradient id="sea" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3a1a5c"/>
+      <stop offset="1" stop-color="#0b0820"/>
     </linearGradient>
-    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
-      <path d="M32 0H0V32" fill="none" stroke="#ffffff" stroke-opacity="0.05"/>
-    </pattern>
+    <linearGradient id="title" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#ffd6ec"/>
+    </linearGradient>
+    <clipPath id="sunclip"><rect x="0" y="0" width="1280" height="300"/></clipPath>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="6" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
   </defs>
-  <rect width="1280" height="400" fill="url(#bg)"/>
-  <rect width="1280" height="400" fill="url(#grid)"/>
-  <g transform="translate(150 200)">
-    <g stroke="#b7b2dc" stroke-width="4" stroke-linecap="round">
-      <path d="M-60 -95v-25M-30 -95v-25M0 -95v-25M30 -95v-25M60 -95v-25"/>
-      <path d="M-60 95v25M-30 95v25M0 95v25M30 95v25M60 95v25"/>
-      <path d="M-95 -60h-25M-95 -30h-25M-95 0h-25M-95 30h-25M-95 60h-25"/>
-      <path d="M95 -60h25M95 -30h25M95 0h25M95 30h25M95 60h25"/>
+
+  <rect width="1280" height="440" fill="url(#sky)"/>
+  <g fill="#ffffff" opacity="0.7">
+    <circle cx="90" cy="40" r="1.6"/><circle cx="240" cy="80" r="1.2"/><circle cx="410" cy="30" r="1.4"/>
+    <circle cx="860" cy="50" r="1.3"/><circle cx="1010" cy="24" r="1.6"/><circle cx="1180" cy="70" r="1.2"/>
+  </g>
+
+  <g clip-path="url(#sunclip)">
+    <circle cx="930" cy="300" r="150" fill="url(#sun)"/>
+    <g fill="#e0457b" opacity="0.85">
+      <rect x="770" y="232" width="320" height="6"/>
+      <rect x="770" y="252" width="320" height="8"/>
+      <rect x="770" y="272" width="320" height="10"/>
+      <rect x="770" y="290" width="320" height="10"/>
     </g>
-    <rect x="-95" y="-95" width="190" height="190" rx="26" fill="url(#chip)"/>
-    <rect x="-70" y="-70" width="140" height="140" rx="16" fill="#151233"/>
-    <rect x="-44" y="-40" width="88" height="18" rx="6" fill="url(#glow)" opacity="0.55"/>
-    <rect x="-44" y="-9" width="88" height="18" rx="6" fill="url(#glow)" opacity="0.8"/>
-    <rect x="-44" y="22" width="88" height="18" rx="6" fill="url(#glow)"/>
   </g>
-  <text x="330" y="175" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif" font-size="78" font-weight="800" fill="#ffffff">VIctory <tspan fill="url(#glow)">for macOS</tspan></text>
-  <text x="333" y="232" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif" font-size="28" fill="#cfcbe8">An Xbox Series runtime on Apple Silicon, through Wine and Metal</text>
-  <g font-family="Menlo, Consolas, monospace" font-size="20" fill="#e9e7f5">
-    <rect x="333" y="270" width="180" height="40" rx="20" fill="#ffffff" fill-opacity="0.08" stroke="#ffffff" stroke-opacity="0.18"/>
-    <text x="423" y="296" text-anchor="middle">Apple Silicon</text>
-    <rect x="527" y="270" width="190" height="40" rx="20" fill="#ffffff" fill-opacity="0.08" stroke="#ffffff" stroke-opacity="0.18"/>
-    <text x="622" y="296" text-anchor="middle">CrossOver Wine</text>
-    <rect x="731" y="270" width="140" height="40" rx="20" fill="#ffffff" fill-opacity="0.08" stroke="#ffffff" stroke-opacity="0.18"/>
-    <text x="801" y="296" text-anchor="middle">D3DMetal</text>
-    <rect x="885" y="270" width="110" height="40" rx="20" fill="#ffffff" fill-opacity="0.08" stroke="#ffffff" stroke-opacity="0.18"/>
-    <text x="940" y="296" text-anchor="middle">Rust</text>
+
+  <g fill="#1c0b33">
+    <rect x="800" y="246" width="24" height="54"/>
+    <rect x="830" y="222" width="30" height="78"/>
+    <rect x="866" y="254" width="20" height="46"/>
+    <rect x="1100" y="210" width="30" height="90"/>
+    <rect x="1136" y="186" width="22" height="114"/>
+    <rect x="1162" y="236" width="40" height="64"/>
+    <rect x="1206" y="220" width="24" height="80"/>
   </g>
+  <g fill="#ff9ad0" opacity="0.6">
+    <rect x="838" y="234" width="4" height="4"/><rect x="848" y="248" width="4" height="4"/><rect x="806" y="262" width="4" height="4"/>
+    <rect x="1142" y="200" width="4" height="4"/><rect x="1148" y="230" width="4" height="4"/><rect x="1108" y="232" width="4" height="4"/>
+  </g>
+
+  <rect y="300" width="1280" height="140" fill="url(#sea)"/>
+  <g stroke="#ff8ab8" stroke-linecap="round" opacity="0.55">
+    <path d="M860 320h140" stroke-width="4"/>
+    <path d="M880 340h100" stroke-width="3"/>
+    <path d="M900 360h60" stroke-width="3"/>
+    <path d="M915 378h30" stroke-width="2"/>
+  </g>
+
+  <g fill="#0b0618">
+    <path d="M1030 440 C1040 360 1050 300 1068 238 L1076 240 C1060 300 1052 362 1048 440 Z"/>
+    <path d="M1072 240 C1030 214 990 222 960 248 C1000 232 1036 236 1072 246 Z"/>
+    <path d="M1072 240 C1050 200 1012 186 978 192 C1016 204 1046 222 1068 246 Z"/>
+    <path d="M1072 240 C1092 196 1132 180 1170 190 C1132 202 1102 222 1078 246 Z"/>
+    <path d="M1072 240 C1112 222 1152 228 1186 254 C1146 240 1110 240 1076 248 Z"/>
+    <path d="M1072 240 C1070 206 1080 182 1100 170 C1090 192 1084 214 1078 244 Z"/>
+    <path d="M1180 440 C1186 384 1194 344 1206 300 L1212 302 C1202 344 1196 386 1194 440 Z"/>
+    <path d="M1210 300 C1180 282 1152 288 1132 306 C1160 296 1186 298 1210 306 Z"/>
+    <path d="M1210 300 C1228 274 1256 266 1280 272 C1256 282 1234 294 1214 306 Z"/>
+    <path d="M1210 300 C1198 274 1176 262 1152 264 C1178 274 1196 288 1206 306 Z"/>
+    <path d="M0 440 L0 404 C120 392 260 396 420 410 C560 420 700 424 820 440 Z"/>
+  </g>
+
+  <g transform="translate(600 352)">
+    <path d="M-62 30 L62 30 L74 40 L-74 40 Z" fill="#c9c3dd"/>
+    <rect x="-56" y="-38" width="112" height="70" rx="6" fill="#d8d3ea"/>
+    <rect x="-50" y="-32" width="100" height="58" rx="3" fill="#120a2a"/>
+    <rect x="-50" y="-32" width="100" height="58" rx="3" fill="url(#sky)" opacity="0.55"/>
+    <circle cx="14" cy="10" r="14" fill="url(#sun)"/>
+  </g>
+
+  <text x="64" y="150" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif" font-size="84" font-weight="900" fill="url(#title)" filter="url(#glow)">VIctory</text>
+  <text x="68" y="212" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif" font-size="46" font-weight="300" letter-spacing="10" fill="#ffd6ec">FOR macOS</text>
+  <text x="68" y="262" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif" font-size="24" fill="#ffe8f3" opacity="0.9">An Xbox Series runtime on Apple Silicon, through Wine and Metal</text>
 </svg>

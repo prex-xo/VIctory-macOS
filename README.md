@@ -1,4 +1,4 @@
-<p align="center"><img src="docs/images/banner.svg" alt="VIctory for macOS: an Xbox Series runtime on Apple Silicon"></p>
+<p align="center"><img src="docs/images/banner.svg" alt="VIctory for macOS: a neon tropical sunset with palm trees, a coastal skyline and a MacBook on the shore"></p>
 
 <h1 align="center">VIctory for macOS</h1>
 
