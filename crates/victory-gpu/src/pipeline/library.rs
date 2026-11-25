@@ -122,7 +122,7 @@ fn library() -> Option<&'static Mutex<Library>> {
     LIBRARY
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
-            let read = |file| DIR.get().and_then(|d| std::fs::read(d.join(file)).ok());
+            let read = |file| DIR.get().and_then(|d| crate::read_file(&d.join(file)).ok());
             let blob = read(LIBRARY_FILE).and_then(unseal).unwrap_or_default();
             let tag = tag(&blob);
             let mut library = open(&device, blob);
@@ -171,11 +171,34 @@ fn unseal(file: Vec<u8>) -> Option<Vec<u8>> {
 /// adapter or driver change, damage).
 fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
-        // SAFETY: the bytes outlive the library (kept beside it).
+        // The `windows` binding hands the method the pointer of the slice it
+        // is given, and the pointer of an empty Rust slice is dangling rather
+        // than null. D3DMetal 3.0 reads any non-null pointer as a serialized
+        // blob, even at length zero, and refuses it, so the fallback that
+        // starts an empty library fails too and a run is left with no host
+        // pipeline library at all. The method's blob is optional, so an empty
+        // library is made through the vtable with a null pointer. (Found by
+        // nickorlabs in #28; measured here on an M5 Pro with CrossOver 26.3's
+        // D3DMetal 3.0.)
+        let data = if bytes.is_empty() {
+            core::ptr::null()
+        } else {
+            bytes.as_ptr().cast::<core::ffi::c_void>()
+        };
+        let mut raw = core::ptr::null_mut();
+        // SAFETY: `device` is a live device, and `bytes` outlives the call
+        // because the blob is kept beside the library. A null pointer with
+        // size 0 is what the method documents for "no initial data".
         unsafe {
-            device
-                .CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?
-                .cast()
+            (device.vtable().CreatePipelineLibrary)(
+                device.as_raw(),
+                data,
+                bytes.len(),
+                &ID3D12PipelineLibrary::IID,
+                &mut raw,
+            )
+            .ok()?;
+            ID3D12PipelineLibrary::from_raw(raw).cast()
         }
     };
     if !blob.is_empty() {
@@ -365,7 +388,7 @@ pub(crate) fn save(now: bool) {
         }
     };
     let used = USED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(Used::list).unwrap_or_default();
-    let written = std::fs::create_dir_all(dir)
+    let written = crate::make_dir(dir)
         .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &seal(&blob)))
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
         .and_then(|()| match &prebuilt {
@@ -451,7 +474,7 @@ fn used() -> std::sync::MutexGuard<'static, Option<Used>> {
     if used.is_none() {
         let listed = DIR
             .get()
-            .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
+            .and_then(|d| crate::read_file(&d.join(EARLY_FILE)).ok().and_then(|b| String::from_utf8(b).ok()))
             .unwrap_or_default();
         let before: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
         tracing::info!(pipelines = before.len(), "title pipelines to start early");

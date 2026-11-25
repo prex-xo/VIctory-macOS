@@ -47,10 +47,14 @@ impl Cache {
     }
 
     /// Returns the cached output for `input`, converting it first if needed.
+    ///
+    /// Asks for no file's or folder's metadata, which under Wine is a call
+    /// to its mount manager: the pipeline workers look up every shader here,
+    /// and such calls have hung them (VIctory-macOS issue #50).
     pub fn get_or_convert(&self, converter: &dyn Converter, input: &[u8]) -> Result<PathBuf> {
         let key = CacheKey::new(converter, input);
         let path = self.path_for(&key);
-        if path.is_file() {
+        if published(&path) {
             tracing::trace!(converter = converter.id(), key = %key.to_hex(), "cache hit");
             return Ok(path);
         }
@@ -58,7 +62,7 @@ impl Cache {
             .convert(input)
             .with_context(|| format!("converter {} v{}", converter.id(), converter.version()))?;
         let dir = path.parent().expect("hashed path has a parent");
-        std::fs::create_dir_all(dir)?;
+        make_dir(dir)?;
         // Write-then-rename so readers never see partial output.
         let (tmp, mut file) = tempfile_in(dir)?;
         let written = file.write_all(&output);
@@ -69,6 +73,28 @@ impl Cache {
         }
         published?;
         Ok(path)
+    }
+}
+
+/// Whether `path` holds an entry. On Windows the file is opened instead of
+/// asked for its metadata (`Path::is_file`), whose volume serial number Wine
+/// gets from its mount manager. A folder does not open as a file there.
+fn published(path: &Path) -> bool {
+    if cfg!(windows) {
+        File::open(path).is_ok()
+    } else {
+        path.is_file()
+    }
+}
+
+/// Makes folder `dir` unless it is there. Not `create_dir_all` alone, which
+/// asks for the metadata of a folder that is there (`Path::is_dir`); the
+/// cache's 256 folders are there after the first few hundred entries.
+fn make_dir(dir: &Path) -> io::Result<()> {
+    match std::fs::create_dir(dir) {
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => std::fs::create_dir_all(dir),
+        made => made,
     }
 }
 
@@ -213,6 +239,28 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
         assert_eq!(counter.load(Ordering::Relaxed), 1);
         assert!(!missing.exists());
+    }
+
+    #[test]
+    fn folders_are_made_once_with_their_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        let deep = dir.path().join("a").join("b");
+        make_dir(&deep).unwrap();
+        assert!(deep.is_dir());
+        make_dir(&deep).unwrap();
+        std::fs::write(deep.join("kept"), b"kept").unwrap();
+        make_dir(&deep).unwrap();
+        assert_eq!(std::fs::read(deep.join("kept")).unwrap(), b"kept");
+    }
+
+    #[test]
+    fn only_files_count_as_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(published(&file));
+        assert!(!published(&dir.path().join("missing")));
+        assert!(!published(dir.path()));
     }
 
     #[test]

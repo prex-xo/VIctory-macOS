@@ -478,6 +478,13 @@ fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
     let mut taken = Vec::with_capacity(pages.len());
     let busy = |page: usize| g.busy.iter().any(|&(a, b)| (a..b).contains(&page));
     let pages: Vec<usize> = pages.iter().copied().filter(|&p| !busy(p)).collect();
+    // Only the runtime's GPU memory is guarded. A tracked range can start
+    // in free or reserved memory and run on into the host's own pages: in
+    // #50 that guarded the process heap's header, and a thread holding the
+    // heap lock then faulted while another held `Guards` and allocated,
+    // a deadlock. Pages left out stay changed, so they are copied whole.
+    let mut allowed = RuntimeRegions::default();
+    let pages: Vec<usize> = pages.into_iter().filter(|&p| allowed.contains(p)).collect();
     let mut i = 0;
     while i < pages.len() {
         if g.protected.contains(&pages[i]) {
@@ -509,6 +516,40 @@ fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
         }
     }
     taken
+}
+
+/// Which pages are the runtime's GPU memory ([`runtime_memory`]), asked
+/// once per memory region: a region shares its state, type and write watch.
+#[derive(Default)]
+struct RuntimeRegions {
+    /// The last region asked about: its pages and whether it is runtime
+    /// memory.
+    last: Option<(usize, usize, bool)>,
+}
+
+impl RuntimeRegions {
+    fn contains(&mut self, page: usize) -> bool {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+        if let Some((a, b, yes)) = self.last
+            && (a..b).contains(&page)
+        {
+            return yes;
+        }
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery((page * PAGE) as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 {
+            return false;
+        }
+        let yes = runtime_memory(page * PAGE, true);
+        let (base, size) = (info.BaseAddress as usize, info.RegionSize);
+        // In our pages, rounded inward so the region never claims a page it
+        // only shares.
+        let (a, b) = (base.div_ceil(PAGE).min(page), ((base + size) / PAGE).max(page + 1));
+        self.last = Some((a, b, yes));
+        yes
+    }
 }
 
 /// Pages `[first, last)` changed, and so the pages showing the same memory
@@ -746,6 +787,36 @@ pub(crate) mod tests {
 
     /// Everything is changed at first; after taking, only what is written
     /// (by faults, or reported) is, and every tracker of a page sees it.
+    /// A tracked range that starts in reserved memory and runs into plain
+    /// committed memory (the host's, as the process heap was in #50) never
+    /// makes that memory read-only; it stays changed instead.
+    #[test]
+    fn plain_committed_memory_is_never_guarded() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualQuery,
+        };
+        // SAFETY: plain reservation and commit of our own memory.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert_ne!(base, 0);
+        // The last two blocks committed as plain private memory.
+        // SAFETY: inside our reservation.
+        assert!(!unsafe { VirtualAlloc((base + 2 * PAGE) as *const _, 2 * PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+        let t = track(base, 4 * PAGE, true).expect("reserved memory counts as runtime memory");
+        let _ = t.take(base, base + 4 * PAGE);
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        unsafe { VirtualQuery((base + 2 * PAGE) as *const _, &mut info, size_of_val(&info)) };
+        assert_eq!(info.Protect, PAGE_READWRITE, "still writable");
+        assert!(t.changed(base / PAGE + 2) && t.changed(base / PAGE + 3), "stays changed");
+        // SAFETY: writable, so no fault.
+        unsafe { ((base + 2 * PAGE + 8) as *mut u8).write_volatile(1) };
+        drop(t);
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
     #[test]
     fn writes_mark_every_tracker_of_their_page() {
         let p = pool(4);

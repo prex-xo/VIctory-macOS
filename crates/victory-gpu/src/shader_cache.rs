@@ -185,7 +185,7 @@ fn cached(
                 break;
             }
         };
-        if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
+        if let Some(shader) = crate::read_file(&path).ok().and_then(|b| decode(&b)) {
             let hit = !converter.ran.load(Ordering::Relaxed);
             let (counter, what) = if hit {
                 (&HITS, "from the cache")
