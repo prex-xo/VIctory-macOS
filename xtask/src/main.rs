@@ -1,6 +1,7 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
 mod embed_clamp;
+mod embed_test_shaders;
 mod policy;
 
 use std::path::{Path, PathBuf};
@@ -30,6 +31,9 @@ enum Cmd {
     /// Write crates/victory-gpu/src/clamp_bytecode.rs from the output of
     /// the clamp-bytecode workflow (a folder with clamp.dxil and clamp.dxbc).
     EmbedClamp { folder: PathBuf },
+    /// Write crates/victory-gpu/src/fxc_bytecode.rs from the output of the
+    /// test-shaders workflow (a folder of `<key>.bin` files).
+    EmbedTestShaders { folder: PathBuf },
 }
 
 fn main() -> Result<()> {
@@ -37,6 +41,7 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Cmd::Policy { staged } => policy::run(&root, staged),
         Cmd::EmbedClamp { folder } => embed_clamp::run(&root, &folder),
+        Cmd::EmbedTestShaders { folder } => embed_test_shaders::run(&root, &folder),
         Cmd::InstallHooks => {
             let status = Command::new("git")
                 .args(["config", "core.hooksPath", ".githooks"])

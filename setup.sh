@@ -27,7 +27,13 @@ missing=()
 for f in $wanted; do brew list --formula "$f" > /dev/null 2>&1 || missing+=("$f"); done
 if (( ${#missing} )); then
   say "installing ${missing[*]} with Homebrew"
-  brew install "${missing[@]}"
+  # brew exits with an error when a post-install step fails, even if the
+  # formula itself installed (rustup's can fail on a completion link it may
+  # not write). Ask Homebrew what is installed instead of trusting the exit.
+  brew install "${missing[@]}" || true
+  failed=()
+  for f in $missing; do brew list --formula "$f" > /dev/null 2>&1 || failed+=("$f"); done
+  (( ${#failed} == 0 )) || die "Homebrew could not install ${failed[*]}. See its output above, fix that and run ./setup.sh again"
 fi
 export PATH="$BREW/opt/rustup/bin:$PATH"
 

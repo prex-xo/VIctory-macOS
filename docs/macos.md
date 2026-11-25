@@ -47,7 +47,20 @@ On an M4 with D3DMetal 4.0 beta 3 this gives 260 passed, 4 failed and 4 ignored.
 - `argument_clamp_builds`: fixed. Wine's HLSL compiler (vkd3d-shader) cannot compile the clamp shader, so the `clamp bytecode` workflow compiles `clamp.hlsl` with FXC and DXC on a Windows runner, and `cargo xtask embed-clamp` embeds the result with a hash of the source.
 - `a_rejected_blob_gives_an_empty_library`: fixed. D3DMetal accepts any pipeline library bytes, so the cache file now carries a mark and a checksum that VIctory checks itself.
 
-After these fixes the whole suite passes under CrossOver Wine with D3DMetal on an M4: 343 passed, 0 failed and 4 ignored.
+After these fixes the whole suite passed under CrossOver Wine with D3DMetal on an M4: 343 passed, 0 failed and 4 ignored. After the merge of 25 November 2026 and the fixes below it gives 481 passed, 0 failed and 7 ignored.
+
+## Run-time HLSL and textures under Wine and D3DMetal
+
+Under Wine, `D3DCompile` is Wine's HLSL compiler (vkd3d-shader). In CrossOver 26.3 Wine it differs from Microsoft's compilers in four ways that matter here:
+
+- It ignores `[RootSignature]` (warning W5302) and writes no root signature into the bytecode, so `CreateRootSignature` on that bytecode fails with `E_FAIL`. Build run-time compute shaders with `compute::pipeline` in `victory-gpu`, which serializes the root signature itself.
+- `RWByteAddressBuffer` has no `Load`, and `RWStructuredBuffer` stores are not implemented. The depth converter in `twin.rs` reads its scratch buffer through a structured view and writes it through a raw one.
+- Shader model 5.1 resource arrays are not implemented, bounded or unbounded (`E_NOTIMPL`), and `NonUniformResourceIndex` is not defined. Shaders that need them have to be compiled on Windows, as the clamp shader is. The one test that needs them (`lists_share_a_table_and_copies_keep_their_views`) prints that it was skipped.
+- It still compiles plain `cs_5_1` shaders, and D3DMetal runs their bytecode.
+
+D3DMetal has no Metal format for `R10G10B10_XR_BIAS_A2_UNORM`. It refuses any castable format list that names it, and creating a texture in that format stops the process in Metal's validation. `castable` leaves it out, so 4-byte colour textures of one memory share one host texture under D3DMetal too.
+
+D3DMetal rounds float depth down when it stores 24-bit depth (a clear to 0.5 stores 8388607, not 8388608), where Windows GPUs round to nearest.
 
 ## Route A: next steps
 
@@ -68,6 +81,21 @@ Later work replaces the Windows host underneath the title. That needs a Rosetta 
 
 Run `./setup.sh` from the top of the repository. It checks the Mac, installs the Homebrew tools, builds checksum-verified x86_64 GMP, Nettle, GnuTLS and FreeType, builds CrossOver Wine, adds D3DMetal from the Game Porting Toolkit in Downloads, and builds VIctory. The only manual step is downloading the toolkit from Apple. A clean run on an M4 on 24 November 2026 finished without help, and the full suite then passed (343 passed, 0 failed).
 
+## D3DMetal's shader cache needs unique shader hashes
+
+D3DMetal keeps a compiled-shader cache for each executable, in `$(getconf DARWIN_USER_CACHE_DIR)d3dm/<exe name>/shaders.cache`. It finds shaders by the DXIL container's shader hash (the `HASH` part), apparently together with the shader's length: two shaders collided only when their lengths matched. VIctory used to write the same all-zero shader hash into every container. So two different shaders of the same length shared a cache entry, and the one compiled second ran the first one's code. The cache is on disk, so the wrong code also came back on every later run of that executable.
+
+This was the "signed zero in minimums" difference listed here before. Each `v_min_f32` and `v_min3_f32` test shader is the same length as the maximum built just before it, so the minimum ran the maximum's code and gave +0 where the console gives -0. Selecting on the integer bits could not help, because the shader that ran was never the one being changed. It also made `v_cmp_class_f16_matches_rdna2` fail whenever the max/min test ran before it, as it does with `--test-threads=1`. The `v_max3_f32` shader and that test's first shader are both 2316 bytes.
+
+`container::shader_hash` now writes the MD5 of the program into the `HASH` part. The minimum cases run under Wine again, and both tests pass in every order on an M5 Pro with D3DMetal 4.0 beta 3. Cache entries written under the old zero hash are never looked up again, so old caches need no cleaning.
+
 ## Open differences under D3DMetal
 
-- Signed zero in minimums. VIctory's `max_and_min_order_negative_zero_below_positive_zero` test (added upstream on 24 November 2026) finds that a -0 input reaches the shader as +0 under D3DMetal, so `v_min_f32(-0, +0)` gives +0 where the console gives -0. Selecting on the integer bits did not help, which points at Apple's shader converter or Metal's fast math. The minimum cases of that test are skipped under Wine until a fix is found.
+The merge of VIctory's changes up to 70564ae on 25 November 2026 brought new shader tests, and three of them find real differences in D3DMetal 4.0 beta 3 on an M4. The tests skip only those checks under Wine, so the rest of each test still runs.
+
+- 64-bit image atomics. D3DMetal reports `AtomicInt64OnTypedResourceSupported` and `AtomicInt64OnDescriptorHeapResourceSupported`, so `victory_gpu` builds pipelines that use them, but the atomics in `image_atomics_of_64_bits` leave every texel at zero. The game's alpha prepasses use them, so those prepasses will be wrong on a Mac until the translator emulates them or D3DMetal is fixed. The test host now also checks the two features, as the runtime does.
+- Sample bias in compute programs. In `image_addresses_of_16_bits_and_clamps`, a sample with a bias of 1 reads level 1 where the console reads level 2, so the bias is ignored. The gather and clamp cases of that test pass.
+- 24-bit depth. Apple GPUs have no 24-bit depth format, so D3DMetal keeps it as 32-bit float. A depth clear of 0.5 then reads back one step lower once VIctory converts it to the console's 16 bits (32767 where Windows gives 32768), so `a_depth_texture_written_through_unordered_views_reads_as_depth` allows one step there.
+- Gather positions. D3DMetal's gather truncates the position where the console rounds it, as WARP's does, so `gathers_at_a_level_match_the_hardware` skips the same comparison it already skipped for WARP.
+
+The seven victory-gpu tests that compile HLSL at run time now take the bytes that Microsoft's FXC made on a Windows runner (the test-shaders workflow and `cargo xtask embed-test-shaders`), because Wine's compiler cannot build them. The depth conversion in `twin.rs` goes through the same table, so depth textures written through unordered views are converted on the Mac too.

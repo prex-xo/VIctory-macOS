@@ -10,7 +10,7 @@ It is built on <a href="https://github.com/Marvisak/VIctory">VIctory</a>, which 
 <p align="center">
 <img alt="Apple Silicon M1 or newer" src="https://img.shields.io/badge/Apple%20Silicon-M1%2B-555555">
 <img alt="macOS 15 or newer" src="https://img.shields.io/badge/macOS-15%2B-blue">
-<img alt="343 tests passed" src="https://img.shields.io/badge/tests-343%20passed-2ea44f">
+<img alt="481 tests passed" src="https://img.shields.io/badge/tests-481%20passed-2ea44f">
 <img alt="GPL-3.0 licence" src="https://img.shields.io/badge/licence-GPL--3.0-lightgrey">
 </p>
 
@@ -19,7 +19,7 @@ If you want to see GTA VI on a Mac, please star the repo and read <a href="CONTR
 </p>
 
 > [!IMPORTANT]
-> **The game is not playable yet, on the Mac or anywhere else.** VIctory on Windows boots the game, runs its menus and loads the world, but the world does not render yet. This project makes the whole VIctory platform run on a Mac, so the Mac moves forward as VIctory does. No game files are included here or ever will be. You need your own copy of the game.
+> **The game is not playable yet, on the Mac or anywhere else.** VIctory on Windows boots the game, runs its menus, loads the world and now draws it, but only at one or two seconds per frame and with unlit surfaces and missing geometry. This project makes the whole VIctory platform run on a Mac, so the Mac moves forward as VIctory does. No game files are included here or ever will be. You need your own copy of the game.
 
 ## What works today
 
@@ -31,9 +31,9 @@ Every part of VIctory now runs on an Apple Silicon Mac, and its full test suite 
 | Console runtime | Stands in for the Xbox: memory, files, saves, input, audio and network rules | Works |
 | GPU layer | Turns the console's Direct3D 12.X into desktop Direct3D 12 | Works on Metal through D3DMetal |
 | Shader recompiler | Recompiles the console GPU's shaders, checked against the hardware's results | All 69 checks pass on Metal |
-| Test suite | 343 tests across every crate | 343 passed, 0 failed |
+| Test suite | 488 tests across every crate | 481 passed, 0 failed, 7 ignored |
 
-<p align="center"><img src="docs/images/tests.svg" width="640" alt="Terminal output of the test suite under CrossOver Wine with D3DMetal on an Apple M4: 343 passed and 0 failed"></p>
+<p align="center"><img src="docs/images/tests.svg" width="640" alt="Terminal output of the test suite under CrossOver Wine with D3DMetal on an Apple M4: 481 passed and 0 failed"></p>
 
 This is the real result of a clean run of `./setup.sh` followed by the test suite on a MacBook with an M4 chip.
 

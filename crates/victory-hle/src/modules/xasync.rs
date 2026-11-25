@@ -610,6 +610,10 @@ pub fn XAsyncComplete(block: *mut AsyncBlock, result: HRESULT, required_size: us
     *done = true;
     call.finished.notify_all();
     drop(done);
+    // Taken after the store, so a waiter that saw the old status under this
+    // lock is already waiting.
+    drop(lock(&PUBLISHED.0));
+    PUBLISHED.1.notify_all();
     if routine.is_some() {
         let task = Task::new(block.cast(), complete);
         match queue(handle) {
@@ -623,12 +627,28 @@ pub fn XAsyncGetStatus(block: *mut AsyncBlock, wait: bool) -> HRESULT {
     if block.is_null() {
         return E_INVALIDARG;
     }
-    if wait && let Some(call) = call(block) {
-        let done = lock(&call.done);
-        drop(call.finished.wait_while(done, |d| !*d));
+    if wait {
+        if let Some(call) = call(block) {
+            let done = lock(&call.done);
+            drop(call.finished.wait_while(done, |d| !*d));
+        } else {
+            // A failing call leaves the table before its status is published
+            // (its cleanup must run while the block is still the title's), so
+            // a pending status here means it is completing right now.
+            let published = lock(&PUBLISHED.0);
+            drop(
+                PUBLISHED
+                    .1
+                    .wait_while(published, |_| status(block) == E_PENDING),
+            );
+        }
     }
     status(block)
 }
+
+/// Woken whenever a call's status is published, for a waiter that found the
+/// call already gone from the table (see [`XAsyncGetStatus`]).
+static PUBLISHED: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
 pub fn XAsyncGetResultSize(block: *mut AsyncBlock, out: *mut usize) -> HRESULT {
     if block.is_null() || out.is_null() {
@@ -1361,5 +1381,46 @@ mod tests {
             E_ABORT
         );
         XTaskQueueCloseHandle(q);
+    }
+
+    /// A failing call leaves the call table before its status is published
+    /// (cleanup must run while the block is still the title's). A waiter
+    /// that looks in between must still wait, not report `E_PENDING`.
+    #[test]
+    fn waiting_on_a_failing_call_never_reports_pending() {
+        use std::sync::mpsc::{Sender, channel};
+        // The provider's cleanup holds the call in that gap: it says when it
+        // starts, then takes its time.
+        static CLEANING: Mutex<Option<Sender<()>>> = Mutex::new(None);
+        extern "system" fn provider(op: u32, _: *const ProviderData) -> HRESULT {
+            if op == OP_CLEANUP {
+                if let Some(tx) = lock(&CLEANING).take() {
+                    let _ = tx.send(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            S_OK
+        }
+        let (tx, rx) = channel();
+        *lock(&CLEANING) = Some(tx);
+        let mut b = AsyncBlock {
+            queue: std::ptr::null(),
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        };
+        let block: *mut AsyncBlock = &mut b;
+        let (context, identity, name) = (std::ptr::null_mut(), std::ptr::null(), std::ptr::null());
+        assert_eq!(
+            XAsyncBegin(block, context, identity, name, Some(provider)),
+            S_OK
+        );
+        let address = block as usize;
+        let worker =
+            std::thread::spawn(move || XAsyncComplete(address as *mut AsyncBlock, E_ABORT, 0));
+        // The call has left the table and its status is not published yet.
+        rx.recv().unwrap();
+        assert_eq!(XAsyncGetStatus(block, true), E_ABORT);
+        worker.join().unwrap();
     }
 }

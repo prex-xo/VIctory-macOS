@@ -64,6 +64,30 @@ impl SigElement {
 }
 
 /// `ISG1`/`OSG1`: 32-byte rows, then the names.
+/// Gives the elements of a row whose interpolation mode nothing decided
+/// (float elements, unless `read` and read) the mode the row's other
+/// elements agree on: DXIL wants one mode per row, and the console's
+/// signature, packed by the source's modes, had one (an int or a system
+/// value beside a float means the float was `nointerpolation`).
+pub(crate) fn same_mode_per_row(elements: &mut [SigElement], read: bool) {
+    let free = |e: &SigElement| e.kind == 0 && e.comp == 9 && !(read && e.usage != 0);
+    let mut rows: Vec<u32> = elements.iter().filter_map(|e| e.row).collect();
+    rows.sort_unstable();
+    rows.dedup();
+    for row in rows {
+        let decided = |e: &&SigElement| e.row == Some(row) && !free(e) && e.interp != 0;
+        let mut modes = elements.iter().filter(decided).map(|e| e.interp);
+        let Some(mode) = modes.next() else { continue };
+        if modes.any(|m| m != mode) {
+            continue;
+        }
+        let undecided = |e: &&mut SigElement| e.row == Some(row) && free(e);
+        for e in elements.iter_mut().filter(undecided) {
+            e.interp = mode;
+        }
+    }
+}
+
 pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend((elements.len() as u32).to_le_bytes());
@@ -89,7 +113,7 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
         }
     }
     let mut order: Vec<usize> = (0..elements.len()).collect();
-    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), elements[i].col));
+    order.sort_by_key(|&i| elements[i].row.unwrap_or(u32::MAX));
     for i in order {
         let (e, offset) = (&elements[i], offsets[i]);
         let used = e.usage << e.col;
@@ -136,6 +160,8 @@ pub(crate) struct Psv<'a> {
     pub prims: &'a [SigElement],
     /// Mesh: its state and the group-shared bytes it declares.
     pub mesh: Option<(super::shader::Mesh, u32)>,
+    /// Geometry: its maximum output vertices (triangles in, strips out).
+    pub gs: Option<u32>,
     pub bindings: &'a [Binding],
     /// Compute: thread-group size and required wave size.
     pub threads: [u32; 3],
@@ -188,6 +214,15 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         info[26] = vectors(p.prims) as u8;
         info[27] = mesh.topology;
         info[30] = p.prims.len() as u8;
+    }
+    if let Some(max) = p.gs {
+        // Input primitive (triangle), output topology (triangle strip),
+        // stream mask, then whether it writes a position.
+        for (k, v) in [3u32, 5, 1].into_iter().enumerate() {
+            info[4 * k..4 * k + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        info[12] = u8::from(p.flag);
+        info[26..28].copy_from_slice(&(max as u16).to_le_bytes());
     }
     out.extend(info);
     u32s(&mut out, &[p.bindings.len() as u32]);
@@ -302,6 +337,41 @@ pub(crate) fn build(parts: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
     out
 }
 
+/// The shader hash part (`HASH`): flags (0, no source included) and the
+/// MD5 of the program. Apple's D3DMetal keys its shader cache on this hash,
+/// so it must differ between shaders: with one shared value, two shaders of
+/// the same length got each other's compiled code.
+pub(crate) fn shader_hash(dxil: &[u8]) -> [u8; 20] {
+    let mut out = [0; 20];
+    out[4..].copy_from_slice(&md5(dxil));
+    out
+}
+
+/// Standard MD5.
+pub(crate) fn md5(data: &[u8]) -> [u8; 16] {
+    let len = data.len();
+    let mut tail = data[len - len % 64..].to_vec();
+    tail.push(0x80);
+    while tail.len() % 64 != 56 {
+        tail.push(0);
+    }
+    tail.extend(((len as u64) << 3).to_le_bytes());
+    let mut state = [0x6745_2301u32, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
+    for block in data[..len - len % 64]
+        .as_chunks::<64>()
+        .0
+        .iter()
+        .chain(tail.as_chunks::<64>().0)
+    {
+        md5_block(&mut state, block);
+    }
+    let mut out = [0; 16];
+    for (o, s) in out.as_chunks_mut::<4>().0.iter_mut().zip(state) {
+        o.copy_from_slice(&s.to_le_bytes());
+    }
+    out
+}
+
 /// The container hash D3D12 checks: MD5 whose last block carries the bit
 /// count first and `2 × bytes + 1` last instead of standard padding.
 pub(crate) fn hash(data: &[u8]) -> [u8; 16] {
@@ -385,5 +455,42 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    #[test]
+    fn md5_matches_rfc_1321() {
+        let hex = |d: [u8; 16]| d.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        // RFC 1321's test suite: empty, one block, 55 and 56 bytes (where
+        // the padding spills into a second block), and two full blocks.
+        for (input, want) in [
+            (&b""[..], "d41d8cd98f00b204e9800998ecf8427e"),
+            (b"abc", "900150983cd24fb0d6963f7d28e17f72"),
+            (b"message digest", "f96b697d7cb7938d525a2f31aaf161d0"),
+            (
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
+                "d174ab98d277d9f5a5611c2c9f419d9f",
+            ),
+            (
+                b"12345678901234567890123456789012345678901234567890123456789012345678901234567890",
+                "57edf4a22be3c955ac49da2e2107b67a",
+            ),
+        ] {
+            assert_eq!(
+                hex(md5(input)),
+                want,
+                "{:?}",
+                String::from_utf8_lossy(input)
+            );
+        }
+        assert_eq!(hex(md5(&[0x61; 55])), "ef1772b6dff9a122358552954ad0df65");
+        assert_eq!(hex(md5(&[0x61; 56])), "3b0c8ac703f828b04c6c197006d17218");
+    }
+
+    #[test]
+    fn shader_hashes_differ_between_programs() {
+        let (a, b) = (shader_hash(b"program a"), shader_hash(b"program b"));
+        assert_eq!(a[..4], [0; 4], "flags");
+        assert_ne!(a, b);
+        assert_eq!(a, shader_hash(b"program a"));
     }
 }
