@@ -36,7 +36,8 @@ WORK="$ALIAS/target/crossover"
 OBJ="$WORK/build"
 PREFIX="$ALIAS/target/wine-cx"
 BREW="${BREW:-/opt/homebrew}"
-x86() { arch -x86_64 /usr/bin/env PATH="$BREW/opt/bison/bin:$BREW/opt/flex/bin:$BREW/bin:/usr/bin:/bin:/usr/sbin:/sbin" "$@"; }
+. "${0:A:h}/native-build-tools.sh"
+x86() { arch -x86_64 /usr/bin/env PATH="$NATIVE_TOOLS:$BREW/opt/bison/bin:$BREW/opt/flex/bin:$BREW/bin:/usr/bin:/bin:/usr/sbin:/sbin" "$@"; }
 
 mkdir -p "$WORK" "$OBJ"
 TAR="$WORK/crossover-sources-$VERSION.tar.gz"

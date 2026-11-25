@@ -1,0 +1,28 @@
+# Mac test fleet: reopens tasks whose lease went stale. See docs/fleet.md.
+name: Fleet leases
+
+on:
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: fleet-leases
+  cancel-in-progress: false
+
+jobs:
+  expire:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          sparse-checkout: tools/fleet
+          persist-credentials: false
+      - run: tools/fleet/queue.sh expire
+        env:
+          GH_TOKEN: ${{ github.token }}

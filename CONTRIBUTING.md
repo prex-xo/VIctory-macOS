@@ -31,7 +31,7 @@ These are the open areas, roughly from most to least useful.
 - **Speed.** Rosetta, Wine and D3DMetal each cost time. Profiling the frame loop on a Mac and finding where it goes is very valuable.
 - **A native Mac host.** The long-term route replaces Wine with a native macOS host and a Metal backend. It is described at the end of `docs/macos.md`, and design discussion in an issue is welcome before any code.
 - **Setup and packaging.** Making `setup.sh` faster or more robust, or turning it into a Mac app, helps everyone who is not a developer.
-- **Testing on other Macs.** Results from M1, M2 and M3 machines, and from different macOS versions, help a lot. Open an issue with your Mac model, your macOS version and the output of both test runs.
+- **Testing on other Macs.** Results from M1, M2 and M3 machines, and from different macOS versions, help a lot. Open an issue with your Mac model, your macOS version and the output of both test runs. The [Mac test fleet](docs/fleet.md) does this for you: it takes a task from the issues, runs both suites and posts the counts.
 
 ## Making a change
 

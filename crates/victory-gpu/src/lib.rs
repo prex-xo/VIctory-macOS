@@ -21,7 +21,8 @@ mod bindless;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
-mod clamp_bytecode;
+#[cfg(windows)]
+mod composite;
 #[cfg(windows)]
 mod compute;
 pub mod console;
@@ -31,10 +32,6 @@ pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
 mod draw;
-#[cfg(windows)]
-mod fxc;
-#[cfg(windows)]
-mod fxc_bytecode;
 pub mod dxgi;
 #[cfg(windows)]
 pub mod external;
@@ -62,6 +59,9 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod shadow;
 pub mod signature;
+mod switch;
+#[cfg(windows)]
+mod tdr;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
@@ -73,6 +73,6 @@ mod watch;
 pub use host::on_failure;
 #[cfg(windows)]
 pub use watch::{
-    Writing as KernelWrite, title_memory_aliased, title_memory_remapped,
+    Writing as KernelWrite, fault_tracking, title_memory_aliased, title_memory_remapped,
     writing as kernel_will_write,
 };

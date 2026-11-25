@@ -1,0 +1,35 @@
+# Mac test fleet: leases tasks through issue comments, checks results and
+# screens text in fleet issues. See docs/fleet.md. Runs only for issues
+# labelled fleet:task, or for every issue when the repository variable
+# FLEET_MODERATE_ALL is "true". Comment text is never evaluated.
+name: Fleet queue
+
+on:
+  issues:
+    types: [opened, edited]
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: fleet-issue-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  queue:
+    if: >-
+      github.event.issue.pull_request == null &&
+      (contains(github.event.issue.labels.*.name, 'fleet:task') || vars.FLEET_MODERATE_ALL == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          sparse-checkout: tools/fleet
+          persist-credentials: false
+      - run: tools/fleet/queue.sh event
+        env:
+          GH_TOKEN: ${{ github.token }}

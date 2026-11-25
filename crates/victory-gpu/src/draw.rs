@@ -194,7 +194,9 @@ fn root_view(list: &HostList, address: u64, srv: bool, uav: bool) -> Option<u64>
     if srv || uav || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
         if uav {
-            shadow.gpu_writes(list, address, len);
+            // A host root descriptor: no heap view, so its writes are not
+            // marked.
+            shadow.gpu_writes(list, address, len, false);
         }
         return Some(gpu);
     }
@@ -549,6 +551,32 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         crate::capture::binding(&p.name);
+        // The bound view heap's mark table and the bitmap shaders mark
+        // their writes through views in (`crate::shadow::copy_back_marks`).
+        if let Some((table_param, bitmap_param)) = p.marks {
+            let heap = match self.heaps[0] {
+                0 => crate::memory::heap(),
+                h => crate::descriptor::heap(h as This).host(),
+            };
+            let (Some(table), Some(bitmap)) = (heap.and_then(|h| h.marks()), crate::shadow::view_writes()) else {
+                once!("a shader marking its writes without a view heap: dropped");
+                not_run("write marks without a view heap");
+                return false;
+            };
+            list.keep(table);
+            // SAFETY: an open list; the table lives while the list holds it,
+            // the bitmap for good.
+            unsafe {
+                let table = table.GetGPUVirtualAddress();
+                if compute {
+                    l.SetComputeRootShaderResourceView(table_param, table);
+                    l.SetComputeRootUnorderedAccessView(bitmap_param, bitmap);
+                } else {
+                    l.SetGraphicsRootShaderResourceView(table_param, table);
+                    l.SetGraphicsRootUnorderedAccessView(bitmap_param, bitmap);
+                }
+            }
+        }
         // Shaders taking views from the heap itself read (or write) views no
         // table names: everything the bound heap's views reach is brought up
         // to date at submission (`crate::bindless`).
@@ -726,7 +754,7 @@ impl State {
                     if let (Some(shadow), Some((_, map))) = (shadow, &self.memory) {
                         let len = shadow.left(*address).min(1 << 20);
                         shadow.refresh(list, *address, len);
-                        shadow.gpu_writes(list, *address, len);
+                        shadow.gpu_writes(list, *address, len, false);
                         map.precise(*address, len);
                     }
                 }
@@ -773,7 +801,10 @@ impl State {
         let offset = u32::try_from(shadow.offset(address)).ok()?;
         shadow.refresh(list, address, shadow.left(address));
         if uav {
-            shadow.gpu_writes(list, address, shadow.left(address).min(1 << 20));
+            // Writes through the view are marked wherever they land in the
+            // copy; else declared for 1 MiB.
+            let len = if shadow.marked() { shadow.left(address) } else { shadow.left(address).min(1 << 20) };
+            shadow.gpu_writes(list, address, len, true);
         }
         let (key, host) = match self.heaps[0] {
             0 => (MEMORY_HEAP, crate::memory::heap()?),
@@ -799,6 +830,9 @@ impl State {
         self.root_run.1 += 1;
         ROOT_VIEW_SLOTS.fetch_add(1, Ordering::Relaxed);
         host.raw_view_at(index, Some(&shadow.buffer), 0, shadow.range().1 & !3, uav);
+        if uav {
+            host.set_mark(index, shadow.mark_entry(shadow.range().0));
+        }
         self.root_slots.insert((key, copy, uav), index);
         Some((index, offset))
     }
@@ -872,7 +906,7 @@ impl State {
             user_data: 0,
             slot: 0,
         };
-        readable(list, &written, &view);
+        readable(list, &written, &view, false);
         self.bind_heaps(list, false);
         list.keep(&resource);
         let gpu = visible.gpu(slot);
@@ -1037,7 +1071,7 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u, &view);
+            readable(list, u, &view, true);
         }
     }
 
@@ -1117,7 +1151,7 @@ impl State {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u, &view);
+                        readable(list, u, &view, true);
                     }
                 }
                 made.push((slot, first * 32));
@@ -1144,7 +1178,7 @@ impl State {
                     Some(view) => {
                         host.make_at(index, &view);
                         if let Some(u) = used {
-                            readable(list, u, &view);
+                            readable(list, u, &view, true);
                         }
                     }
                     None => {
@@ -1521,6 +1555,19 @@ impl State {
         };
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
+        // A call with no host pipeline cannot run, and that is the common
+        // case while the world builds its pipelines: #400 measures 1 400-1 750
+        // indirect calls a frame dropped this way. Drop it here, before the
+        // argument refresh and the clamp dispatch, which would otherwise copy
+        // the arguments and dispatch a compute shader for records nothing
+        // reads. Same order as the `is_skipped` check above, for the same
+        // reason.
+        if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_drop(self.pipeline as This);
+            why("no host pipeline");
+            return false;
+        }
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find(arguments, len) else {
             why("arguments outside title buffers");
@@ -1660,8 +1707,10 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
 }
 
 /// Gets what a shader reads or writes through a view ready: buffer data
-/// copied, textures moved to the state they need.
-fn readable(list: &HostList, u: &UsedResource, view: &View) {
+/// copied, textures moved to the state they need. `marked`: a shader's
+/// writes through the view mark their pages (every translated shader's do);
+/// the host's own (clears) do not.
+fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
@@ -1689,7 +1738,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
     {
         shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
-            shadow.gpu_writes(list, address, len);
+            shadow.gpu_writes(list, address, len, marked);
         }
     }
     match (view, u.kind) {
@@ -2115,9 +2164,9 @@ void main(uint3 id : SV_DispatchThreadID) {
             );
             let list = host.new_list().unwrap();
             let copies = crate::texture::ALIAS_COPIES.load(Ordering::Relaxed);
-            readable(&list, &used(ResourceType::Uav), &unordered);
+            readable(&list, &used(ResourceType::Uav), &unordered, false);
             run(&list, &slots, &write, 0, None, (size / 8, size / 8));
-            readable(&list, &used(ResourceType::Srv), &view);
+            readable(&list, &used(ResourceType::Srv), &view, false);
             run(&list, &slots, &read, 1, Some(&out), (read_size / 8, read_size / 8));
             list.close();
             host.execute(&[&list]);
@@ -2195,11 +2244,11 @@ void main(uint3 id : SV_DispatchThreadID) {
         let (raw, raw_data) = host.shared_buffer(total).unwrap();
         let list = host.new_list().unwrap();
         for v in &planes {
-            readable(&list, &used(ResourceType::Uav), v);
+            readable(&list, &used(ResourceType::Uav), v, false);
         }
         run(&list, &slots, &write, 0, None, (8, 8));
         for v in &reads {
-            readable(&list, &used(ResourceType::Srv), v);
+            readable(&list, &used(ResourceType::Srv), v, false);
         }
         assert!(list.take_rebind(), "the conversion ran in the list");
         run(&list, &slots, &read, 2, Some(&out), (8, 8));
@@ -2259,7 +2308,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         unsafe {
             list.list.ClearDepthStencilView(handle, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.75, 0x11, None)
         };
-        readable(&list, &used(ResourceType::Uav), &planes[0]);
+        readable(&list, &used(ResourceType::Uav), &planes[0], false);
         let twin = copy.twin.get().and_then(Option::as_ref).expect("a twin");
         let mut g = [D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); 2];
         for (p, plane) in twin.planes.iter().enumerate() {
@@ -2345,9 +2394,9 @@ void main(uint3 id : SV_DispatchThreadID) {
                 READS,
             );
             let list = host.new_list().unwrap();
-            readable(&list, &used(ResourceType::Uav), &unordered);
+            readable(&list, &used(ResourceType::Uav), &unordered, false);
             run(&list, &slots, &write, 0, None, groups);
-            readable(&list, &used(ResourceType::Srv), &shader);
+            readable(&list, &used(ResourceType::Srv), &shader, false);
             run(&list, &slots, &read, 1, Some(&out), (8, 8));
             list.close();
             host.execute(&[&list]);
@@ -2355,6 +2404,40 @@ void main(uint3 id : SV_DispatchThreadID) {
             let got = unsafe { (data.add((2 * 64 + 7) * 16) as *const [f32; 4]).read() };
             assert_eq!(got, want, "round {round}");
         }
+    }
+
+    /// A texture written through an unordered view and copied into a title
+    /// buffer (a read back) reaches the buffer's title memory once the
+    /// submission has run (#50: the title waited on such a copy).
+    #[test]
+    fn a_texture_copied_to_a_buffer_reaches_title_memory() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let slots = Slots::new(1);
+        let address = title_memory(1 << 22);
+        let words = [3, 0, 0, 0, 64, 0, 64, 1 | 1 << 16, 41, 1, 0, 0, 4, 0];
+        let texture = texture_at_address(address, &words);
+        let unordered = View::Unordered(texture as usize, 0, Some([41, 4, 0, 0, 0, 0, 0, 0, 0, 0]));
+        slots.make(0, &unordered);
+        let write = compile_cs(
+            "RWTexture2D<float> o : register(u0);\n[numthreads(8, 8, 1)]\nvoid main(uint3 id : SV_DispatchThreadID) { o[id.xy] = id.x + id.y * 64; }",
+            WRITES,
+        );
+        let dst = buffer(256 * 64);
+        let list = host.new_list().unwrap();
+        readable(&list, &used(ResourceType::Uav), &unordered, false);
+        run(&list, &slots, &write, 0, None, (8, 8));
+        let footprint = crate::resource::PlacedFootprint::new(0, 41, 64, 64, 256);
+        let to = crate::list::CopyLocation::placed(dst, footprint);
+        let from = crate::list::CopyLocation::whole(texture);
+        assert!(crate::list::texture_to_buffer(&list, &to, (0, 0, 0), &from, std::ptr::null()), "recorded");
+        list.close();
+        host.execute(&[&list]);
+        let (bytes, _) = crate::resource::buffer_bytes(dst).unwrap();
+        // SAFETY: inside the buffer: texel (7, 2) at a 256-byte pitch.
+        let got = unsafe { (bytes.add(2 * 256 + 7 * 4) as *const f32).read() };
+        assert_eq!(got, (7 + 2 * 64) as f32);
     }
 
     /// A structured view the title places off its buffer's elements (the

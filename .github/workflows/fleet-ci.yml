@@ -1,0 +1,23 @@
+# Mac test fleet: lint and test the fleet scripts. See docs/fleet.md.
+name: Fleet CI
+
+on:
+  pull_request:
+    paths: ["tools/fleet/**", ".github/workflows/fleet-*.yml", "docs/fleet*.md"]
+  push:
+    branches: [main]
+    paths: ["tools/fleet/**", ".github/workflows/fleet-*.yml", "docs/fleet*.md"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - run: shellcheck tools/fleet/*.sh
+      - run: tools/fleet/test.sh

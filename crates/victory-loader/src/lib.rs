@@ -23,7 +23,9 @@
 
 #[cfg(windows)]
 mod crash;
+pub mod masked;
 pub mod prepare;
+pub(crate) mod publish;
 pub mod resolve;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod stacks;
@@ -47,7 +49,7 @@ pub use resolve::{ImportResolver, Provenance, Resolution};
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use stacks::{dump_stacks, dump_stacks_on_schedule};
 #[cfg(windows)]
-pub use threads::disable_thread_calls;
+pub use threads::{disable_thread_calls, in_title_image};
 #[cfg(windows)]
 pub use thunks::{UnimplementedPolicy, unimplemented_call_count};
 #[cfg(windows)]

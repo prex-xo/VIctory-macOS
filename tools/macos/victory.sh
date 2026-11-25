@@ -4,6 +4,8 @@
 #   tools/macos/victory.sh config
 #   tools/macos/victory.sh run --execute <path to the game's executable>
 # WINE defaults to the Wine that tools/macos/build-crossover-wine.sh builds.
+# VICTORY_DIAGNOSTICS=1 builds with the diagnostics feature (debug logs,
+# black-frame reports, frame capture and the other debugging switches).
 set -e
 cd "$(dirname "$0")/../.."
 ROOT="$PWD"
@@ -14,7 +16,11 @@ WINE="${WINE:-$HOME/Library/Caches/victory-macos/target/wine-cx/bin/wine}"
     echo "D3DMetal is missing: copy the redist/lib folder of Apple's evaluation environment over $(dirname "$WINE")/../lib" >&2
     exit 1
 }
-cargo build --quiet --release -p victory --target x86_64-pc-windows-gnullvm
+if [ "${VICTORY_DIAGNOSTICS:-0}" = 1 ]; then
+    cargo build --quiet --release -p victory --features diagnostics --target x86_64-pc-windows-gnullvm
+else
+    cargo build --quiet --release -p victory --target x86_64-pc-windows-gnullvm
+fi
 export WINEPREFIX="${WINEPREFIX:-$ROOT/target/wineprefix-play}"
 export WINEDEBUG="${WINEDEBUG:--all}"
 export WINEDLLOVERRIDES="mscoree,mshtml=;winedbg.exe=d;d3d12,d3d12core,dxgi=b${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"

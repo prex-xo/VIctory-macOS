@@ -23,14 +23,95 @@ use windows::core::s;
 
 use crate::host::{HostList, host, transition};
 
-/// The clamp shader. the clamp-bytecode workflow compiles it on a
-/// Windows runner, and `clamp_bytecode.rs` holds the result, because Wine's
-/// HLSL compiler (vkd3d-shader) cannot compile it.
-const SOURCE: &str = include_str!("clamp.hlsl");
+const SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
+cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
+RWByteAddressBuffer args : register(u0);
+// The list's work so far (vertex instances, threads): past the budget,
+// records run empty.
+RWByteAddressBuffer budget : register(u1);
+static const uint BUDGET = 1u << 27;
+// Groups of one dispatch; more run empty.
+static const uint GROUPS = 1u << 20;
+// Clamps the record at `at` in place; its cost.
+uint clamped(uint at) {
+    uint cost;
+    if (kind <= 1) {
+        // Draws: vertex or index count, then instances.
+        uint count = min(args.Load(at), 1u << 24);
+        uint instances = min(args.Load(at + 4), (1u << 26) / max(count, 1u));
+        cost = count * instances;
+        args.Store2(at, uint2(count, instances));
+    } else if (kind == 2) {
+        uint3 g = min(args.Load3(at), uint3(65535, 65535, 65535));
+        // x * y fits 32 bits; the whole count may not.
+        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
+            g = uint3(0, 0, 0);
+        }
+        cost = g.x * g.y * g.z * 64;
+        args.Store3(at, g);
+    } else {
+        // Mesh dispatches: the console's are one-dimensional.
+        uint3 g = args.Load3(at);
+        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+        cost = g.x * g.y * g.z * 128;
+        args.Store3(at, g);
+    }
+    return cost;
+}
+// A record past the budget (no cost reaches it).
+static const uint PAST = 0xffffffffu;
+groupshared uint costs[64];
+// One group walks the records in tiles of 64: every lane clamps its own
+// record, then the first lane charges the tile's records in order. No
+// other group shares the budget: a shared add wraps once enough records
+// are rejected, and a compare-exchange retries more the more records fit.
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint lane : SV_GroupIndex) {
+    uint left = 0;
+    if (lane == 0) {
+        left = BUDGET - min(budget.Load(0), BUDGET);
+    }
+    for (uint tile = 0; tile < records / 64 + min(records % 64, 1u); tile++) {
+        uint record = tile * 64 + lane;
+        uint at = record * stride;
+        uint cost = 0;
+        if (record < records) {
+            cost = clamped(at);
+        }
+        costs[lane] = cost;
+        GroupMemoryBarrierWithGroupSync();
+        if (lane == 0) {
+            for (uint i = 0; i < 64; i++) {
+                if (costs[i] > left) {
+                    // The first record that does not fit takes what is
+                    // left, so those after it run empty too.
+                    costs[i] = PAST;
+                    left = 0;
+                } else {
+                    left -= costs[i];
+                }
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (costs[lane] == PAST) {
+            // Draws keep their layout with no vertices; groups become zero.
+            args.Store(at, 0);
+        }
+    }
+    if (lane == 0) {
+        budget.Store(0, BUDGET - left);
+    }
+}
+"#;
 
 struct Clamp {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
+    /// Built from [`WORDS_SOURCE`], which also reads the two buffers as
+    /// words through root views 3 and 4.
+    words: bool,
 }
 
 // SAFETY: D3D12 objects are free-threaded.
@@ -51,27 +132,83 @@ fn clamp() -> Option<&'static Clamp> {
         .as_ref()
 }
 
-/// FNV-1a of the shader source, which names the bytecode it was built into.
-pub(crate) fn source_hash() -> u64 {
-    SOURCE.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
-        (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+fn make() -> windows::core::Result<Clamp> {
+    make_fxc().or_else(|e| {
+        tracing::info!(error = %e, "argument clamp: building the one-thread form");
+        make_words()
     })
 }
 
-fn make() -> windows::core::Result<Clamp> {
-    let device = &host().ok_or_else(windows::core::Error::empty)?.device;
-    // Prebuilt bytecode first, as long as it was built from this source.
-    if crate::clamp_bytecode::SOURCE_HASH == source_hash() {
-        for bytes in [crate::clamp_bytecode::DXIL, crate::clamp_bytecode::DXBC] {
-            if bytes.is_empty() {
-                continue;
-            }
-            match from_bytecode(device, bytes) {
-                Ok(c) => return Ok(c),
-                Err(e) => tracing::warn!(error = %e, "prebuilt argument clamp refused"),
-            }
+/// The clamp for Wine's HLSL compiler (vkd3d-shader), which has no `Load`
+/// on `RWByteAddressBuffer`, no stores to indexed group-shared memory and
+/// no `[RootSignature]`: [`SOURCE`]'s clamp, read through structured views
+/// of the same buffers, and one thread charging the records in order
+/// instead of a group of 64. The results are the same.
+const WORDS_SOURCE: &str = r#"
+cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
+RWByteAddressBuffer args : register(u0);
+RWByteAddressBuffer budget : register(u1);
+RWStructuredBuffer<uint> argWords : register(u2);
+RWStructuredBuffer<uint> budgetWords : register(u3);
+static const uint BUDGET = 1u << 27;
+static const uint GROUPS = 1u << 20;
+uint3 load3(uint at) { return uint3(argWords[at / 4], argWords[at / 4 + 1], argWords[at / 4 + 2]); }
+uint clamped(uint at) {
+    uint cost;
+    if (kind <= 1) {
+        uint count = min(argWords[at / 4], 1u << 24);
+        uint instances = min(argWords[at / 4 + 1], (1u << 26) / max(count, 1u));
+        cost = count * instances;
+        args.Store2(at, uint2(count, instances));
+    } else if (kind == 2) {
+        uint3 g = min(load3(at), uint3(65535, 65535, 65535));
+        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
+            g = uint3(0, 0, 0);
+        }
+        cost = g.x * g.y * g.z * 64;
+        args.Store3(at, g);
+    } else {
+        uint3 g = load3(at);
+        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+        cost = g.x * g.y * g.z * 128;
+        args.Store3(at, g);
+    }
+    return cost;
+}
+[numthreads(1, 1, 1)]
+void main() {
+    uint left = BUDGET - min(budgetWords[0], BUDGET);
+    for (uint record = 0; record < records; record++) {
+        uint at = record * stride;
+        uint cost = clamped(at);
+        if (cost > left) {
+            // The first record that does not fit takes what is left, so
+            // those after it run empty too.
+            args.Store(at, 0);
+            left = 0;
+        } else {
+            left -= cost;
         }
     }
+    budget.Store(0, BUDGET - left);
+}
+"#;
+
+fn make_words() -> windows::core::Result<Clamp> {
+    use crate::compute::Param;
+    let params = [
+        Param::Constants { register: 0, count: 4 },
+        Param::Uav { register: 0 },
+        Param::Uav { register: 1 },
+        Param::Uav { register: 2 },
+        Param::Uav { register: 3 },
+    ];
+    let (root, pso) = crate::compute::pipeline(WORDS_SOURCE, s!("clamp"), 0, &params)?;
+    Ok(Clamp { root, pso, words: true })
+}
+
+fn make_fxc() -> windows::core::Result<Clamp> {
+    let device = &host().ok_or_else(windows::core::Error::empty)?.device;
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -94,28 +231,16 @@ fn make() -> windows::core::Result<Clamp> {
         if let Some(errors) = errors {
             // SAFETY: the blob's own bytes.
             let text = unsafe {
-                std::slice::from_raw_parts(
-                    errors.GetBufferPointer().cast::<u8>(),
-                    errors.GetBufferSize(),
-                )
+                std::slice::from_raw_parts(errors.GetBufferPointer().cast::<u8>(), errors.GetBufferSize())
             };
             tracing::warn!("argument clamp: {}", String::from_utf8_lossy(text));
         }
         return Err(e);
     }
     let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes.
-    let bytes = unsafe {
-        std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
-    };
-    from_bytecode(device, bytes)
-}
-
-/// The root signature and pipeline of compiled clamp bytecode, whose root
-/// signature is inside it.
-fn from_bytecode(device: &ID3D12Device, bytes: &[u8]) -> windows::core::Result<Clamp> {
-    // SAFETY: the bytes live through both calls.
+    // SAFETY: the blob's own bytes; the root signature is inside the shader.
     unsafe {
+        let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
         let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
@@ -125,7 +250,7 @@ fn from_bytecode(device: &ID3D12Device, bytes: &[u8]) -> windows::core::Result<C
             },
             ..Default::default()
         })?;
-        Ok(Clamp { root, pso })
+        Ok(Clamp { root, pso, words: false })
     }
 }
 
@@ -158,7 +283,12 @@ pub(crate) fn bound(
         l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
         l.SetComputeRootUnorderedAccessView(1, gpu);
         l.SetComputeRootUnorderedAccessView(2, budget);
-        l.Dispatch(records.div_ceil(64), 1, 1);
+        if c.words {
+            l.SetComputeRootUnorderedAccessView(3, gpu);
+            l.SetComputeRootUnorderedAccessView(4, budget);
+        }
+        // One group walks every record.
+        l.Dispatch(records.min(1), 1, 1);
         l.ResourceBarrier(&[
             uav_barrier(),
             transition(
@@ -189,9 +319,7 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
         Anonymous: D3D12_RESOURCE_BARRIER_0 {
-            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                pResource: std::mem::ManuallyDrop::new(None),
-            }),
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
         },
     }
 }
@@ -205,5 +333,94 @@ mod tests {
             return; // no host GPU here
         }
         assert!(super::clamp().is_some());
+    }
+
+    /// Clamps `records` records of `kind`, filled by repeating `words`,
+    /// `calls` times in one list: each record's first word after (zero when
+    /// it runs empty). One record more follows them and must stay as
+    /// written. `None` without a host GPU.
+    fn clamped(kind: u32, words: &[u32], records: u32, calls: u32) -> Option<Vec<u32>> {
+        let host = super::host()?;
+        // Words in a record of `kind`.
+        let per = match kind {
+            0 => 4,
+            1 => 5,
+            _ => 3,
+        };
+        let spec = (kind, per as u32 * 4, records);
+        let all = per * (records as usize + 1);
+        let (buffer, data) = host.shared_buffer(all as u64 * 4).unwrap();
+        let data = data.cast::<u32>();
+        let list = host.new_list().unwrap();
+        // SAFETY: our mapped buffer, written before the list runs and read
+        // after it has; a live buffer.
+        unsafe {
+            for at in 0..all {
+                data.add(at).write_volatile(words[at % words.len()]);
+            }
+            let gpu = buffer.GetGPUVirtualAddress();
+            for _ in 0..calls {
+                assert!(super::bound(&list, &buffer, gpu, spec));
+                super::done(&list, &buffer);
+            }
+            list.close();
+            host.execute(&[&list]);
+            for at in all - per..all {
+                assert_eq!(data.add(at).read_volatile(), words[at % words.len()]);
+            }
+            let first = |i: usize| data.add(i * per).read_volatile();
+            Some((0..records as usize).map(first).collect())
+        }
+    }
+
+    /// Rejected records do not wrap the budget: of 128 garbage draws (2^26
+    /// vertex instances each once clamped) two run, where a wrapping add
+    /// let four; of 600 garbage mesh dispatches 16, not 31.
+    #[test]
+    fn rejected_records_do_not_wrap_the_budget() {
+        let Some(draws) = clamped(0, &[u32::MAX], 128, 1) else {
+            return; // no host GPU here
+        };
+        assert_eq!(draws.iter().filter(|&&count| count != 0).count(), 2);
+        let meshes = clamped(10, &[u32::MAX], 600, 1).unwrap();
+        assert_eq!(meshes.iter().filter(|&&groups| groups != 0).count(), 16);
+    }
+
+    /// The budget goes to the first records, in order: of 200 draws of
+    /// 3 * 2^18 vertices the first 170 run (it ends inside the third tile);
+    /// small records that all fit all run.
+    #[test]
+    fn the_budget_goes_to_the_first_records() {
+        let Some(draws) = clamped(0, &[3 << 18, 1, 0, 0], 200, 1) else {
+            return; // no host GPU here
+        };
+        assert!(draws[..170].iter().all(|&count| count != 0));
+        assert!(draws[170..].iter().all(|&count| count == 0));
+        let small = clamped(0, &[1], 1 << 16, 1).unwrap();
+        assert!(small.iter().all(|&count| count == 1));
+    }
+
+    /// A record that does not fit ends the budget: after two draws of
+    /// 3 * 2^24 vertex instances a third takes what is left, and the small
+    /// ones after it run empty.
+    #[test]
+    fn a_record_that_does_not_fit_ends_the_budget() {
+        let mut words = [1 << 24, 3, 0, 0].repeat(3);
+        words.extend([3, 1, 0, 0].repeat(6));
+        let Some(draws) = clamped(0, &words, 8, 1) else {
+            return; // no host GPU here
+        };
+        let ran: Vec<bool> = draws.iter().map(|&count| count != 0).collect();
+        assert_eq!(ran, [true, true, false, false, false, false, false, false]);
+    }
+
+    /// The budget is the list's: a second execution of the same records
+    /// finds it spent, and they all run empty.
+    #[test]
+    fn a_spent_budget_stays_spent() {
+        let Some(twice) = clamped(1, &[u32::MAX], 64, 2) else {
+            return; // no host GPU here
+        };
+        assert!(twice.iter().all(|&count| count == 0));
     }
 }

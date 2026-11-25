@@ -1,23 +1,25 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="900" height="574" viewBox="0 0 900 574" role="img" aria-label="Terminal output: VIctory test suite under Wine with D3DMetal on an Apple M4, 481 passed and 0 failed">
-<rect width="900" height="574" rx="14" fill="#1a1b26"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="626" viewBox="0 0 900 626" role="img" aria-label="Terminal output: VIctory test suite under Wine with D3DMetal on an Apple M4, 701 passed and 0 failed">
+<rect width="900" height="626" rx="14" fill="#1a1b26"/>
 <circle cx="26" cy="22" r="7" fill="#ff5f57"/><circle cx="48" cy="22" r="7" fill="#febc2e"/><circle cx="70" cy="22" r="7" fill="#28c840"/>
 <text x="450.0" y="27" text-anchor="middle" font-family="-apple-system, Helvetica, Arial, sans-serif" font-size="14" fill="#7f88b0">VIctory-macOS: tests</text>
 <text x="28" y="70" font-family="Menlo, Consolas, monospace" font-size="17" fill="#9aa5ce" xml:space="preserve">$ tools/macos/test-wine.sh --workspace</text>
 <text x="28" y="96" font-family="Menlo, Consolas, monospace" font-size="17" fill="#7f88b0" xml:space="preserve">  Wine: CrossOver 26.3   GPU: D3DMetal 4.0 on Apple M4</text>
-<text x="28" y="148" font-family="Menlo, Consolas, monospace" font-size="17" fill="#c0caf5" xml:space="preserve">  victory_shader          211 passed   0 failed</text>
-<text x="28" y="174" font-family="Menlo, Consolas, monospace" font-size="17" fill="#c0caf5" xml:space="preserve">  victory_hle              98 passed   0 failed</text>
-<text x="28" y="200" font-family="Menlo, Consolas, monospace" font-size="17" fill="#c0caf5" xml:space="preserve">  victory_gpu              80 passed   0 failed</text>
-<text x="28" y="226" font-family="Menlo, Consolas, monospace" font-size="17" fill="#c0caf5" xml:space="preserve">  victory_formats          23 passed   0 failed</text>
-<text x="28" y="252" font-family="Menlo, Consolas, monospace" font-size="17" fill="#c0caf5" xml:space="preserve">  victory_loader           22 passed   0 failed</text>
-<text x="28" y="278" font-family="Menlo, Consolas, monospace" font-size="17" fill="#c0caf5" xml:space="preserve">  victory_game             15 passed   0 failed</text>
-<text x="28" y="304" font-family="Menlo, Consolas, monospace" font-size="17" fill="#c0caf5" xml:space="preserve">  victory_core             11 passed   0 failed</text>
-<text x="28" y="330" font-family="Menlo, Consolas, monospace" font-size="17" fill="#c0caf5" xml:space="preserve">  victory_pe                7 passed   0 failed</text>
-<text x="28" y="356" font-family="Menlo, Consolas, monospace" font-size="17" fill="#c0caf5" xml:space="preserve">  victory_pipeline          4 passed   0 failed</text>
-<text x="28" y="382" font-family="Menlo, Consolas, monospace" font-size="17" fill="#c0caf5" xml:space="preserve">  xtask                     4 passed   0 failed</text>
-<text x="28" y="408" font-family="Menlo, Consolas, monospace" font-size="17" fill="#c0caf5" xml:space="preserve">  load_probe                2 passed   0 failed</text>
-<text x="28" y="434" font-family="Menlo, Consolas, monospace" font-size="17" fill="#c0caf5" xml:space="preserve">  fidelityfx                1 passed   0 failed</text>
-<text x="28" y="460" font-family="Menlo, Consolas, monospace" font-size="17" fill="#c0caf5" xml:space="preserve">  no_dll_planting           1 passed   0 failed</text>
-<text x="28" y="486" font-family="Menlo, Consolas, monospace" font-size="17" fill="#c0caf5" xml:space="preserve">  title_dlls                1 passed   0 failed</text>
-<text x="28" y="512" font-family="Menlo, Consolas, monospace" font-size="17" fill="#c0caf5" xml:space="preserve">  victory                   1 passed   0 failed</text>
-<text x="28" y="538" font-family="Menlo, Consolas, monospace" font-size="17" fill="#9ece6a" xml:space="preserve">  all tests               481 passed   0 failed</text>
+<text x="28" y="148" font-family="Menlo, Consolas, monospace" font-size="17" fill="#c0caf5" xml:space="preserve">  victory_shader          248 passed   0 failed</text>
+<text x="28" y="174" font-family="Menlo, Consolas, monospace" font-size="17" fill="#c0caf5" xml:space="preserve">  victory_hle             144 passed   0 failed</text>
+<text x="28" y="200" font-family="Menlo, Consolas, monospace" font-size="17" fill="#c0caf5" xml:space="preserve">  victory_gpu             142 passed   0 failed</text>
+<text x="28" y="226" font-family="Menlo, Consolas, monospace" font-size="17" fill="#c0caf5" xml:space="preserve">  victory_formats          38 passed   0 failed</text>
+<text x="28" y="252" font-family="Menlo, Consolas, monospace" font-size="17" fill="#c0caf5" xml:space="preserve">  victory_pe               36 passed   0 failed</text>
+<text x="28" y="278" font-family="Menlo, Consolas, monospace" font-size="17" fill="#c0caf5" xml:space="preserve">  victory_loader           34 passed   0 failed</text>
+<text x="28" y="304" font-family="Menlo, Consolas, monospace" font-size="17" fill="#c0caf5" xml:space="preserve">  victory_game             15 passed   0 failed</text>
+<text x="28" y="330" font-family="Menlo, Consolas, monospace" font-size="17" fill="#c0caf5" xml:space="preserve">  victory_core             13 passed   0 failed</text>
+<text x="28" y="356" font-family="Menlo, Consolas, monospace" font-size="17" fill="#c0caf5" xml:space="preserve">  victory                  10 passed   0 failed</text>
+<text x="28" y="382" font-family="Menlo, Consolas, monospace" font-size="17" fill="#c0caf5" xml:space="preserve">  victory_pipeline          7 passed   0 failed</text>
+<text x="28" y="408" font-family="Menlo, Consolas, monospace" font-size="17" fill="#c0caf5" xml:space="preserve">  xtask                     6 passed   0 failed</text>
+<text x="28" y="434" font-family="Menlo, Consolas, monospace" font-size="17" fill="#c0caf5" xml:space="preserve">  census                    2 passed   0 failed</text>
+<text x="28" y="460" font-family="Menlo, Consolas, monospace" font-size="17" fill="#c0caf5" xml:space="preserve">  load_probe                2 passed   0 failed</text>
+<text x="28" y="486" font-family="Menlo, Consolas, monospace" font-size="17" fill="#c0caf5" xml:space="preserve">  crash_log                 1 passed   0 failed</text>
+<text x="28" y="512" font-family="Menlo, Consolas, monospace" font-size="17" fill="#c0caf5" xml:space="preserve">  fidelityfx                1 passed   0 failed</text>
+<text x="28" y="538" font-family="Menlo, Consolas, monospace" font-size="17" fill="#c0caf5" xml:space="preserve">  no_dll_planting           1 passed   0 failed</text>
+<text x="28" y="564" font-family="Menlo, Consolas, monospace" font-size="17" fill="#c0caf5" xml:space="preserve">  title_dlls                1 passed   0 failed</text>
+<text x="28" y="590" font-family="Menlo, Consolas, monospace" font-size="17" fill="#9ece6a" xml:space="preserve">  all tests               701 passed   0 failed</text>
 </svg>

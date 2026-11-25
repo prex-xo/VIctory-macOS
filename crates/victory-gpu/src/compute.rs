@@ -8,12 +8,13 @@
 //! signature is version 1.1 with no flags, as Microsoft's compilers build
 //! it from an HLSL root signature string.
 
-// Tables, root views and their ranges are used only by tests so far.
+// Tables and root shader resource views are used only by tests so far.
 #![cfg_attr(not(test), allow(dead_code))]
 
+use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::core::{Error, PCSTR, Result};
+use windows::core::{Error, PCSTR, Result, s};
 
 /// A root parameter, visible to every stage.
 pub(crate) enum Param<'a> {
@@ -66,17 +67,45 @@ pub(crate) fn pipeline(
     params: &[Param],
 ) -> Result<(ID3D12RootSignature, ID3D12PipelineState)> {
     let device = &crate::host::host().ok_or_else(Error::empty)?.device;
-    // SAFETY: the caller's name, a NUL-terminated string.
-    let name = unsafe { name.to_string() }.unwrap_or_default();
-    let code = crate::fxc::compile(source, &name, "cs_5_1", flags)?;
+    let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
+    // SAFETY: the source and names live through the call; out pointers ours.
+    let compiled = unsafe {
+        D3DCompile(
+            source.as_ptr().cast(),
+            source.len(),
+            name,
+            None,
+            None,
+            s!("main"),
+            s!("cs_5_1"),
+            flags,
+            0,
+            &mut code,
+            Some(&mut errors),
+        )
+    };
+    if let Err(e) = compiled {
+        if let Some(errors) = errors {
+            // SAFETY: the blob's own bytes, and a name the caller keeps.
+            unsafe {
+                let text = std::slice::from_raw_parts(
+                    errors.GetBufferPointer().cast::<u8>(),
+                    errors.GetBufferSize(),
+                );
+                tracing::warn!("{}: {}", name.display(), String::from_utf8_lossy(text));
+            }
+        }
+        return Err(e);
+    }
+    let code = code.ok_or_else(Error::empty)?;
     let root = root_signature(device, params)?;
     // SAFETY: the bytecode and the root signature live through the call.
     let pso = unsafe {
         device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {
-                pShaderBytecode: code.as_ptr().cast(),
-                BytecodeLength: code.len(),
+                pShaderBytecode: code.GetBufferPointer(),
+                BytecodeLength: code.GetBufferSize(),
             },
             ..Default::default()
         })

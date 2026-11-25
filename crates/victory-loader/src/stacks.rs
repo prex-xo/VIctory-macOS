@@ -27,19 +27,138 @@ pub fn dump_stacks_on_schedule() {
     let Ok(list) = std::env::var("VICTORY_STACKS") else {
         return;
     };
-    let mut times: Vec<f64> = list
-        .split(',')
-        .filter_map(|t| t.trim().parse().ok())
-        .collect();
-    times.sort_by(f64::total_cmp);
+    let times = schedule(&list);
     let start = std::time::Instant::now();
+    // `VICTORY_STACKS_FILE=<path>`: the dumps go to that file instead, in a
+    // form that needs no lock another thread could hold (#50: in a freeze
+    // the dump thread never printed, as if a stuck thread held stderr, the
+    // heap or the loader lock). The module table is written now, while
+    // all is well; the dumps give raw addresses.
+    let raw = std::env::var_os("VICTORY_STACKS_FILE").and_then(|path| {
+        let file = std::fs::File::create(path).ok()?;
+        modules(&file);
+        Some(file)
+    });
+    // Room for every thread id, made before any dump.
+    let mut ids: Vec<u32> = Vec::with_capacity(8192);
     std::thread::spawn(move || {
-        for t in times {
-            let at = std::time::Duration::from_secs_f64(t.max(0.0));
+        for at in times {
             std::thread::sleep(at.saturating_sub(start.elapsed()));
-            dump_stacks();
+            match &raw {
+                Some(file) => dump_raw(file, at.as_secs(), &mut ids),
+                None => dump_stacks(),
+            }
         }
     });
+}
+
+/// A line formatted on the stack, written with one `WriteFile`: no
+/// allocation, no stderr lock.
+fn line(mut file: &std::fs::File, args: std::fmt::Arguments) {
+    use std::io::Write;
+    struct Buf([u8; 256], usize);
+    impl std::fmt::Write for Buf {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            let n = s.len().min(self.0.len() - 1 - self.1);
+            self.0[self.1..self.1 + n].copy_from_slice(&s.as_bytes()[..n]);
+            self.1 += n;
+            Ok(())
+        }
+    }
+    let mut b = Buf([0; 256], 0);
+    let _ = std::fmt::Write::write_fmt(&mut b, args);
+    b.0[b.1] = b'\n';
+    let _ = file.write_all(&b.0[..=b.1]);
+}
+
+/// Every loaded module's name, base and size, so raw addresses can be
+/// placed later.
+fn modules(file: &std::fs::File) {
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        MODULEENTRY32W, Module32FirstW, Module32NextW, TH32CS_SNAPMODULE,
+    };
+    // SAFETY: a snapshot of this process's modules.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return;
+    }
+    // SAFETY: zeroed is a valid MODULEENTRY32W; its size is set before use.
+    let mut entry: MODULEENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = size_of::<MODULEENTRY32W>() as u32;
+    // SAFETY: `snapshot` is open; `entry` is sized.
+    let mut more = unsafe { Module32FirstW(snapshot, &mut entry) } != 0;
+    while more {
+        let len = entry.szModule.iter().position(|&c| c == 0).unwrap_or(entry.szModule.len());
+        let name = String::from_utf16_lossy(&entry.szModule[..len]);
+        line(file, format_args!("module {name} base {:#x} size {:#x}", entry.modBaseAddr as usize, entry.modBaseSize));
+        // SAFETY: as above.
+        more = unsafe { Module32NextW(snapshot, &mut entry) } != 0;
+    }
+    // SAFETY: we opened it.
+    unsafe { CloseHandle(snapshot) };
+}
+
+/// [`dump_stacks`] into `file`, with a line before each step, so a dump
+/// that stops shows where.
+fn dump_raw(file: &std::fs::File, at: u64, ids: &mut Vec<u32>) {
+    line(file, format_args!("dump at {at} s: taking a thread snapshot"));
+    // SAFETY: plain queries and a snapshot of this process's threads.
+    let (me, process, snapshot) = unsafe {
+        (GetCurrentThreadId(), GetCurrentProcessId(), CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0))
+    };
+    if snapshot == INVALID_HANDLE_VALUE {
+        line(file, format_args!("dump at {at} s: no snapshot"));
+        return;
+    }
+    ids.clear();
+    // SAFETY: zeroed is a valid THREADENTRY32; its size is set before use.
+    let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
+    entry.dwSize = size_of::<THREADENTRY32>() as u32;
+    // SAFETY: `snapshot` is open; `entry` is sized.
+    let mut more = unsafe { Thread32First(snapshot, &mut entry) } != 0;
+    while more && ids.len() < ids.capacity() {
+        if entry.th32OwnerProcessID == process && entry.th32ThreadID != me {
+            ids.push(entry.th32ThreadID);
+        }
+        // SAFETY: as above.
+        more = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+    }
+    // SAFETY: we opened it.
+    unsafe { CloseHandle(snapshot) };
+    line(file, format_args!("dump at {at} s: {} threads", ids.len()));
+    for &id in ids.iter() {
+        line(file, format_args!("  thread {id}: opening"));
+        // SAFETY: opens a thread of our own process.
+        let thread = unsafe {
+            OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, 0, id)
+        };
+        if thread.is_null() {
+            continue;
+        }
+        line(file, format_args!("  thread {id} start {:#x}", start_of(thread)));
+        let (frames, (priority, base)) = frames_of(thread);
+        line(file, format_args!("  thread {id} priority {priority} (base {base}), {} frames", frames.len()));
+        for (i, pc) in frames.into_iter().enumerate() {
+            line(file, format_args!("    #{i:<2} {pc:#x}"));
+        }
+        // SAFETY: we opened it.
+        unsafe { CloseHandle(thread) };
+    }
+    line(file, format_args!("dump at {at} s: done"));
+}
+
+/// The times in a `VICTORY_STACKS` list (seconds, comma-separated), in
+/// order. Negative times are now; times no `Duration` holds (`inf`, `NaN`,
+/// `1e20`) are left out instead of panicking the dump thread.
+fn schedule(list: &str) -> Vec<std::time::Duration> {
+    let mut times: Vec<_> = list
+        .split(',')
+        .filter_map(|t| t.trim().parse::<f64>().ok())
+        .filter(|t| !t.is_nan())
+        .filter_map(|t| std::time::Duration::try_from_secs_f64(t.max(0.0)).ok())
+        .collect();
+    times.sort();
+    times
 }
 
 /// `THREAD_BASIC_INFORMATION` (ntddk).
@@ -125,6 +244,12 @@ fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
         priority: 0,
         base_priority: 0,
     };
+    // Suspended first: a running thread may exit and free its TEB between
+    // the query and the read below.
+    // SAFETY: a thread of this process that is not this one.
+    if unsafe { SuspendThread(thread) } == u32::MAX {
+        return (frames, (0, 0));
+    }
     // SAFETY: writes `info`, whose layout and size are the system's.
     let status = unsafe {
         NtQueryInformationThread(
@@ -136,21 +261,20 @@ fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
         )
     };
     if status != 0 || info.teb.is_null() {
+        // SAFETY: suspended above.
+        unsafe { ResumeThread(thread) };
         return (frames, (0, 0));
     }
-    // SAFETY: the TEB of a live thread of this process: its NT_TIB holds
-    // the stack base at +8 and the stack limit at +0x10.
+    // SAFETY: the TEB of a suspended thread of this process: its NT_TIB
+    // holds the stack base at +8 and the stack limit at +0x10.
     let (high, low) = unsafe { (info.teb.add(1).read(), info.teb.add(2).read()) };
     // SAFETY: zeroed is a valid CONTEXT.
     let mut context = Aligned(unsafe { std::mem::zeroed() });
     context.0.ContextFlags = CONTEXT_FULL_AMD64;
-    // SAFETY: suspends, reads and resumes a thread that is not this one;
-    // nothing between suspend and resume allocates or takes a lock the
-    // thread could hold besides the unwinder's own.
+    // SAFETY: reads and resumes the thread suspended above; nothing until
+    // the resume allocates or takes a lock the thread could hold besides
+    // the unwinder's own.
     unsafe {
-        if SuspendThread(thread) == u32::MAX {
-            return (frames, (info.priority, info.base_priority));
-        }
         if GetThreadContext(thread, &mut context.0) != 0 {
             unwind_into(context.0, low, high, &mut frames);
         }
@@ -192,6 +316,30 @@ fn name_of(thread: HANDLE) -> String {
 mod tests {
     use super::*;
 
+    /// A raw dump of this process (a sleeping thread kept for it) writes
+    /// its module table and every step's marker, ending in "done".
+    #[test]
+    fn raw_dumps_write_markers_and_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stacks.txt");
+        let file = std::fs::File::create(&path).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let sleeper = std::thread::spawn(move || {
+            let _ = rx.recv();
+        });
+        modules(&file);
+        let mut ids = Vec::with_capacity(8192);
+        dump_raw(&file, 7, &mut ids);
+        drop(tx);
+        sleeper.join().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.lines().any(|l| l.starts_with("module ")), "{text}");
+        assert!(text.contains("dump at 7 s: taking a thread snapshot"));
+        assert!(text.contains("frames"), "{text}");
+        assert!(text.contains("    #0  0x"), "{text}");
+        assert!(text.trim_end().ends_with("dump at 7 s: done"), "{text}");
+    }
+
     #[test]
     fn another_threads_stack_unwinds_to_its_start() {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -220,5 +368,19 @@ mod tests {
         dump_stacks();
         stop_tx.send(()).unwrap();
         parked.join().unwrap();
+    }
+
+    /// Times no `Duration` holds are left out instead of panicking the dump
+    /// thread (`from_secs_f64` panicked on `inf`); the rest come in order.
+    #[test]
+    fn schedules_skip_times_out_of_range() {
+        let secs = |list| {
+            schedule(list)
+                .iter()
+                .map(|d| d.as_secs_f64())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(secs("30, 5,x,-2,inf,NaN,1e20"), [0.0, 5.0, 30.0]);
+        assert!(schedule("").is_empty());
     }
 }

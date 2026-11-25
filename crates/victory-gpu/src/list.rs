@@ -162,11 +162,11 @@ pub(crate) extern "system" fn create_list(
     _nodes: u32,
     kind: u32,
     allocator: This,
-    _pipeline: This,
+    pipeline: This,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    new_list(kind, allocator, iid, out)
+    new_list(kind, allocator, pipeline, iid, out)
 }
 
 /// The console's list creation: type, flags, node mask and barrier batch
@@ -184,7 +184,7 @@ pub(crate) extern "system" fn create_list_x(
     _: This,
     desc: *const ListDesc,
     allocator: This,
-    _pipeline: This,
+    pipeline: This,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
@@ -193,10 +193,16 @@ pub(crate) extern "system" fn create_list_x(
         return E_INVALIDARG;
     };
     tracing::debug!(?desc, "console command list");
-    new_list(desc.kind, allocator, iid, out)
+    new_list(desc.kind, allocator, pipeline, iid, out)
 }
 
-fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) -> HRESULT {
+fn new_list(
+    kind: u32,
+    allocator: This,
+    pipeline: This,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
     if allocator.is_null() {
         return E_INVALIDARG;
     }
@@ -224,9 +230,17 @@ fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) -> HRES
             }
         }),
         #[cfg(windows)]
-        state: Default::default(),
+        state: {
+            let mut state = crate::draw::State::default();
+            state.set_pipeline(pipeline);
+            std::sync::Mutex::new(state)
+        },
     });
-    object::hand_out(LIST, list, iid, &LIST_IIDS, out)
+    let hr = object::hand_out(LIST, list, iid, &LIST_IIDS, out);
+    if hr == S_OK {
+        crate::pipeline::bound(pipeline);
+    }
+    hr
 }
 
 extern "system" fn allocator_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
@@ -271,8 +285,9 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         host.reset();
         state.reset(pipeline);
     });
+    crate::pipeline::bound(pipeline);
     #[cfg(not(windows))]
-    let _ = (this, pipeline);
+    let _ = this;
     S_OK
 }
 
@@ -507,8 +522,10 @@ extern "system" fn copy_texture_region(
             return;
         };
         let Some(to) = crate::resource::host_resource(dst.resource) else {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
+            if !texture_to_buffer(list, &dst, (x, y, z), &src, source_box) {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| tracing::warn!("a texture to buffer copy was dropped"));
+            }
             return;
         };
         let mut from = src;
@@ -590,6 +607,78 @@ extern "system" fn copy_texture_region(
     }
     #[cfg(not(windows))]
     let _ = (this, dst, x, y, z, src, source_box);
+}
+
+#[cfg(test)]
+impl CopyLocation {
+    /// A placed footprint in `resource` (tests).
+    pub(crate) fn placed(resource: This, footprint: crate::resource::PlacedFootprint) -> Self {
+        Self { resource, kind: 1, footprint }
+    }
+    /// Subresource 0 of `resource` (tests).
+    pub(crate) fn whole(resource: This) -> Self {
+        Self { resource, kind: 0, footprint: crate::resource::PlacedFootprint::new(0, 0, 0, 0, 0) }
+    }
+}
+
+/// Texture to buffer (a read back): the copy goes on the GPU into the
+/// buffer's host copy, and the copy-back after the submission puts it in
+/// title memory, as for shader writes. The title then reads it, often
+/// waiting on it first (#50: the main thread slept for good right after
+/// these copies were dropped). False if it cannot be done this way.
+#[cfg(windows)]
+pub(crate) fn texture_to_buffer(
+    list: &crate::host::HostList,
+    dst: &CopyLocation,
+    (x, y, z): (u32, u32, u32),
+    src: &CopyLocation,
+    source_box: *const [u32; 6],
+) -> bool {
+    use windows::core::Interface;
+    const FOOTPRINT: u32 = 1;
+    // Placed footprints start on 512-byte boundaries in a host buffer.
+    const PLACEMENT: u64 = 512;
+    if dst.kind != FOOTPRINT || src.kind == FOOTPRINT {
+        return false;
+    }
+    let (Some(bytes), Some(texture)) = (dst.footprint.bytes(), crate::resource::host_resource(src.resource)) else {
+        return false;
+    };
+    let Some(data) = buffer_range(dst.resource, dst.footprint.offset, bytes) else {
+        return false;
+    };
+    let address = data as u64;
+    let Some(shadow) = crate::shadow::find(address, bytes) else {
+        return false;
+    };
+    // SAFETY: a live buffer.
+    let base = unsafe { shadow.buffer.GetGPUVirtualAddress() };
+    let offset = shadow.gpu(address) - base;
+    if offset % PLACEMENT != 0 || shadow.left(address) < bytes {
+        return false;
+    }
+    if crate::texture::title_written(texture) {
+        crate::texture::upload(list, src.resource, texture);
+    }
+    ensure_state(list, src.resource, COPY_SOURCE);
+    // What the copy does not write keeps the title's bytes; what it writes
+    // goes back after the submission.
+    shadow.refresh(list, address, bytes);
+    shadow.gpu_writes(list, address, bytes, false);
+    let mut to = *dst;
+    to.resource = shadow.buffer.as_raw().cast_const().cast();
+    to.footprint.offset = offset;
+    let mut from = *src;
+    from.resource = texture.as_raw().cast_const().cast();
+    let host_box = (!source_box.is_null()).then(|| source_box.cast());
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| format!("copy texture {:?} to buffer {:?} at {address:#x}, {bytes} bytes", src.resource, dst.resource));
+    // SAFETY: an open list; both locations in the host's layout, naming
+    // live resources; the box is the title's (same layout).
+    unsafe {
+        list.list.CopyTextureRegion((&raw const to).cast(), x, y, z, (&raw const from).cast(), host_box)
+    };
+    true
 }
 
 #[allow(clippy::too_many_arguments)] // the method's own arguments
@@ -840,7 +929,10 @@ extern "system" fn resolve_queries(
         PIPELINE_STATISTICS => (Written::Value(0), 88),
         _ => (Written::Value(0), 16),
     };
-    if offset + u64::from(count) * bytes > size {
+    let Some(end) = offset.checked_add(u64::from(count) * bytes) else {
+        return;
+    };
+    if end > size {
         return;
     }
     for i in 0..u64::from(count) {
@@ -1539,6 +1631,102 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tracing::{Event, Metadata, Subscriber, span};
+
+    struct PipelineBinds(Arc<AtomicUsize>);
+
+    impl Subscriber for PipelineBinds {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            metadata.is_event()
+                && metadata.target() == "victory_gpu::pipeline"
+                && metadata.fields().field("pipeline").is_some()
+                && metadata.fields().field("frame").is_some()
+        }
+
+        fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+            unreachable!()
+        }
+
+        fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+        fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+        fn enter(&self, _: &span::Id) {}
+        fn exit(&self, _: &span::Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            if self.enabled(event.metadata()) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    #[test]
+    fn lists_bind_the_initial_pipeline_on_creation() {
+        use crate::pipeline::{ComputeHead, create_compute};
+
+        // A synthetic compute description matching the public ABI.
+        #[repr(C)]
+        struct ComputeDesc {
+            root: This,
+            code: *const u8,
+            size: usize,
+        }
+
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let desc = ListDesc {
+            kind: 0,
+            flags: 0,
+            nodes: 0,
+            barrier_batch: 0,
+        };
+        let bytes = [0xa5, 0xb6, 0xc7];
+        let compute = ComputeDesc {
+            root: null,
+            code: bytes.as_ptr(),
+            size: bytes.len(),
+        };
+        let compute = std::ptr::from_ref(&compute).cast::<ComputeHead>();
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        let binds = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing::Dispatch::new(PipelineBinds(binds.clone()));
+
+        tracing::dispatcher::with_default(&subscriber, || {
+            for console in [false, true] {
+                let create = |pipeline, out| {
+                    if console {
+                        create_list_x(null, &desc, allocator, pipeline, &LIST_IIDS[1], out)
+                    } else {
+                        create_list(null, 0, 0, allocator, pipeline, &LIST_IIDS[1], out)
+                    }
+                };
+                let mut pipeline = null;
+                let mut list = null;
+                assert_eq!(
+                    create_compute(null, compute, &PAGEABLE_IIDS[0], &mut pipeline),
+                    S_OK
+                );
+                let before = binds.load(Ordering::Relaxed);
+
+                assert_eq!(create(null, &mut list), S_OK);
+                assert_eq!(binds.load(Ordering::Relaxed), before);
+                assert_eq!(release(list), 0);
+
+                assert_eq!(create(pipeline, &mut list), S_OK);
+                assert_eq!(binds.load(Ordering::Relaxed), before + 1);
+                assert_eq!(release(list), 0);
+                assert_eq!(release(pipeline), 0);
+            }
+        });
+        assert_eq!(release(allocator), 0);
+    }
 
     /// ClearUnorderedAccessViewUint/Float and DiscardResource come before
     /// the methods newer lists insert: the AMD upscaler calls them there.
@@ -1605,5 +1793,29 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    /// An offset near `u64::MAX` must not overflow and write outside the
+    /// query destination buffer.
+    #[test]
+    fn resolve_queries_rejects_overflowing_offset() {
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+        let buffer = crate::resource::test_buffer(64);
+        // Used to overflow `offset + count * 8` (panic in debug, wrap in release).
+        resolve_queries(list, null, 0, 0, 2, buffer, u64::MAX - 8);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        for object in [buffer, list, allocator] {
+            assert_eq!(release(object), 0);
+        }
     }
 }

@@ -7,8 +7,8 @@
 //!
 //! "Changed" means a page of the memory changed since the last detiling
 //! ([`crate::watch`], which follows writes through every mapping of the
-//! same physical pages) in the runtime's memory; elsewhere, a content hash
-//! of the whole memory at every submission that samples it.
+//! same physical pages) in the runtime's memory; elsewhere, the whole memory
+//! compared with the bytes last detiled at every submission that samples it.
 //!
 //! shortcut: a change detiles the whole texture, not the pages written.
 //! Textures read through descriptor tables are brought up to date, and for
@@ -38,7 +38,6 @@ macro_rules! once {
 pub(crate) struct Staging {
     buffer: ID3D12Resource,
     /// Its bytes.
-    #[cfg(feature = "diagnostics")]
     size: u64,
     data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
@@ -48,16 +47,16 @@ pub(crate) struct Staging {
     mips: u32,
     memory: *const u8,
     /// The memory's pages changed since detiled (none: not the runtime's
-    /// memory, hashed instead).
+    /// memory, compared instead).
     tracked: Option<crate::watch::Tracked>,
     last: Mutex<Last>,
 }
 
-/// What a texture's staging buffer holds: the hash of the memory detiled
-/// (memory not tracked), with room to read tracked memory into.
+/// What a texture's staging buffer holds: the memory last detiled (memory
+/// not tracked, compared to tell a change), or room to read tracked memory
+/// into.
 #[derive(Default)]
 struct Last {
-    hash: Option<blake3::Hash>,
     read: Vec<u8>,
 }
 
@@ -328,14 +327,16 @@ impl Staging {
         }
         // SAFETY: committed memory of the texture's layout size.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = blake3::hash(tiled);
+        // Compared with the bytes last detiled, which tracked memory keeps
+        // as well. Hashing them instead ran at 0.45 GB/s under Wine on
+        // Rosetta (blake3's AVX2 code, emulated), where no memory is
+        // tracked: 30-250 ms per frame; the comparison runs at memory speed.
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-        if last.hash == Some(hash) {
+        if !take_changed(&mut last.read, tiled) {
             return (size, false);
         }
-        last.hash = Some(hash);
-        self.detile(tiled);
+        self.detile(&last.read);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         (size, true)
@@ -355,8 +356,10 @@ impl Staging {
             let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
-            let len = pitch * rows as usize * f.Depth as usize;
-            // SAFETY: the subresource's part of the mapped staging buffer.
+            let len = subresource_len(footprint.Offset, pitch, rows, f.Depth, self.size);
+            // SAFETY: `subresource_len` clamps `len` to `self.size - footprint.Offset`,
+            // keeping the slice strictly inside the mapped staging buffer even when
+            // GetCopyableFootprints does not pad the final row of the last subresource.
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
@@ -371,21 +374,54 @@ impl Staging {
     }
 }
 
-/// Whether `[at, at + len)` is committed memory (streamed textures may be
-/// unmapped until their pages arrive).
+/// Whether `memory` differs from `last`, the bytes last detiled, which then
+/// take its bytes.
+fn take_changed(last: &mut Vec<u8>, memory: &[u8]) -> bool {
+    if last[..] == *memory {
+        return false;
+    }
+    last.clear();
+    last.extend_from_slice(memory);
+    true
+}
+
+/// Bytes available in the staging buffer for a subresource at `offset`.
+/// D3D12's `GetCopyableFootprints` omits trailing row-pitch padding on the
+/// final row of the final subresource, so `pitch * rows * depth` can exceed
+/// `total - offset`.
+fn subresource_len(offset: u64, pitch: usize, rows: u32, depth: u32, total: u64) -> usize {
+    let padded = pitch
+        .saturating_mul(rows as usize)
+        .saturating_mul(depth as usize);
+    let remaining = usize::try_from(total.saturating_sub(offset)).unwrap_or(usize::MAX);
+    padded.min(remaining)
+}
+
+/// Whether `[at, at + len)` is committed, readable memory (streamed textures
+/// may be unmapped until their pages arrive).
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
     let mut p = at as usize;
-    let end = p + len;
+    let Some(end) = p.checked_add(len) else {
+        return false;
+    };
     while p < end {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
         let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
-        if n == 0 || info.State != MEM_COMMIT {
+        let unreadable = info.Protect == 0
+            || info.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0;
+        if n == 0 || info.State != MEM_COMMIT || unreadable {
             return false;
         }
-        p = info.BaseAddress as usize + info.RegionSize;
+        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        if next <= p {
+            return false;
+        }
+        p = next;
     }
     true
 }
@@ -446,7 +482,6 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let layout_size = layout.size as usize;
     let s = Arc::new(Staging {
         buffer,
-        #[cfg(feature = "diagnostics")]
         size: total,
         data,
         footprints,
@@ -459,4 +494,55 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     *held = Some(s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subresource_len_stays_inside_staging_total() {
+        // A 4x4 RGBA8 texture has RowPitch=256, rows=4, last_row=16 -> total=784.
+        // Padded size (1024) must be clamped to 784 so from_raw_parts_mut stays in bounds.
+        assert_eq!(subresource_len(0, 256, 4, 1, 784), 784);
+        assert_eq!(subresource_len(512, 256, 4, 1, 784), 272);
+        assert_eq!(subresource_len(0, 256, 4, 1, 2048), 1024);
+    }
+
+    #[test]
+    fn untracked_memory_reads_as_changed_once_per_change() {
+        let mut last = Vec::new();
+        let mut memory = vec![1u8; 4096];
+        assert!(take_changed(&mut last, &memory), "never detiled");
+        assert!(!take_changed(&mut last, &memory));
+        memory[4095] = 2;
+        assert!(take_changed(&mut last, &memory));
+        assert_eq!(last, memory);
+        assert!(!take_changed(&mut last, &memory));
+    }
+
+    #[test]
+    fn committed_rejects_overflow_and_noaccess_pages() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+        assert!(!committed(usize::MAX as *const u8, 16));
+        // SAFETY: reserving and committing one private page for the test, freed below.
+        let noaccess =
+            unsafe { VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS) };
+        assert!(!noaccess.is_null());
+        assert!(!committed(noaccess.cast::<u8>(), 4096));
+        // SAFETY: freeing the allocation above.
+        unsafe { VirtualFree(noaccess, 0, MEM_RELEASE) };
+
+        // Negative control: a readable committed page still passes.
+        // SAFETY: reserving and committing one private page for the test, freed below.
+        let rw =
+            unsafe { VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!rw.is_null());
+        assert!(committed(rw.cast::<u8>(), 4096));
+        // SAFETY: freeing the allocation above.
+        unsafe { VirtualFree(rw, 0, MEM_RELEASE) };
+    }
 }

@@ -9,7 +9,8 @@ SRC="${PREFIX:h}/deps-src"
 WORK="${PREFIX:h}/deps-build"
 BREW="${HOMEBREW_PREFIX:-/opt/homebrew}"
 JOBS="$(sysctl -n hw.ncpu)"
-x86() { arch -x86_64 /usr/bin/env PATH="$BREW/opt/bison/bin:$BREW/opt/flex/bin:$BREW/bin:/usr/bin:/bin:/usr/sbin:/sbin" "$@"; }
+. "${0:A:h}/native-build-tools.sh"
+x86() { arch -x86_64 /usr/bin/env PATH="$NATIVE_TOOLS:$BREW/opt/bison/bin:$BREW/opt/flex/bin:$BREW/bin:/usr/bin:/bin:/usr/sbin:/sbin" "$@"; }
 
 if [[ -f $PREFIX/lib/libgnutls.30.dylib && -f $PREFIX/lib/libfreetype.6.dylib ]]; then
   echo "libraries already built"

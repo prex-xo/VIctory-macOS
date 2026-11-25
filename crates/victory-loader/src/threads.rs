@@ -370,6 +370,15 @@ fn starts_in(thread: windows_sys::Win32::Foundation::HANDLE, module: &std::ffi::
         && found == unsafe { GetModuleHandleA(name) }
 }
 
+/// Whether `address` lies in an image the title loaded (its executable or
+/// one of its DLLs), as opposed to the host's own code.
+pub fn in_title_image(address: usize) -> bool {
+    images().iter().any(|m| {
+        let base = m.image.base();
+        (base..base + m.image.info().size_of_image as usize).contains(&address)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};

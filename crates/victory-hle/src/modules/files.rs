@@ -83,8 +83,15 @@ pub fn mount_at(letter: char, root: &Path) {
 }
 
 /// `root` as UTF-16, absolute, without trailing separators (a drive root
-/// keeps its own).
+/// keeps its own). An empty root is the current directory, as it is to a
+/// path joined to it: it is the title's folder when the title is run by its
+/// file name alone (`victory run GTA6.exe`).
 fn root_wide(root: &Path) -> Vec<u16> {
+    let root = if root.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        root
+    };
     let root = std::path::absolute(root).unwrap_or_else(|_| root.to_owned());
     let mut wide: Vec<u16> = root.as_os_str().encode_wide().collect();
     while wide.len() > 3 && wide.last().is_some_and(|c| SEPARATORS.contains(c)) {
@@ -528,10 +535,32 @@ pub extern "system" fn ReadFile(
     read: *mut u32,
     overlapped: *mut c_void,
 ) -> i32 {
-    let _writing = victory_gpu::kernel_will_write(buffer as usize, len as usize);
-    host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
+    use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, GetLastError, SetLastError};
+    let writing = victory_gpu::kernel_will_write(buffer as usize, len as usize);
+    let done = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
         file, buffer, len, read, overlapped,
-    )
+    );
+    // The title reads the host's last error (ERROR_IO_PENDING for an
+    // overlapped read in flight); what runs after the call here must not
+    // change it (it was 203, a variable not found, from our own setup).
+    // SAFETY: a plain query of the thread's last error.
+    let error = unsafe { GetLastError() };
+    // An overlapped read can still be writing the destination after the
+    // call returns, when the blocks are guarded again, and a kernel write
+    // into a guarded block under Wine on Rosetta stops the process for
+    // good (#50). With tracking on, the read is waited for before the
+    // destination is guarded again; the title still sees the pending
+    // result, and its event or completion port is signalled as before.
+    if done == 0 && error == ERROR_IO_PENDING && !overlapped.is_null() && victory_gpu::fault_tracking() {
+        let mut n = 0u32;
+        host!("kernel32.dll", "GetOverlappedResult": extern "system" fn(*mut c_void, *mut c_void, *mut u32, i32) -> i32)(
+            file, overlapped, &mut n, 1,
+        );
+    }
+    drop(writing);
+    // SAFETY: sets the thread's last error.
+    unsafe { SetLastError(error) };
+    done
 }
 
 /// The host CRT reads large requests straight into the caller's buffer.
@@ -754,6 +783,41 @@ mod tests {
         assert_eq!((&out, n), (b"0123456789", 10));
     }
 
+    /// An overlapped read of a file opened for overlapped I/O: the data
+    /// arrives and the title still sees a pending or finished result as
+    /// the host gave it.
+    #[test]
+    fn overlapped_reads_reach_the_buffer() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, GetLastError};
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.bin");
+        let data: Vec<u8> = (0..1u32 << 20).map(|i| i as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OVERLAPPED)
+            .open(&path)
+            .unwrap();
+        let handle = file.as_raw_handle().cast();
+        let mut out = vec![0u8; data.len()];
+        // An OVERLAPPED (32 bytes), zeroed: a read at offset 0, no event.
+        let mut ov = [0u64; 4];
+        let ok = ReadFile(handle, out.as_mut_ptr(), out.len() as u32, std::ptr::null_mut(), (&raw mut ov).cast());
+        // SAFETY: a plain query of the thread's last error.
+        let error = unsafe { GetLastError() };
+        assert!(ok != 0 || error == ERROR_IO_PENDING, "ReadFile gave {ok}, last error {error}");
+        let mut n = 0;
+        let waited = host!("kernel32.dll", "GetOverlappedResult": extern "system" fn(*mut c_void, *mut c_void, *mut u32, i32) -> i32)(
+            handle, (&raw mut ov).cast(), &mut n, 1,
+        );
+        assert_ne!(waited, 0);
+        assert_eq!(n as usize, data.len());
+        assert!(out == data);
+    }
+
     fn text(v: &[u16]) -> String {
         String::from_utf16_lossy(&v[..v.len() - 1])
     }
@@ -805,6 +869,17 @@ mod tests {
             verbatim(&w(r"\\server\share\")[..15], &w("/x/../../y")[..10]),
             w(r"\\?\UNC\server\share\y")[..22].to_vec()
         );
+    }
+
+    /// A title run by its file name alone has an empty folder: the drive
+    /// over it is the current directory, not the current drive's root.
+    #[test]
+    fn an_empty_root_is_the_current_directory() {
+        let letter = mount(Path::new("")).unwrap();
+        let path = format!(r"{letter}:\a.rpf");
+        let host = translate(&w(&path)[..path.len()]).map(|v| text(&v));
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(host, Some(cwd.join("a.rpf").display().to_string()));
     }
 
     #[test]
