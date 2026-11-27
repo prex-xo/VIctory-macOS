@@ -20,12 +20,9 @@
 use std::ffi::c_void;
 use std::sync::Mutex;
 
-use super::xasync::E_INVALIDARG;
+use super::xasync::{E_INVALIDARG, E_OUTOFMEMORY, E_POINTER};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleModule, hle_export};
-
-const E_POINTER: HRESULT = 0x8000_4003_u32 as i32;
-const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
 
 const CONVOLUTION: u32 = 1;
 /// Option bits that need a stereo stream, and one convolution refuses.

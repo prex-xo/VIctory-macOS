@@ -17,16 +17,19 @@ use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
-use super::xasync::{E_INVALIDARG, E_NOTIMPL};
+use super::lock;
+use super::xasync::{E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
+
+#[path = "gameinput_filter.rs"]
+mod filter;
 
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
 pub const DEVICE_NOT_FOUND: HRESULT = 0x838A_0002_u32 as i32;
 pub const READING_NOT_FOUND: HRESULT = 0x838A_0003_u32 as i32;
 pub const REFERENCE_TOO_OLD: HRESULT = 0x838A_0004_u32 as i32;
-const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
 
 /// Input kinds (bits) our devices have.
 const KEYBOARD_KIND: u32 = 0x10;
@@ -83,30 +86,30 @@ const FALLBACK_BUTTONS: [(u8, u32); 14] = [
 /// A gamepad reading: triggers 0 to 1, sticks -1 to 1 (up positive).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct PadState {
-    buttons: u32,
-    left_trigger: f32,
-    right_trigger: f32,
-    left_x: f32,
-    left_y: f32,
-    right_x: f32,
-    right_y: f32,
+pub(crate) struct PadState {
+    pub(crate) buttons: u32,
+    pub(crate) left_trigger: f32,
+    pub(crate) right_trigger: f32,
+    pub(crate) left_x: f32,
+    pub(crate) left_y: f32,
+    pub(crate) right_x: f32,
+    pub(crate) right_y: f32,
 }
 
 /// One key held down: scan code (0xE0xx when extended), character, key.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct KeyState {
-    scan_code: u32,
-    code_point: u32,
-    virtual_key: u8,
-    dead_key: bool,
+pub(crate) struct KeyState {
+    pub(crate) scan_code: u32,
+    pub(crate) code_point: u32,
+    pub(crate) virtual_key: u8,
+    pub(crate) dead_key: bool,
 }
 
 const _: () = assert!(size_of::<KeyState>() == 12 && size_of::<PadState>() == 28);
 
 /// Host input, or a fake in tests.
-trait Source: Send {
+pub(crate) trait Source: Send {
     /// The pad in host slot `slot`, `None` when the slot is empty.
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
@@ -352,11 +355,15 @@ struct Slot {
 
 struct State {
     slots: [Slot; DEVICES],
+    /// Host slots that have reported non-rest input on their current connection.
+    seen_input: [bool; PADS],
     callbacks: Vec<Registration>,
     /// Asynchronous enumerations, delivered by the next poll.
     pending: Vec<Event>,
     /// Device callbacks running now: token and thread.
     running: Vec<(u64, ThreadId)>,
+    /// Opt-in input latch and stick deadzone filters.
+    filter: filter::InputFilter,
 }
 
 pub struct Hub {
@@ -368,10 +375,6 @@ pub struct Hub {
     state: Mutex<State>,
     /// A device callback returned.
     returned: Condvar,
-}
-
-fn lock<T: ?Sized>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 // SAFETY: the back pointers are set before the hub is shared and never
@@ -398,9 +401,11 @@ impl Hub {
             source: Mutex::new(source),
             state: Mutex::new(State {
                 slots: Default::default(),
+                seen_input: [false; PADS],
                 callbacks: Vec::new(),
                 pending: Vec::new(),
                 running: Vec::new(),
+                filter: filter::InputFilter::default(),
             }),
             returned: Condvar::new(),
         }));
@@ -416,7 +421,8 @@ impl Hub {
 
     /// A hub over the host's input, polled from now on.
     fn start(source: Box<dyn Source>) -> &'static Hub {
-        let hub = Hub::new(source);
+        let hub = Hub::new(super::gameinput_script::wrap(source));
+        hub.state().filter = filter::InputFilter::from_env();
         hub.poll();
         std::thread::spawn(move || {
             loop {
@@ -433,19 +439,16 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let (pads, keys, scripted) = {
             let mut source = lock(&self.source);
-            let mut pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
+            let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
             #[cfg(any(test, feature = "diagnostics"))]
-            {
-                let scripted = source.scripted_keys();
-                merge_scripted(&mut pads, &scripted);
-            }
+            let scripted = source.scripted_keys();
             #[cfg(not(any(test, feature = "diagnostics")))]
-            let _ = &mut pads;
-            (pads, source.keys())
+            let scripted: [KeyState; 0] = [];
+            (pads, source.keys(), scripted)
         };
-        let events = self.state().poll(&self.devices, pads, keys);
+        let events = self.state().poll(&self.devices, pads, keys, &scripted);
         self.deliver(events);
     }
 
@@ -490,15 +493,48 @@ impl State {
         devices: &[Device; DEVICES],
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        scripted: &[KeyState],
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
+        // A wireless receiver answers for a switched-off pad with an all-zero
+        // report; ignore a slot until its current connection reports input.
+        let mut pads: [Option<PadState>; PADS] = std::array::from_fn(|slot| {
+            let Some(pad) = pads[slot] else {
+                self.seen_input[slot] = false;
+                return None;
+            };
+            if pad != PadState::default() {
+                self.seen_input[slot] = true;
+            }
+            self.seen_input[slot].then_some(pad)
+        });
+        self.filter.apply_deadzone(&mut pads);
+        #[cfg(any(test, feature = "diagnostics"))]
+        merge_scripted(&mut pads, scripted);
+        #[cfg(not(any(test, feature = "diagnostics")))]
+        let _ = (&mut pads, scripted);
         let any_pad = pads.iter().any(Option::is_some);
         for (slot, pad) in pads.into_iter().enumerate() {
+            let pad = self.filter.latch(slot, pad, now);
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
-        self.update(devices, FALLBACK, fallback, now, &mut events);
+        let fallback = (!any_pad).then(|| {
+            let base = fallback(&keys);
+            #[cfg(any(test, feature = "diagnostics"))]
+            if !scripted.is_empty() {
+                return merge_pad(base, fallback(scripted));
+            }
+            base
+        });
+        let fallback = self.filter.latch(FALLBACK, fallback, now);
+        self.update(
+            devices,
+            FALLBACK,
+            fallback.map(Value::Pad),
+            now,
+            &mut events,
+        );
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
     }
@@ -632,7 +668,7 @@ extern "system" fn current_reading(
     out: Out,
 ) -> HRESULT {
     let hub = hub(this);
-    let state = hub.state();
+    let mut state = hub.state();
     let newest = |i: usize| {
         state.slots[i]
             .history
@@ -657,7 +693,14 @@ extern "system" fn current_reading(
         sequence = found.map(|r| r.sequence),
         "current reading"
     );
-    hand(out, found)
+    let handed = found.and_then(|r| hub.index(r.device));
+    let hr = hand(out, found);
+    if hr == S_OK
+        && let Some(index) = handed
+    {
+        state.filter.handed(index, now());
+    }
+    hr
 }
 
 /// The reading after (`forward`) or before `reference`: on `device`, or with
@@ -745,9 +788,13 @@ extern "system" fn temporal_reading(
     let Some(index) = hub.index(device) else {
         return fail(out, E_INVALIDARG);
     };
-    let state = hub.state();
+    let mut state = hub.state();
     let history = &state.slots[index].history;
-    hand(out, history.iter().rev().find(|r| r.timestamp <= time))
+    let hr = hand(out, history.iter().rev().find(|r| r.timestamp <= time));
+    if hr == S_OK {
+        state.filter.handed(index, now());
+    }
+    hr
 }
 
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
@@ -1118,6 +1165,554 @@ pub(crate) fn module() -> HleModule {
     }
 }
 
+/// How long each scripted press is held by default.
+#[cfg(any(test, windows))]
+const PRESS: Duration = Duration::from_millis(200);
+
+/// How often `VICTORY_KEYS_FILE` is looked at, at most.
+#[cfg(any(test, windows))]
+const FILE_POLL: Duration = Duration::from_millis(100);
+
+/// One scripted key: held from `from` until `to`; with `every`, pressed
+/// again each `every` (each press lasts `hold`).
+#[cfg(any(test, windows))]
+#[derive(Debug, PartialEq)]
+struct Scripted {
+    from: Duration,
+    to: Duration,
+    every: Option<Duration>,
+    /// How long each repeated press is held (`+<hold>`; [`PRESS`] by default).
+    hold: Duration,
+    vk: u8,
+}
+
+/// The virtual key a script names: a letter, a digit, or `Enter`, `Esc`,
+/// `Tab`, `Back`, `Up`, `Down`, `Left`, `Right`.
+#[cfg(any(test, windows))]
+fn key_named(name: &str) -> Option<u8> {
+    Some(match name.trim() {
+        "Enter" => 0x0D,
+        "Esc" => 0x1B,
+        "Tab" => 0x09,
+        "Back" => 0x08,
+        "Up" => 0x26,
+        "Down" => 0x28,
+        "Left" => 0x25,
+        "Right" => 0x27,
+        k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+            k.as_bytes()[0].to_ascii_uppercase()
+        }
+        _ => return None,
+    })
+}
+
+/// One complete number at the start of `s`, and the rest of `s`: digits with
+/// an optional decimal point and an optional exponent (`[eE][+-]?` plus
+/// digits), so scientific notation (`1e-3`, `1E+3`) is one number and its
+/// `-`/`+` is part of the number, not a range or hold separator. The number
+/// must run up to one of `delims` or to the end of `s` — trailing characters
+/// (`5x`, `1e`, `2extra`) invalidate the entry instead of leaving a shorter
+/// number — and must convert to a finite, non-negative [`Duration`] (`1e309`
+/// overflows; `NaN`, `inf`, `-1` never scan as a number at all).
+#[cfg(any(test, windows))]
+fn take_time<'a>(s: &'a str, delims: &str) -> Option<(Duration, &'a str)> {
+    let s = s.trim_start();
+    let b = s.as_bytes();
+    let mut i = 0;
+    if i < b.len() && b[i] == b'+' {
+        i += 1;
+    }
+    let mut digits = 0;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+        digits += 1;
+    }
+    if i < b.len() && b[i] == b'.' {
+        i += 1;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+            digits += 1;
+        }
+    }
+    if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+        let mut j = i + 1;
+        if j < b.len() && (b[j] == b'+' || b[j] == b'-') {
+            j += 1;
+        }
+        let exponent = j;
+        while j < b.len() && b[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j > exponent {
+            i = j; // an exponent with digits belongs to the number
+        }
+    }
+    if digits == 0 {
+        return None;
+    }
+    let rest = s[i..].trim_start();
+    if !rest.is_empty() && !delims.as_bytes().contains(&rest.as_bytes()[0]) {
+        return None;
+    }
+    let secs = s[..i].parse::<f64>().ok()?;
+    if !secs.is_finite() || secs < 0.0 {
+        return None;
+    }
+    Some((Duration::try_from_secs_f64(secs).ok()?, rest))
+}
+
+/// The entries of a `VICTORY_KEYS` list; one that does not parse is left
+/// out. An entry is `<span>[/<every>[+<hold>]]`, then `:`, then a key name:
+/// `<span>` is `<from>-<to>` (bounds; empty parts default to the start, 0,
+/// or no end), and `/<every>[+<hold>]` presses the key again each `<every>`
+/// seconds, each press `<hold>` long (0.2 s by default). A plain
+/// `<seconds>:<key>` is one 0.2 s press at that time.
+#[cfg(any(test, windows))]
+fn parse_script(list: &str) -> Vec<Scripted> {
+    list.split(',')
+        .filter_map(|entry| {
+            let (at, key) = entry.split_once(':')?;
+            let vk = key_named(key)?;
+            // `<from>-<to>/<every>[+<hold>]`: the `/<every>` part is optional,
+            // and `+<hold>` (shorter than `<every>`) lengthens each press,
+            // e.g. for prompts that skip only while the key is held.
+            let (span, every, hold) = match at.split_once('/') {
+                Some((span, rest)) => {
+                    let (every, rest) = take_time(rest, "+")?;
+                    let hold = match rest.strip_prefix('+') {
+                        Some(hold) => take_time(hold, "")?.0,
+                        None => PRESS,
+                    };
+                    if hold.is_zero() || every <= hold {
+                        return None;
+                    }
+                    (span, Some(every), hold)
+                }
+                None => (at, None, PRESS),
+            };
+            let (from, rest) = if span.trim().is_empty() {
+                every?;
+                (Duration::ZERO, span)
+            } else {
+                take_time(span, "-")?
+            };
+            let to = match rest.trim_start().strip_prefix('-') {
+                Some(to) => take_time(to, "")?.0,
+                None => match every {
+                    // `<seconds>:<key>`: one press, held the default time.
+                    None => from.checked_add(PRESS)?,
+                    // A repeat with no end bound runs for as long as input does.
+                    Some(_) => Duration::MAX,
+                },
+            };
+            Some(Scripted {
+                from,
+                to,
+                every,
+                hold,
+                vk,
+            })
+        })
+        .collect()
+}
+
+/// The keys of `script` held `now` after input started.
+#[cfg(any(test, windows))]
+fn held_at(script: &[Scripted], now: Duration) -> Vec<u8> {
+    script
+        .iter()
+        .filter(|k| {
+            if !(k.from..k.to).contains(&now) {
+                return false;
+            }
+            match k.every {
+                // Held for the whole span, or pressed again each period.
+                None => true,
+                Some(every) => (now - k.from).as_nanos() % every.as_nanos() < k.hold.as_nanos(),
+            }
+        })
+        .map(|k| k.vk)
+        .collect()
+}
+
+/// The complete `\n`-terminated lines in `bytes`, and how many bytes they
+/// span. A trailing line without `\n` is left alone: its writer may still
+/// be writing it, so it is consumed only once the `\n` arrives.
+#[cfg(any(test, windows))]
+fn complete_lines(bytes: &[u8]) -> (u64, Vec<&[u8]>) {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let mut used = 0_u64;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'\n' {
+            lines.push(&bytes[start..i]);
+            used = i as u64 + 1;
+            start = i + 1;
+        }
+    }
+    (used, lines)
+}
+
+/// `VICTORY_KEYS_FILE` state: how far into the file we have consumed, the
+/// keys of complete lines waiting to be pressed, and the press in progress.
+#[cfg(any(test, windows))]
+#[derive(Default)]
+struct FileKeys {
+    /// Bytes consumed, just past the last complete line's `\n`.
+    offset: u64,
+    /// The consumed bytes themselves: exactly the file's first `offset`
+    /// bytes as last read, so a rewrite in place can be spotted by comparing
+    /// against them (the file is tiny key-name lines, so keeping them costs
+    /// nothing).
+    consumed: Vec<u8>,
+    /// Keys of complete lines, in file order, not yet pressed.
+    pending: VecDeque<u8>,
+    /// When the file was last looked at, since input started.
+    looked: Duration,
+    /// The press in progress: when it started, which key.
+    held: Option<(Duration, u8)>,
+}
+
+#[cfg(any(test, windows))]
+impl FileKeys {
+    /// Looks at the file when due (`now` since input started), queuing the
+    /// keys of the complete lines written since the last look. Only whole
+    /// `\n`-terminated lines are consumed, so a line a concurrent writer is
+    /// still appending to is pressed once it is complete, never dropped as
+    /// a partial name. The consumed offset is reused only while the file's
+    /// first `offset` bytes are still exactly what was consumed: a rewrite
+    /// in place (even to the same or a longer length) starts parsing over
+    /// from byte 0, so no press is dropped or read from mid-line. A UTF-8
+    /// BOM at byte 0 is skipped, not matched as part of the first key name.
+    fn poll(&mut self, path: &std::path::Path, now: Duration) {
+        if now.saturating_sub(self.looked) < FILE_POLL {
+            return;
+        }
+        self.looked = now;
+        let Ok(bytes) = std::fs::read(path) else {
+            return;
+        };
+        let offset = self.offset as usize;
+        if bytes.len() < offset || bytes[..offset] != self.consumed[..] {
+            // The file was truncated or rewritten in place; start over.
+            self.offset = 0;
+            self.consumed.clear();
+        }
+        let mut start = self.offset as usize;
+        if start == 0 && bytes.starts_with(b"\xEF\xBB\xBF") {
+            start = 3; // a UTF-8 BOM is not part of the first key's name
+        }
+        let rest = &bytes[start..];
+        let (used, lines) = complete_lines(rest);
+        self.consumed
+            .extend_from_slice(&bytes[self.offset as usize..start + used as usize]);
+        self.offset = start as u64 + used;
+        for line in lines {
+            let name = String::from_utf8_lossy(line);
+            tracing::info!(key = %name, "a key was asked for (VICTORY_KEYS_FILE)");
+            if let Some(vk) = key_named(name.trim()) {
+                self.pending.push_back(vk);
+            }
+        }
+    }
+
+    /// The key to hold at `now`: each queued key is pressed for [`PRESS`],
+    /// then released for two more so the title sees separate presses.
+    fn take_held(&mut self, now: Duration) -> Option<u8> {
+        if let Some((since, vk)) = self.held {
+            let age = now.saturating_sub(since);
+            if age < PRESS {
+                return Some(vk);
+            }
+            // A gap between two presses, so the title sees each one.
+            if age < PRESS * 3 {
+                return None;
+            }
+            self.held = None;
+        }
+        let vk = self.pending.pop_front()?;
+        self.held = Some((now, vk));
+        Some(vk)
+    }
+}
+
+#[cfg(test)]
+mod script_tests {
+    use super::*;
+
+    fn s(t: f64) -> Duration {
+        Duration::from_secs_f64(t)
+    }
+
+    fn append(path: &std::path::Path, bytes: &[u8]) {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        file.write_all(bytes).unwrap();
+    }
+
+    #[test]
+    fn key_names() {
+        assert_eq!(key_named("Enter"), Some(0x0D));
+        assert_eq!(key_named(" Esc "), Some(0x1B));
+        assert_eq!(key_named(" esc "), None); // names are case-sensitive
+        assert_eq!(key_named("x"), Some(b'X'));
+        assert_eq!(key_named("7"), Some(b'7'));
+        assert_eq!(key_named("Ent"), None);
+        assert_eq!(key_named(""), None);
+        assert_eq!(key_named("Enter2"), None);
+    }
+
+    #[test]
+    fn scientific_notation_is_one_number() {
+        // `1e-3`/`1E-3` must not split into a `1e`-to-`3` range (which would
+        // fail to parse and drop the key), and `1e+2` is 100, not `1e` + `2`.
+        let script = parse_script("1e-3:Enter,1E-3:Esc,1e+2:Tab,2.5e-1-3:X");
+        assert_eq!(script.len(), 4);
+        assert_eq!(
+            script[0],
+            Scripted {
+                from: s(0.001),
+                to: s(0.201),
+                every: None,
+                hold: PRESS,
+                vk: 0x0D
+            }
+        );
+        assert_eq!(script[1].from, s(0.001));
+        assert_eq!(script[2].from, s(100.0));
+        assert_eq!(script[3].from, s(0.25));
+        assert_eq!(script[3].to, s(3.0));
+        assert_eq!(held_at(&script, s(0.0015)), [0x0D, 0x1B]);
+        assert_eq!(held_at(&script, s(0.0005)), Vec::<u8>::new());
+        assert_eq!(held_at(&script, s(0.3)), [b'X']);
+        assert_eq!(held_at(&script, s(100.05)), [0x09]);
+    }
+
+    #[test]
+    fn plain_presses_hold_200ms() {
+        let script = parse_script("5:Enter,bad,1/x:Up");
+        assert_eq!(script.len(), 1);
+        assert_eq!(held_at(&script, s(4.9)), Vec::<u8>::new());
+        assert_eq!(held_at(&script, s(5.0)), [0x0D]);
+        assert_eq!(held_at(&script, s(5.1)), [0x0D]);
+        assert_eq!(held_at(&script, s(5.2)), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn ranges_hold_the_whole_span() {
+        let script = parse_script("2-10:Down,1e-3-2:Enter");
+        assert_eq!(script.len(), 2);
+        assert_eq!(held_at(&script, s(1.9)), [0x0D]);
+        assert_eq!(held_at(&script, s(1.999)), [0x0D]);
+        assert_eq!(held_at(&script, s(2.0)), [0x28]);
+        assert_eq!(held_at(&script, s(9.999)), [0x28]);
+        assert_eq!(held_at(&script, s(10.0)), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn repeats_press_each_period() {
+        let script = parse_script("2-10/1:Down");
+        assert_eq!(script.len(), 1);
+        // Pressed at 2.0, 3.0, ... for 0.2 s each.
+        assert_eq!(held_at(&script, s(1.95)), Vec::<u8>::new());
+        assert_eq!(held_at(&script, s(2.1)), [0x28]);
+        assert_eq!(held_at(&script, s(2.5)), Vec::<u8>::new());
+        assert_eq!(held_at(&script, s(3.0)), [0x28]);
+        assert_eq!(held_at(&script, s(9.05)), [0x28]);
+        assert_eq!(held_at(&script, s(10.05)), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn unbounded_repeat_from_start_or_a_bound() {
+        let script = parse_script("/0.5:Up,7.3/1:W");
+        assert_eq!(script.len(), 2);
+        // `/<every>:<key>` repeats from the start, with no end bound.
+        assert_eq!(held_at(&script, s(0.1)), [0x26]);
+        assert_eq!(held_at(&script, s(0.3)), Vec::<u8>::new());
+        assert_eq!(held_at(&script, s(100.6)), [0x26]);
+        // A lone start with a period repeats from there, unbounded.
+        assert_eq!(held_at(&script, s(7.35)), [b'W']);
+        assert_eq!(held_at(&script, s(7.6)), [0x26]);
+        assert_eq!(held_at(&script, s(1000.35)), [b'W']);
+    }
+
+    #[test]
+    fn held_repeats_and_refused_periods() {
+        // A hold as long as the period (or zero) would merge the presses
+        // into one, so those entries are refused.
+        let script = parse_script("2-20/3+2.5:Enter,2-20/1+1:A,2-20/1+0:A,2-20/0:B");
+        assert_eq!(script.len(), 1);
+        assert_eq!(held_at(&script, s(2.0)), [0x0D]);
+        assert_eq!(held_at(&script, s(4.4)), [0x0D]);
+        assert_eq!(held_at(&script, s(4.5)), Vec::<u8>::new());
+        assert_eq!(held_at(&script, s(4.6)), Vec::<u8>::new());
+        assert_eq!(held_at(&script, s(5.1)), [0x0D]);
+    }
+
+    #[test]
+    fn mixed_entries() {
+        let script = parse_script("5:Enter, 2-10/1:Down,3-4:A,bad,7/0.1:Up,1/x:Up");
+        assert_eq!(script.len(), 3);
+        assert_eq!(held_at(&script, s(5.1)), [0x0D, 0x28]);
+        assert_eq!(held_at(&script, s(5.3)), Vec::<u8>::new());
+        assert_eq!(held_at(&script, s(3.5)), [b'A']);
+        assert_eq!(held_at(&script, s(3.05)), [0x28, b'A']);
+    }
+
+    #[test]
+    fn complete_lines_only_consumes_terminated_lines() {
+        assert_eq!(complete_lines(b""), (0, Vec::<&[u8]>::new()));
+        assert_eq!(complete_lines(b"Ent"), (0, Vec::<&[u8]>::new()));
+        assert_eq!(complete_lines(b"Enter\nEs"), (6, vec![&b"Enter"[..]]));
+        assert_eq!(
+            complete_lines(b"Enter\nEsc\n"),
+            (10, vec![&b"Enter"[..], &b"Esc"[..]])
+        );
+        assert_eq!(
+            complete_lines(b"\n\nA\n"),
+            (4, vec![&b""[..], &b""[..], &b"A"[..]])
+        );
+    }
+
+    #[test]
+    fn keys_file_waits_for_the_whole_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys");
+        std::fs::write(&path, b"Ent").unwrap();
+        let mut keys = FileKeys::default();
+        // A partial line is not consumed...
+        keys.poll(&path, s(0.2));
+        assert_eq!(keys.offset, 0);
+        assert_eq!(keys.take_held(s(0.2)), None);
+        // ...so when the writer finishes it in chunks, the key is pressed
+        // once the line is complete, not dropped as a partial name.
+        append(&path, b"er\n");
+        keys.poll(&path, s(0.4));
+        assert_eq!(keys.offset, 6);
+        assert_eq!(keys.take_held(s(0.4)), Some(0x0D));
+        assert_eq!(keys.take_held(s(0.45)), Some(0x0D)); // held 0.2 s
+        assert_eq!(keys.take_held(s(0.61)), None); // gap before the next press
+        // The consumed line is not pressed again.
+        keys.poll(&path, s(0.6));
+        assert_eq!(keys.take_held(s(1.2)), None);
+        // Further complete lines queue in order; a trailing partial line
+        // waits for its newline.
+        append(&path, b"Esc\nUp\nEs");
+        keys.poll(&path, s(0.8));
+        assert_eq!(keys.offset, 13);
+        assert_eq!(keys.take_held(s(1.3)), Some(0x1B));
+        assert_eq!(keys.take_held(s(1.4)), Some(0x1B));
+        assert_eq!(keys.take_held(s(1.6)), None);
+        assert_eq!(keys.take_held(s(2.0)), Some(0x26));
+        keys.poll(&path, s(2.4));
+        assert_eq!(keys.offset, 13);
+        append(&path, b"c\n");
+        keys.poll(&path, s(2.8));
+        assert_eq!(keys.offset, 17);
+        assert_eq!(keys.take_held(s(3.0)), Some(0x1B));
+    }
+
+    #[test]
+    fn keys_file_restarts_on_a_shorter_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys");
+        std::fs::write(&path, b"Enter\nEsc\n").unwrap();
+        let mut keys = FileKeys::default();
+        keys.poll(&path, s(0.2));
+        assert_eq!(keys.offset, 10);
+        // The file is replaced by a shorter one: start over.
+        std::fs::write(&path, b"Tab\n").unwrap();
+        keys.poll(&path, s(0.4));
+        assert_eq!(keys.offset, 4);
+        assert_eq!(
+            keys.pending.iter().copied().collect::<Vec<_>>(),
+            vec![0x0D, 0x1B, 0x09]
+        );
+    }
+
+    #[test]
+    fn keys_file_survives_an_in_place_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys");
+        std::fs::write(&path, b"Enter\n").unwrap();
+        let mut keys = FileKeys::default();
+        keys.poll(&path, s(0.2));
+        assert_eq!(keys.offset, 6);
+        // Rewritten in place to different content of the same length: the
+        // consumed prefix no longer matches, so parsing starts over and
+        // the new key is not dropped.
+        std::fs::write(&path, b"Right\n").unwrap();
+        keys.poll(&path, s(0.4));
+        assert_eq!(keys.offset, 6);
+        assert_eq!(keys.take_held(s(0.4)), Some(0x0D));
+        assert_eq!(keys.take_held(s(0.5)), Some(0x0D));
+        assert_eq!(keys.take_held(s(0.7)), None);
+        assert_eq!(keys.take_held(s(1.0)), Some(0x27)); // Right
+        // Rewritten in place to longer content: same, both keys come
+        // through cleanly.
+        std::fs::write(&path, b"Down\nEsc\n").unwrap();
+        keys.poll(&path, s(1.2));
+        assert_eq!(keys.offset, 9);
+        assert_eq!(keys.take_held(s(1.2)), None);
+        assert_eq!(keys.take_held(s(1.6)), Some(0x28)); // Down
+        assert_eq!(keys.take_held(s(1.7)), Some(0x28));
+        assert_eq!(keys.take_held(s(2.0)), None);
+        assert_eq!(keys.take_held(s(2.2)), Some(0x1B)); // Esc
+    }
+
+    #[test]
+    fn keys_file_skips_a_utf8_bom() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys");
+        std::fs::write(&path, "\u{feff}Enter\r\nTab\r\n").unwrap();
+        let mut keys = FileKeys::default();
+        keys.poll(&path, s(0.2));
+        assert_eq!(keys.offset, 15); // BOM (3) + "Enter\r\n" + "Tab\r\n"
+        assert_eq!(keys.take_held(s(0.2)), Some(0x0D));
+        assert_eq!(keys.take_held(s(0.3)), Some(0x0D));
+        assert_eq!(keys.take_held(s(0.5)), None);
+        assert_eq!(keys.take_held(s(0.8)), Some(0x09)); // Tab
+        // A rewrite back to offset 0 with a BOM is skipped again.
+        std::fs::write(&path, "\u{feff}Esc\n").unwrap();
+        keys.poll(&path, s(1.0));
+        assert_eq!(keys.offset, 7);
+        assert_eq!(keys.take_held(s(1.0)), None);
+        assert_eq!(keys.take_held(s(1.4)), Some(0x1B)); // Esc
+    }
+
+    #[test]
+    fn invalid_times_schedule_nothing() {
+        // No falling back to a shorter number, and no unconsumed trailing
+        // characters: each of these entries is refused whole.
+        for bad in [
+            ":Enter",         // missing timestamp with no repeat
+            " :Enter",        // whitespace-only timestamp with no repeat
+            "+:Enter",        // bare leading plus
+            "1e309:Enter",    // overflows Duration
+            "5garbage:Enter", // trailing characters
+            "1e:Enter",       // exponent without digits
+            "NaN:Enter",
+            "inf:Enter",
+            "-1:Enter", // negative
+            "1-2extra:Enter",
+            "/1+0.2extra:Enter",
+        ] {
+            assert!(parse_script(bad).is_empty(), "{bad} parsed");
+        }
+        // Leading `+` and scientific notation still parse cleanly.
+        let script = parse_script("1e-3:Enter,/1e+3+0.5:X,2.5e-1-3:A,+5:Enter");
+        assert_eq!(script.len(), 4);
+        assert_eq!(script[0].from, s(0.001));
+        assert_eq!(script[0].to, s(0.201));
+        assert_eq!(script[1].every, Some(s(1000.0)));
+        assert_eq!(script[1].hold, s(0.5));
+        assert_eq!(script[2].from, s(0.25));
+        assert_eq!(script[2].to, s(3.0));
+        assert_eq!(script[3].from, s(5.0));
+        assert_eq!(script[3].to, s(5.2));
+    }
+}
+
 /// Host input: XInput pads, the keyboard while our process has focus.
 #[cfg(windows)]
 mod host {
@@ -1210,10 +1805,7 @@ mod host {
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
-            #[cfg(feature = "diagnostics")]
             let mut down = scripted();
-            #[cfg(not(feature = "diagnostics"))]
-            let mut down = Vec::new();
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
@@ -1250,42 +1842,47 @@ mod host {
     }
 
     /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus. A key is a
-    /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
-    #[cfg(feature = "diagnostics")]
+    /// 0.2 s that long after input starts, with or without focus. Times are
+    /// seconds, scientific notation included (`1e-3:Enter`); `<from>-<to>:<key>`
+    /// holds the key that whole time, and `/<every>[+<hold>]:<key>` (bounds
+    /// in front, e.g. `<from>-<to>/<every>[+<hold>]:<key>`) presses it again
+    /// every `<every>` seconds, each press `<hold>` long (0.2 s by default),
+    /// e.g. `2-120/1:Enter` to get through menus a second after they are
+    /// ready, not up to a period late, or `2-200/3+2.5:Enter` to hold long
+    /// enough to skip a hold-to-skip cutscene. A key is a letter, a digit, or
+    /// `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`, `Left`, `Right` (the
+    /// stand-in pad's table maps them to buttons).
+    ///
+    /// `VICTORY_KEYS_FILE=<path>`: one key name per line (as above), each
+    /// pressed for 0.2 s once its line is complete (newline-terminated), in
+    /// order, so a script watching the log can press a key exactly when a
+    /// screen is ready (`Add-Content <path> Enter`); a line still being
+    /// written is left for the next look.
+    ///
+    /// In every build, so that unattended runs can get past the title's
+    /// prompts; unset, it holds nothing.
     fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
+        static SCRIPT: LazyLock<(Instant, Vec<Scripted>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
-            let keys = list.split(',').filter_map(|entry| {
-                let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
-                Some((
-                    Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
-                ))
-            });
-            (Instant::now(), keys.collect())
+            (Instant::now(), parse_script(&list))
         });
+        static FILE: LazyLock<Option<std::ffi::OsString>> =
+            LazyLock::new(|| std::env::var_os("VICTORY_KEYS_FILE"));
+        static KEYS_FILE: LazyLock<Mutex<FileKeys>> =
+            LazyLock::new(|| Mutex::new(FileKeys::default()));
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
-        keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
-            .map(|&(_, vk)| vk)
-            .collect()
+        let mut down = held_at(keys, now);
+        if let Some(file) = FILE.as_ref() {
+            let mut asked = lock(&KEYS_FILE);
+            asked.poll(std::path::Path::new(file), now);
+            if let Some(vk) = asked.take_held(now)
+                && !down.contains(&vk)
+            {
+                down.push(vk);
+            }
+        }
+        down
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
@@ -1560,7 +2157,10 @@ mod tests {
         let stand_in = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
         let no_keys = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
         tick();
-        host.lock().unwrap().pads[1] = Some(PadState::default());
+        host.lock().unwrap().pads[1] = Some(PadState {
+            buttons: A,
+            ..Default::default()
+        });
         hub.poll();
         let pad_a = current(hub, GAMEPAD_KIND, 1).unwrap();
         tick();
@@ -1637,7 +2237,10 @@ mod tests {
 
         let unregister = slot::<extern "system" fn(This, u64, u64) -> bool, _>(&hub.object, 0x68);
         assert!(unregister(&hub.object, token, 5000));
-        host.lock().unwrap().pads[0] = Some(PadState::default());
+        host.lock().unwrap().pads[0] = Some(PadState {
+            buttons: A,
+            ..Default::default()
+        });
         hub.poll();
         assert_eq!(log.lock().unwrap().len(), 1);
     }
@@ -1693,7 +2296,10 @@ mod tests {
             ),
             S_OK
         );
-        host.lock().unwrap().pads[1] = Some(PadState::default());
+        host.lock().unwrap().pads[1] = Some(PadState {
+            buttons: A,
+            ..Default::default()
+        });
         let poller = std::thread::spawn(|| hub.poll());
         while !INSIDE.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(1));
@@ -1757,7 +2363,10 @@ mod tests {
         }
         hub.poll();
 
-        assert_eq!(current(hub, GAMEPAD_KIND, FALLBACK), Err(DEVICE_DISCONNECTED));
+        assert_eq!(
+            current(hub, GAMEPAD_KIND, FALLBACK),
+            Err(DEVICE_DISCONNECTED)
+        );
         let r = current(hub, GAMEPAD_KIND, 1).unwrap();
         assert_eq!(
             pad(r),
@@ -1776,5 +2385,177 @@ mod tests {
         let r = current(hub, GAMEPAD_KIND, 1).unwrap();
         assert_eq!(pad(r), physical);
         release(r);
+    }
+
+    #[test]
+    fn switched_off_receiver_does_not_hide_the_keyboard_stand_in() {
+        let (hub, host) = fake();
+        let log = Log::default();
+        register(hub, GAMEPAD_KIND, 2, &log);
+        assert_eq!(*log.lock().unwrap(), [(FALLBACK, STATUS_CONNECTED, 0)]);
+
+        // A receiver answering with an all-zero state while its pad is off
+        // stays disconnected and leaves the keyboard stand-in active.
+        host.lock().unwrap().pads[0] = Some(PadState::default());
+        hub.poll();
+        assert_eq!(log.lock().unwrap().len(), 1);
+        assert_eq!(current(hub, GAMEPAD_KIND, 0), Err(DEVICE_DISCONNECTED));
+
+        host.lock().unwrap().keys = vec![key(0x0D), key(b'W')];
+        hub.poll();
+        let stand_in = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(
+            pad(stand_in),
+            PadState {
+                buttons: A,
+                left_y: 1.0,
+                ..Default::default()
+            }
+        );
+        release(stand_in);
+
+        // Scripted diagnostic keys drive the stand-in without latching the
+        // idle receiver slot as an active physical controller.
+        {
+            let mut h = host.lock().unwrap();
+            h.keys.clear();
+            h.scripted = vec![key(b'X')];
+        }
+        hub.poll();
+        assert_eq!(current(hub, GAMEPAD_KIND, 0), Err(DEVICE_DISCONNECTED));
+        let scripted_r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(pad(scripted_r).buttons, X);
+        release(scripted_r);
+
+        host.lock().unwrap().scripted.clear();
+        hub.poll();
+        let rest = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(pad(rest), PadState::default());
+        release(rest);
+
+        // Turning the pad on and pressing a button connects slot 0, drops the
+        // stand-in, and preserves that first press as the current reading.
+        host.lock().unwrap().pads[0] = Some(PadState {
+            buttons: B,
+            ..Default::default()
+        });
+        hub.poll();
+        assert_eq!(
+            log.lock().unwrap()[1..],
+            [(0, STATUS_CONNECTED, 0), (FALLBACK, 0, STATUS_CONNECTED)]
+        );
+        assert_eq!(
+            current(hub, GAMEPAD_KIND, FALLBACK),
+            Err(DEVICE_DISCONNECTED)
+        );
+        let first = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(first).buttons, B);
+        release(first);
+
+        // Releasing the button back to rest keeps slot 0 connected.
+        host.lock().unwrap().pads[0] = Some(PadState::default());
+        hub.poll();
+        let idle = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(idle), PadState::default());
+        release(idle);
+
+        // Unplugging clears `seen_input` so a later neutral receiver on the
+        // same slot does not take the stand-in away again.
+        host.lock().unwrap().pads[0] = None;
+        hub.poll();
+        assert_eq!(current(hub, GAMEPAD_KIND, 0), Err(DEVICE_DISCONNECTED));
+
+        {
+            let mut h = host.lock().unwrap();
+            h.pads[0] = Some(PadState::default());
+            h.keys = vec![key(0x0D)];
+        }
+        hub.poll();
+        assert_eq!(current(hub, GAMEPAD_KIND, 0), Err(DEVICE_DISCONNECTED));
+        let back = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(pad(back).buttons, A);
+        release(back);
+    }
+
+    #[test]
+    fn input_latch_delivers_tap_once_preserves_held_and_clears_release() {
+        let (hub, host) = fake();
+        let set_pad = |buttons| {
+            host.lock().unwrap().pads[1] = Some(PadState {
+                buttons,
+                left_x: 0.1,
+                ..Default::default()
+            });
+        };
+        let read_pad = |device| {
+            let r = current(hub, GAMEPAD_KIND, device).unwrap();
+            let buttons = pad(r).buttons;
+            release(r);
+            buttons
+        };
+        let tap_pad = || {
+            set_pad(A);
+            hub.poll();
+            set_pad(0);
+            hub.poll();
+        };
+
+        set_pad(0);
+        hub.poll();
+        // Default (off): a tap that ends before the title polls is missed.
+        tap_pad();
+        assert_eq!(read_pad(1), 0);
+
+        // Enabled: a tap between two polls is delivered once, then cleared.
+        hub.state().filter = filter::for_tests(Some(0), 0.0);
+        hub.poll();
+        assert_eq!(read_pad(1), 0);
+        tap_pad();
+        assert_eq!(read_pad(1), A, "tap observed on next reading");
+        hub.poll();
+        assert_eq!(read_pad(1), 0, "cleared once read and released");
+        hub.poll();
+        assert_eq!(read_pad(1), 0);
+
+        // Held button stays down across readings and clears after release.
+        set_pad(B);
+        for _ in 0..3 {
+            hub.poll();
+            assert_eq!(read_pad(1), B);
+        }
+        set_pad(0);
+        hub.poll();
+        assert_eq!(read_pad(1), 0);
+
+        // Disconnect physical pad so fallback keyboard pad is active, then tap Enter (A).
+        host.lock().unwrap().pads[1] = None;
+        hub.poll();
+        assert_eq!(read_pad(FALLBACK), 0);
+        host.lock().unwrap().keys = vec![key(0x0D)];
+        hub.poll();
+        host.lock().unwrap().keys.clear();
+        hub.poll();
+        assert_eq!(read_pad(FALLBACK), A, "fallback pad tap latched");
+        hub.poll();
+        assert_eq!(read_pad(FALLBACK), 0, "fallback pad tap cleared");
+    }
+
+    #[test]
+    fn stick_deadzone_filters_host_pad_through_hub_poll() {
+        let (hub, host) = fake();
+        hub.state().filter = filter::for_tests(None, 0.25);
+        host.lock().unwrap().pads[0] = Some(PadState {
+            left_x: 0.15,
+            left_y: -0.15,
+            right_x: 0.0,
+            right_y: 0.625,
+            ..Default::default()
+        });
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, 0).unwrap();
+        let state = pad(r);
+        release(r);
+        assert_eq!((state.left_x, state.left_y), (0.0, 0.0));
+        assert!(state.right_x == 0.0 && (state.right_y - 0.5).abs() < 1e-6);
     }
 }

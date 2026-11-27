@@ -47,7 +47,7 @@
 //! public); programs use the ratios and the denominator's sign.
 
 use super::{Lower, Why};
-use crate::emit::bitcode::{Attr, Bin, Cast, V, pred};
+use crate::emit::bitcode::{Bin, Cast, V, pred};
 use crate::gfx10::{Fields, Operand};
 use crate::ir::{Inst, Reg};
 use crate::resource::Source;
@@ -60,6 +60,15 @@ enum Nodes {
     Buffer(V, V),
     /// The node's 64-bit GPU address.
     Raw(V),
+}
+
+/// A title-memory lookup of a node's byte: the raw buffer, the byte's
+/// offset in it, its address's low dword.
+#[derive(Clone, Copy)]
+struct Lookup {
+    h: V,
+    at: V,
+    lo: V,
 }
 
 /// A ray: extent, origin, direction, inverse direction (f32).
@@ -127,23 +136,35 @@ impl Lower<'_> {
                 // shortcut: the root address is taken to be 256-byte aligned
                 // (the descriptor drops its low byte, not known here).
                 let (k, dynamic) = self.built_offset(src)?;
-                let three = self.s.m.i32(3);
-                let mut at = self.s.m.bin(c, Bin::Shl, lo, three);
-                let k = self.s.m.i32(k);
-                at = self.s.m.bin(c, Bin::Add, at, k);
-                if let Some(d) = dynamic {
-                    at = self.s.m.bin(c, Bin::Add, at, d);
-                }
                 // A root view is title memory there (bounds-checked).
                 match self.root_address(src) {
                     Some((root_lo, root_hi)) => {
                         self.s.flags |= super::flags::INT64;
-                        let base = wide64(self, root_lo, root_hi);
                         let zero = self.s.m.i32(0);
-                        let at = wide64(self, at, zero);
-                        Nodes::Raw(self.s.m.bin(c, Bin::Add, base, at))
+                        let mut base = wide64(self, root_lo, root_hi);
+                        if k != 0 {
+                            let k = self.s.m.int_const(i64t, i64::from(k));
+                            base = self.s.m.bin(c, Bin::Add, base, k);
+                        }
+                        if let Some(d) = dynamic {
+                            let d = wide64(self, d, zero);
+                            base = self.s.m.bin(c, Bin::Add, base, d);
+                        }
+                        let ptr = wide64(self, lo, node_hi.unwrap_or(zero));
+                        let k3 = self.s.m.int_const(i64t, 3);
+                        let off = self.s.m.bin(c, Bin::Shl, ptr, k3);
+                        Nodes::Raw(self.s.m.bin(c, Bin::Add, base, off))
                     }
-                    None => Nodes::Buffer(self.handle((b, i), src, false, (11, 0))?, at),
+                    None => {
+                        let three = self.s.m.i32(3);
+                        let mut at = self.s.m.bin(c, Bin::Shl, lo, three);
+                        let k = self.s.m.i32(k);
+                        at = self.s.m.bin(c, Bin::Add, at, k);
+                        if let Some(d) = dynamic {
+                            at = self.s.m.bin(c, Bin::Add, at, d);
+                        }
+                        Nodes::Buffer(self.handle((b, i), src, false, (11, 0))?, at)
+                    }
                 }
             }
             Some(_) => return Err("a BVH descriptor"),
@@ -190,18 +211,32 @@ impl Lower<'_> {
 
     /// The four result dwords of `ray` against the node `node` points to.
     fn bvh_lanes(&mut self, nodes: &Nodes, node: V, ray: &Ray) -> Result<[V; 4], Why> {
-        let w = self.node_dwords(nodes, 0, 16)?;
         let c = self.cur;
         let seven = self.s.m.i32(7);
         let ty = self.s.m.bin(c, Bin::And, node, seven);
+        let six = self.s.m.i32(6);
+        // Types 6 (instance) and 7 (procedural, including `INVALID = 0xFFFF_FFFF`)
+        // always return `[INVALID; 4]`; skip loading their node memory so sentinel
+        // or unhandled pointers never read unmapped title memory or mark misses.
+        let known = self.s.m.cmp(c, pred::IULT, ty, six);
+        let outer = self.begin_guarded(Some(known));
+        let (w, head) = match self.node_dwords(nodes, 0, 16, None) {
+            Ok(loaded) => loaded,
+            Err(why) => {
+                self.end_guarded(outer, &[]);
+                return Err(why);
+            }
+        };
+        let c = self.cur;
         // The rest of a box32 node, read only for one.
         let five = self.s.m.i32(5);
         let is32 = self.s.m.cmp(c, pred::EQ, ty, five);
         let at = self.begin_guarded(Some(is32));
-        let tail = match self.node_dwords(nodes, 16, 12) {
-            Ok(t) => t,
+        let tail = match self.node_dwords(nodes, 16, 12, head) {
+            Ok((t, _)) => t,
             Err(why) => {
                 self.end_guarded(at, &[]);
+                self.end_guarded(outer, &[]);
                 return Err(why);
             }
         };
@@ -213,22 +248,32 @@ impl Lower<'_> {
         let tri = self.bvh_triangle(&w, ty, ray);
         let c = self.cur;
         let four = self.s.m.i32(4);
-        let six = self.s.m.i32(6);
         let is_tri = self.s.m.cmp(c, pred::IULT, ty, four);
-        let t6 = self.s.m.bin(c, Bin::And, ty, six);
-        let is_box = self.s.m.cmp(c, pred::EQ, t6, four);
+        let r: [V; 4] = std::array::from_fn(|k| self.s.m.select(c, is_tri, tri[k], boxes[k]));
         let none = self.s.m.i32(INVALID);
-        Ok(std::array::from_fn(|k| {
-            let x = self.s.m.select(c, is_box, boxes[k], none);
-            self.s.m.select(c, is_tri, tri[k], x)
-        }))
+        let r = self.end_guarded(outer, &r.map(|x| (x, none)));
+        Ok([r[0], r[1], r[2], r[3]])
     }
 
-    /// `n` dwords of the node from dword `from`.
-    fn node_dwords(&mut self, nodes: &Nodes, from: u32, n: u32) -> Result<Vec<V>, Why> {
-        let (h, at) = match *nodes {
-            Nodes::Buffer(h, at) => (h, at),
-            Nodes::Raw(address) => return self.raw_load(address, 4 * from, n),
+    /// `n` dwords of the node from dword `from`, and in title memory the
+    /// lookup they were read through, which reads past the first 64 bytes
+    /// may reuse (`head`, [`Self::raw_load_past`]).
+    fn node_dwords(
+        &mut self,
+        nodes: &Nodes,
+        from: u32,
+        n: u32,
+        head: Option<Lookup>,
+    ) -> Result<(Vec<V>, Option<Lookup>), Why> {
+        let (h, at) = match (nodes, head) {
+            (&Nodes::Buffer(h, at), _) => (h, at),
+            (&Nodes::Raw(address), None) => {
+                let (out, lookup) = self.raw_load(address, 4 * from, n);
+                return Ok((out, Some(lookup)));
+            }
+            (&Nodes::Raw(address), Some(head)) => {
+                return Ok((self.raw_load_past(address, head, 4 * from, n), None));
+            }
         };
         let c = self.cur;
         let (u, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
@@ -238,25 +283,19 @@ impl Lower<'_> {
             let off = self.s.m.i32(4 * (from + k));
             let off = self.s.m.bin(c, Bin::Add, at, off);
             let mask = self.s.m.i8((1u8 << m) - 1);
-            let r = self.s.op(
-                c,
-                "rawBufferLoad.f32",
-                Attr::ReadOnly,
-                self.s.t.res_ret,
-                139,
-                &[h, off, u, mask, align],
-            );
+            let r = self.raw_buffer_load(c, &[h, off, u, mask, align]);
             for j in 0..m {
                 let x = self.s.m.extract(c, r, j);
                 out.push(self.as_int(x));
             }
         }
-        Ok(out)
+        Ok((out, None))
     }
 
     /// `dwords` dwords at byte `offset` past `address`, a 64-bit GPU address
-    /// (`i64`), from title memory ([`Lower::memory`]).
-    fn raw_load(&mut self, address: V, offset: u32, dwords: u32) -> Result<Vec<V>, Why> {
+    /// (`i64`), from title memory ([`Lower::memory`]), and the lookup they
+    /// were read through.
+    fn raw_load(&mut self, address: V, offset: u32, dwords: u32) -> (Vec<V>, Lookup) {
         let c = self.cur;
         let i64t = self.s.m.int(64);
         let off = self.s.m.int_const(i64t, i64::from(offset));
@@ -270,28 +309,44 @@ impl Lower<'_> {
         let hi = self.s.m.bin(c, Bin::And, hi, mask);
         // A node (64 bytes, 64-byte aligned) lies in one 64 KiB page.
         let (h, at) = self.memory(lo, hi, 4 * dwords, false, None);
+        let lookup = Lookup { h, at, lo };
+        (self.raw_dwords(&lookup, 0, dwords), lookup)
+    }
+
+    /// [`Self::raw_load`] at byte `offset` past `address`, whose first byte
+    /// `head` looked up. Where byte `offset` lies in the head's 64 KiB page
+    /// the dwords are read through its lookup (the same view, its offset
+    /// plus `offset`; a miss there is marked already): only lanes whose node
+    /// crosses into the next page look up again.
+    fn raw_load_past(&mut self, address: V, head: Lookup, offset: u32, dwords: u32) -> Vec<V> {
+        let c = self.cur;
+        let (page, last) = (self.s.m.i32(0xFFFF), self.s.m.i32(0x1_0000 - offset));
+        let x = self.s.m.bin(c, Bin::And, head.lo, page);
+        let crosses = self.s.m.cmp(c, pred::IUGE, x, last);
+        let reused = self.raw_dwords(&head, offset, dwords);
+        let at = self.begin_guarded(Some(crosses));
+        let (own, _) = self.raw_load(address, offset, dwords);
+        let pairs: Vec<(V, V)> = own.into_iter().zip(reused).collect();
+        self.end_guarded(at, &pairs)
+    }
+
+    /// `dwords` dwords at byte `offset` past a lookup's byte.
+    fn raw_dwords(&mut self, lookup: &Lookup, offset: u32, dwords: u32) -> Vec<V> {
         let c = self.cur;
         let (u, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
         let mut out = Vec::new();
         for k in (0..dwords).step_by(4) {
             let m = (dwords - k).min(4);
-            let o = self.s.m.i32(4 * k);
-            let o = self.s.m.bin(c, Bin::Add, at, o);
+            let o = self.s.m.i32(offset + 4 * k);
+            let o = self.s.m.bin(c, Bin::Add, lookup.at, o);
             let mask = self.s.m.i8((1u8 << m) - 1);
-            let r = self.s.op(
-                c,
-                "rawBufferLoad.f32",
-                Attr::ReadOnly,
-                self.s.t.res_ret,
-                139,
-                &[h, o, u, mask, align],
-            );
+            let r = self.raw_buffer_load(c, &[lookup.h, o, u, mask, align]);
             for j in 0..m {
                 let x = self.s.m.extract(c, r, j);
                 out.push(self.as_int(x));
             }
         }
-        Ok(out)
+        out
     }
 
     /// The child pointers of a box node (`w`: its 28 dwords, past 16 zero
@@ -300,7 +355,6 @@ impl Lower<'_> {
         let c = self.cur;
         let four = self.s.m.i32(4);
         let is16 = self.s.m.cmp(c, pred::EQ, ty, four);
-        let f32t = self.s.t.f32;
         let zero = self.s.m.f32(0);
         let (inf, ninf) = (
             self.s.m.f32(f32::INFINITY.to_bits()),
@@ -322,9 +376,7 @@ impl Lower<'_> {
                 } else {
                     half
                 };
-                let half = self
-                    .s
-                    .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[half]);
+                let half = self.f16_to_f32(c, half);
                 *x = self.s.m.select(c, is16, half, wide);
             }
             let mut nan = self.s.m.bool(false);

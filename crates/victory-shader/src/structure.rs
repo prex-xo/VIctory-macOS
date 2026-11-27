@@ -49,14 +49,20 @@ pub enum Atom {
     Lane(Value),
     /// An SCC value, the same in every lane.
     Uniform(Value),
+    /// Some lane of the console wave satisfies the predicate.
+    Any(Bool),
     /// A lane mask joined at a block entry, by its low dword's phi.
     Phi(Value),
+    /// A literal mask join by its exact pair of dword values.
+    PairPhi(Value, Value),
     /// `s_wqm` result: some lane of the quad is in the source mask.
     Quad(Value),
     /// A mask the pass cannot see into (loaded, built from scalars, an
     /// EXEC write it does not follow): the lane's bit of the register pair
     /// this value is a dword of.
     Opaque(Value),
+    /// A literal mask held in two scalar dwords.
+    OpaquePair(Value, Value),
     /// A constant mask other than all lanes or none.
     Constant(u64),
 }
@@ -75,9 +81,10 @@ pub struct Bools {
     overflow: bool,
 }
 
-/// The tables below have small integer keys; SipHash dominated run time.
-type Map<K, V> = HashMap<K, V, BuildHasherDefault<Fx>>;
-type Set<K> = HashSet<K, BuildHasherDefault<Fx>>;
+/// The tables below have small integer keys; SipHash dominated run time. The
+/// emitter's tables (`emit::lower`, `emit::bitcode`) use the same hasher.
+pub type Map<K, V> = HashMap<K, V, BuildHasherDefault<Fx>>;
+pub type Set<K> = HashSet<K, BuildHasherDefault<Fx>>;
 
 /// A set of what a walk has met: a list scan while it is small (most lane
 /// masks are a handful of nodes), a hash set once it grows.
@@ -116,7 +123,7 @@ impl<T: Copy + Eq + std::hash::Hash> Seen<T> {
 
 /// FxHash's multiply-rotate step.
 #[derive(Default)]
-struct Fx(u64);
+pub struct Fx(u64);
 
 impl Hasher for Fx {
     fn finish(&self) -> u64 {
@@ -429,7 +436,7 @@ impl Bools {
 pub enum LaneExit {
     Jump(usize),
     /// To `taken` in lanes where `when` holds. A condition over
-    /// [`Atom::Uniform`]s only is a uniform branch.
+    /// [`Atom::Uniform`] and [`Atom::Any`] predicates is a uniform branch.
     Branch {
         when: Bool,
         taken: usize,
@@ -439,10 +446,16 @@ pub enum LaneExit {
     Indirect,
 }
 
-/// A [`Program`] as one lane runs it: same blocks, per-lane branches.
+/// Lane conditions and branches of a [`Program`].
 #[derive(Debug, Clone)]
 pub struct Structured {
     pub bools: Bools,
+    /// Every lane follows the console wave through the blocks.
+    pub(crate) literal: bool,
+    /// The incoming lane predicates of each literal mask join.
+    pub(crate) mask_inputs: Map<Key, Vec<Bool>>,
+    /// SCC values computed by votes over a mask in literal mode.
+    pub(crate) scc_votes: Map<Value, Bool>,
     /// Per block.
     pub exits: Vec<LaneExit>,
     /// Per block and instruction: the condition, beyond reaching it, under
@@ -454,27 +467,43 @@ pub struct Structured {
     /// edges; a loop header forgets what its loop redefines).
     pub reach: Vec<Bool>,
     /// The lane's bit of each lane-mask value, by its low dword's value.
-    pub masks: HashMap<Value, Bool>,
+    pub masks: Map<Value, Bool>,
     /// Lane masks not derived from EXEC or VALU results (constants, opaque
     /// values, uniform selects) resolved at uses such as `v_cndmask_b32`.
-    pub other: HashMap<Value, Bool>,
+    pub other: Map<Value, Bool>,
     /// Exact Wave64 pairs for checking masks at their uses.
     paired_masks: Map<Key, Bool>,
+    paired_other: Map<Key, Bool>,
     /// Wave64 masks: low dword's value by the high dword's.
-    pub highs: HashMap<Value, Value>,
+    pub highs: Map<Value, Value>,
     /// Masks (low dwords) set only in lanes whose EXEC bit is set where
     /// they are written: every such lane reaches the writing block, so a
     /// ballot there gives the mask as data.
-    pub active: HashSet<Value>,
+    pub active: Set<Value>,
     /// `v_readlane_b32` results of a constant lane: the SGPR value that
     /// `v_writelane_b32` spilled to that lane, the same along every path.
-    pub restored: HashMap<Value, Value>,
+    pub restored: Map<Value, Value>,
     /// A pixel's discards, by block and instruction: the lanes (EXEC there)
     /// the instruction takes out of the live mask, which here stay in it.
-    pub discards: HashMap<(usize, usize), Bool>,
+    pub discards: Map<(usize, usize), Bool>,
 }
 
 impl Structured {
+    pub(crate) fn select_mask(&self, low: Value, high: Option<Value>) -> Option<Bool> {
+        if self.literal {
+            let key = (low, high?);
+            self.paired_masks
+                .get(&key)
+                .or_else(|| self.paired_other.get(&key))
+                .copied()
+        } else {
+            self.masks
+                .get(&low)
+                .or_else(|| self.other.get(&low))
+                .copied()
+        }
+    }
+
     pub(crate) fn mask_bits(&self, low: Value, high: Option<Value>) -> Option<Bool> {
         match high {
             Some(high) => self.paired_masks.get(&(low, high)),
@@ -497,8 +526,16 @@ pub fn killing(program: &Program) -> Result<Structured, ShaderError> {
     structure_as(program, false)
 }
 
+/// Builds the whole-wave form with the console's EXEC at each vector use.
+pub(crate) fn split_literal(program: &Program) -> Result<Structured, ShaderError> {
+    let mut l = Lanes::new(program, true)?;
+    let execs = l.masks_in_order();
+    let reach = vec![Bool::TRUE; program.blocks.len()];
+    l.finish(&execs, &reach)
+}
+
 fn structure_as(program: &Program, helpers: bool) -> Result<Structured, ShaderError> {
-    let mut l = Lanes::new(program)?;
+    let mut l = Lanes::new(program, false)?;
     if !helpers {
         l.kills.clear();
     }
@@ -520,6 +557,8 @@ type Key = (Value, Value);
 
 struct Lanes<'a> {
     p: &'a Program,
+    literal: bool,
+    pair_joins: Map<Key, Vec<Key>>,
     order: Vec<usize>,
     /// Reverse-postorder index per block.
     index: Vec<usize>,
@@ -539,6 +578,7 @@ struct Lanes<'a> {
     /// For branches: SCC of a mask operation ("some lane is set") as the
     /// lane's own bit.
     scc_lane: Map<Value, Bool>,
+    scc_votes: Map<Value, Bool>,
     /// Joins resolved to a constant, to check once all edges are known.
     joins: Vec<Join>,
     /// Per block: what a lane knows on entry, over forward edges only.
@@ -546,7 +586,7 @@ struct Lanes<'a> {
     /// Per block ending in a branch: when a lane takes it.
     when: Vec<Option<Bool>>,
     /// See [`Structured::active`].
-    active: HashSet<Value>,
+    active: Set<Value>,
     /// See [`Structured::restored`].
     restored: Map<Value, Value>,
     /// A pixel's discards (see [`Structured::discards`]) by block and
@@ -576,14 +616,19 @@ struct SopMasks {
 const MAX_ROUNDS: usize = 256;
 
 impl<'a> Lanes<'a> {
-    fn new(p: &'a Program) -> Result<Self, ShaderError> {
+    fn new(p: &'a Program, literal: bool) -> Result<Self, ShaderError> {
         let blocks = &p.blocks;
         let order = crate::ir::reverse_postorder(blocks);
         let mut index = vec![usize::MAX; blocks.len()];
         for (i, &b) in order.iter().enumerate() {
             index[b] = i;
         }
-        check_reducible(p, &order, &index)?;
+        // `ir::build` splits irreducible loops, and everything here assumes
+        // a reducible graph.
+        debug_assert!(
+            crate::ir::irreducible_edge(blocks, &order, &index).is_none(),
+            "irreducible control flow"
+        );
         let mut incoming = vec![Vec::new(); blocks.len()];
         let (mut defs, mut phis) = (Map::default(), Map::default());
         for (b, block) in blocks.iter().enumerate() {
@@ -601,6 +646,8 @@ impl<'a> Lanes<'a> {
         }
         let mut l = Lanes {
             p,
+            literal,
+            pair_joins: Map::default(),
             order,
             index,
             incoming,
@@ -611,18 +658,19 @@ impl<'a> Lanes<'a> {
             masks: Map::default(),
             other: Map::default(),
             scc_lane: Map::default(),
+            scc_votes: Map::default(),
             joins: Vec::new(),
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
-            active: HashSet::new(),
+            active: Set::default(),
             restored: Map::default(),
             kills: HashSet::new(),
         };
-        for block in blocks {
+        for block in blocks.iter().filter(|_| !literal) {
             if let Exit::Branch { taken, not_taken } = block.exit
                 && let Some(last) = block.insts.last()
-                && l.discards(last)
-                && (l.kill_exit(taken) || l.kill_exit(not_taken))
+                && let Some(live) = l.discards(last)
+                && (l.kill_exit(taken, live) || l.kill_exit(not_taken, live))
                 && let Some(def) = last.read(Reg::Scc).and_then(|v| l.defs.get(&v))
             {
                 l.kills.insert(*def);
@@ -714,11 +762,13 @@ impl<'a> Lanes<'a> {
         for n in 0..self.order.len() {
             let b = self.order[n];
             let mut c = if n == 0 { Bool::TRUE } else { Bool::FALSE };
-            for k in 0..self.incoming[b].len() {
-                let (q, taken) = self.incoming[b][k];
-                if self.index[q] < n {
-                    let e = self.edge(self.first[q], q, taken);
-                    c = self.b.or(c, e);
+            if !self.literal {
+                for k in 0..self.incoming[b].len() {
+                    let (q, taken) = self.incoming[b][k];
+                    if self.index[q] < n {
+                        let e = self.edge(self.first[q], q, taken);
+                        c = self.b.or(c, e);
+                    }
                 }
             }
             self.first[b] = c;
@@ -750,7 +800,7 @@ impl<'a> Lanes<'a> {
                     let m = self.mask(old).0;
                     self.masks.insert(new, m);
                     if let Some(scc) = inst.write(Reg::Scc) {
-                        self.scc_lane.insert(scc, m);
+                        self.record_scc(scc, m, false);
                     }
                 }
                 if let Some(k) = self.key(|r| inst.write(r), EXEC) {
@@ -760,17 +810,18 @@ impl<'a> Lanes<'a> {
             if let Exit::Branch { taken, not_taken } = p.blocks[b].exit
                 && let Some(last) = p.blocks[b].insts.last()
             {
-                let mut w = self.branch(last);
+                let mut w = self.raw_when(last);
                 // A discard's "no lane is left" exit: no lane takes it (the
                 // live mask keeps every lane, see `kills`).
-                if last
-                    .read(Reg::Scc)
-                    .and_then(|v| self.defs.get(&v))
-                    .is_some_and(|d| self.kills.contains(d))
+                if let Some(live) = self.discards(last)
+                    && last
+                        .read(Reg::Scc)
+                        .and_then(|v| self.defs.get(&v))
+                        .is_some_and(|d| self.kills.contains(d))
                 {
-                    if self.kill_exit(taken) {
+                    if self.kill_exit(taken, live) {
                         w = Bool::FALSE;
-                    } else if self.kill_exit(not_taken) {
+                    } else if self.kill_exit(not_taken, live) {
                         w = Bool::TRUE;
                     }
                 }
@@ -822,6 +873,14 @@ impl<'a> Lanes<'a> {
         cond: &[Bool],
     ) -> Result<Structured, ShaderError> {
         let blocks = &self.p.blocks;
+        // Resolve back-edge inputs after every definition has been visited.
+        let mut mask_inputs = Map::default();
+        while !self.pair_joins.is_empty() {
+            for (pair, args) in std::mem::take(&mut self.pair_joins) {
+                let incoming = args.into_iter().map(|a| self.mask(a).0).collect();
+                mask_inputs.insert(pair, incoming);
+            }
+        }
         let b = &mut self.b;
         let guards = blocks
             .iter()
@@ -838,6 +897,9 @@ impl<'a> Lanes<'a> {
                         (None, _)
                         | (_, Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Smem { .. }) => {
                             None
+                        }
+                        (&Some(e), _) if self.literal => {
+                            (e != Bool::TRUE && inst.name() != "v_writelane_b32").then_some(e)
                         }
                         (&Some(e), _) => {
                             if let Some((prev, guard)) = last_guard
@@ -861,7 +923,11 @@ impl<'a> Lanes<'a> {
                 Exit::End => LaneExit::End,
                 Exit::Indirect => LaneExit::Indirect,
                 Exit::Branch { taken, not_taken } => LaneExit::Branch {
-                    when: b.given(self.when[n].unwrap_or(Bool::FALSE), cond[n]),
+                    when: if self.literal {
+                        self.when[n].unwrap_or(Bool::FALSE)
+                    } else {
+                        b.given(self.when[n].unwrap_or(Bool::FALSE), cond[n])
+                    },
                     taken,
                     not_taken,
                 },
@@ -870,22 +936,35 @@ impl<'a> Lanes<'a> {
         if self.b.overflow {
             return Err(TOO_LARGE);
         }
+        // A partially overwritten pair can be read as a mask, but its two
+        // dwords do not denote a single numeric definition.
+        let words = self.masks.iter().filter(|&(&(lo, hi), _)| {
+            !self.literal
+                || self.defs.get(&lo) == self.defs.get(&hi)
+                    && self.phis.get(&lo).map(|x| x.0) == self.phis.get(&hi).map(|x| x.0)
+        });
         Ok(Structured {
-            masks: self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
+            literal: self.literal,
+            mask_inputs,
+            scc_votes: self.scc_votes,
+            masks: words.clone().map(|(&(lo, _), &m)| (lo, m)).collect(),
             other: self.other.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
-            highs: self
-                .masks
-                .keys()
-                .filter(|(lo, hi)| lo != hi)
-                .map(|&(lo, hi)| (hi, lo))
+            highs: words
+                .filter(|&(&(lo, hi), _)| lo != hi)
+                .map(|(&(lo, hi), _)| (hi, lo))
                 .collect(),
             paired_masks: if self.p.wave64 {
                 self.masks
             } else {
                 Map::default()
             },
+            paired_other: if self.literal {
+                self.other
+            } else {
+                Map::default()
+            },
             active: self.active,
-            restored: self.restored.into_iter().collect(),
+            restored: self.restored,
             discards: self
                 .kills
                 .iter()
@@ -959,7 +1038,12 @@ impl<'a> Lanes<'a> {
                 let derived = exec_write(lo, k.0) || exec_write(hi, k.1);
                 let m = m.unwrap_or_else(|| {
                     let born = self.born(k.0);
-                    self.b.atom(Atom::Opaque(k.0), born)
+                    let atom = if self.literal {
+                        Atom::OpaquePair(k.0, k.1)
+                    } else {
+                        Atom::Opaque(k.0)
+                    };
+                    self.b.atom(atom, born)
                 });
                 (m, derived)
             }
@@ -1010,6 +1094,13 @@ impl<'a> Lanes<'a> {
             && forward.iter().all(|f| f.1 == m)
         {
             return Some((m, derived));
+        }
+        if self.literal {
+            self.pair_joins.insert(k, args);
+            return Some((
+                self.b.atom(Atom::PairPhi(k.0, k.1), self.index[block]),
+                derived,
+            ));
         }
         if !self.unresolved.contains(&id) {
             for value in [true, false] {
@@ -1118,7 +1209,11 @@ impl<'a> Lanes<'a> {
                 let (a, c) = (arg(0, self)?, arg(1, self)?);
                 let scc = inst.read(Reg::Scc)?;
                 let born = self.born(scc);
-                let u = self.b.atom(Atom::Uniform(scc), born);
+                let u = self
+                    .scc_votes
+                    .get(&scc)
+                    .copied()
+                    .unwrap_or_else(|| self.b.atom(Atom::Uniform(scc), born));
                 (self.b.ite(u, a, c), None)
             }
             _ => {
@@ -1204,7 +1299,7 @@ impl<'a> Lanes<'a> {
                         }
                     }
                     if let (Some(scc), Some(m)) = (inst.write(Reg::Scc), r.scc) {
-                        self.scc_lane.insert(scc, m);
+                        self.record_scc(scc, m, false);
                     }
                 }
                 // `s_cmp_eq/lg` of a mask: "no lane differs" per lane.
@@ -1225,7 +1320,7 @@ impl<'a> Lanes<'a> {
                     } else {
                         ne
                     };
-                    self.scc_lane.insert(scc, m);
+                    self.record_scc(scc, m, rest.starts_with("eq"));
                 }
             }
             Fields::Valu(v) => {
@@ -1281,39 +1376,58 @@ impl<'a> Lanes<'a> {
     }
 
     /// Whether `inst` branches on the SCC of `s_andn2 X, X, exec`: whether
-    /// any lane is left in a pixel's live mask after a discard.
-    fn discards(&self, inst: &Inst) -> bool {
+    /// any lane is left in a pixel's live mask after a discard. `X`'s
+    /// operand code if so.
+    fn discards(&self, inst: &Inst) -> Option<u8> {
         if !inst.name().starts_with("s_cbranch_scc") {
-            return false;
+            return None;
         }
-        let Some(&(db, di)) = inst.read(Reg::Scc).and_then(|v| self.defs.get(&v)) else {
-            return false;
-        };
+        let &(db, di) = inst.read(Reg::Scc).and_then(|v| self.defs.get(&v))?;
         let def = &self.p.blocks[db].insts[di];
         let Fields::Sop {
-            dst: Some(d), src, ..
+            dst: Some(d @ Operand::Scalar { code, .. }),
+            src,
+            ..
         } = &def.fields
         else {
-            return false;
+            return None;
         };
-        matches!(def.name(), "s_andn2_b32" | "s_andn2_b64")
+        (matches!(def.name(), "s_andn2_b32" | "s_andn2_b64")
             && src.first() == Some(d)
-            && matches!(src.get(1), Some(Operand::Scalar { code: EXEC, .. }))
+            && matches!(src.get(1), Some(Operand::Scalar { code: EXEC, .. })))
+        .then_some(*code)
     }
 
     /// Whether a lane entering block `b` leaves the program doing nothing but
-    /// scalar work and a `done` export to `null` (a discard's exit).
-    fn kill_exit(&self, mut b: usize) -> bool {
+    /// scalar work and a `done` export to `null` (a discard's exit, `live`
+    /// the operand code of the live mask the discard emptied).
+    ///
+    /// An end that first gives EXEC a saved mask other than `live` exports
+    /// those lanes as valid: a pixel program with no color output ending
+    /// normally, after a loop that leaves through the same test on its own
+    /// exit mask (`s_andn2 X, X, exec`, then its SCC). Taken for a discard,
+    /// that loop's lanes would never leave it (only the loop limit ends it,
+    /// about 0.2 s a draw on the host).
+    fn kill_exit(&self, mut b: usize, live: u8) -> bool {
         for _ in 0..8 {
             let block = &self.p.blocks[b];
             let mut null_done = false;
             for inst in &block.insts {
-                match inst.fields {
+                match &inst.fields {
                     Fields::Exp {
                         target: 9,
                         done: true,
                         ..
                     } => null_done = true,
+                    Fields::Sop {
+                        dst: Some(Operand::Scalar { code: EXEC, .. }),
+                        src,
+                        ..
+                    } if inst.name().starts_with("s_mov_b")
+                        && matches!(src.first(), Some(&Operand::Scalar { code, .. }) if code != live) =>
+                    {
+                        return false;
+                    }
                     Fields::Sop { .. } | Fields::Sopp { .. } => {}
                     _ => return false,
                 }
@@ -1327,18 +1441,25 @@ impl<'a> Lanes<'a> {
         false
     }
 
-    /// The per-lane condition under which a block's closing branch is taken.
-    fn branch(&mut self, inst: &Inst) -> Bool {
+    /// The closing branch before simplification by its block's reach.
+    fn raw_when(&mut self, inst: &Inst) -> Bool {
         let exec = self.exec(inst);
         match inst.name() {
-            "s_cbranch_execz" => self.b.not(exec),
-            "s_cbranch_execnz" => exec,
+            n @ ("s_cbranch_execz" | "s_cbranch_execnz") => {
+                let any = self.any(exec, 0);
+                if n.ends_with("nz") {
+                    any
+                } else {
+                    self.b.not(any)
+                }
+            }
             n @ ("s_cbranch_vccz" | "s_cbranch_vccnz") => {
                 let vcc = match self.key(|r| inst.read(r), VCC) {
                     Some(k) => self.mask(k).0,
                     None => Bool::FALSE,
                 };
-                let any = self.b.and(vcc, exec);
+                let masked = self.b.and(vcc, exec);
+                let any = self.any(masked, 0);
                 if n.ends_with("nz") {
                     any
                 } else {
@@ -1349,7 +1470,7 @@ impl<'a> Lanes<'a> {
                 let Some(scc) = inst.read(Reg::Scc) else {
                     return Bool::FALSE;
                 };
-                let set = match self.scc_lane.get(&scc) {
+                let set = match self.scc_votes.get(&scc).or(self.scc_lane.get(&scc)) {
                     Some(&m) => m,
                     None => {
                         let born = self.born(scc);
@@ -1362,6 +1483,25 @@ impl<'a> Lanes<'a> {
                     self.b.not(set)
                 }
             }
+        }
+    }
+
+    fn any(&mut self, bit: Bool, born: usize) -> Bool {
+        if self.literal && bit != Bool::FALSE && bit != Bool::TRUE {
+            self.b.atom(Atom::Any(bit), born)
+        } else {
+            bit
+        }
+    }
+
+    fn record_scc(&mut self, scc: Value, bit: Bool, all: bool) {
+        if self.literal {
+            let test = if all { self.b.not(bit) } else { bit };
+            let voted = self.any(test, self.born(scc));
+            let voted = if all { self.b.not(voted) } else { voted };
+            self.scc_votes.insert(scc, voted);
+        } else {
+            self.scc_lane.insert(scc, bit);
         }
     }
 
@@ -1410,18 +1550,6 @@ const TOO_LARGE: ShaderError = ShaderError::Isa {
     reason: "lane conditions too large",
 };
 
-/// `ir::build` splits irreducible loops; checked again because everything
-/// here assumes a reducible graph.
-fn check_reducible(p: &Program, order: &[usize], index: &[usize]) -> Result<(), ShaderError> {
-    match crate::ir::irreducible_edge(&p.blocks, order, index) {
-        Some((from, _)) => Err(ShaderError::Unsupported {
-            offset: p.blocks[from].offset,
-            what: "irreducible control flow",
-        }),
-        None => Ok(()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1436,6 +1564,65 @@ mod tests {
 
     fn guarded(s: &Structured) -> usize {
         s.guards.iter().flatten().filter(|g| g.is_some()).count()
+    }
+
+    /// `exp null done vm`: a pixel program's end with no color output.
+    const EXP_NULL_DONE: [u32; 2] = [0xF800_1890, 0x0000_0000];
+
+    /// A loop that leaves through `s_andn2 X, X, exec` and its SCC to a
+    /// program end with no output (a pixel program that only writes
+    /// through atomics), which gives EXEC back the mask saved before the
+    /// loop, is a loop, not a discard: taken as a discard, the back edge was
+    /// always taken and every lane ran to the loop limit.
+    #[test]
+    fn a_loop_exit_to_a_null_export_is_no_discard() {
+        let mut words = vec![
+            0xBE89_037E, // s_mov_b32 s9, exec_lo
+            0xBE88_037E, // s_mov_b32 s8, exec_lo
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xBF82_0001, // s_branch -> body
+            0xBEFE_0308, // header: s_mov_b32 exec_lo, s8
+            0x4A02_0281, // body: v_add_nc_u32 v1, 1, v1
+            0x7DA2_0283, // v_cmpx_lt_u32 exec, 3, v1 (the lanes done)
+            0x8A08_7E08, // s_andn2_b32 s8, s8, exec_lo
+            0xBF85_FFFB, // s_cbranch_scc1 -> header
+            0xBEFE_0309, // s_mov_b32 exec_lo, s9
+        ];
+        words.extend(EXP_NULL_DONE);
+        words.push(S_ENDPGM);
+        let p = build(&words, false);
+        let s = structure(&p).unwrap();
+        assert!(s.discards.is_empty(), "{:?}", s.discards);
+        // The back edge is taken by the lanes not done, not by every lane.
+        let back = p
+            .blocks
+            .iter()
+            .position(|b| b.insts.last().is_some_and(|i| i.name() == "s_cbranch_scc1"))
+            .unwrap();
+        let LaneExit::Branch { when, .. } = s.exits[back] else {
+            panic!("{:?}", s.exits)
+        };
+        assert_ne!(when, Bool::TRUE);
+    }
+
+    /// The same test on a forward branch to a null export is a discard.
+    #[test]
+    fn a_forward_exit_to_a_null_export_is_a_discard() {
+        let mut words = vec![
+            0xBE88_037E, // s_mov_b32 s8, exec_lo
+            0x7C22_0080, // v_cmpx_lt_f32 exec, 0, v0 (the lanes killed)
+            0x8A08_7E08, // s_andn2_b32 s8, s8, exec_lo
+            0xBF84_0005, // s_cbranch_scc0 -> kill
+            0xBEFE_0308, // s_mov_b32 exec_lo, s8
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xF800_180F,
+            0x0101_0101, // exp mrt0, v1, v1, v1, v1 done vm
+            S_ENDPGM,
+        ];
+        words.extend(EXP_NULL_DONE); // kill:
+        words.push(S_ENDPGM);
+        let s = structure(&build(&words, false)).unwrap();
+        assert_eq!(s.discards.len(), 1, "{:?}", s.discards);
     }
 
     #[test]

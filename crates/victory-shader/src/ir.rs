@@ -42,8 +42,6 @@ pub struct Value(pub u32);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Program {
     pub wave64: bool,
-    /// VGPRs v0 up to this exist; bounds M0-relative access.
-    pub vgprs: u16,
     /// In code order, then copies made to give every loop one entry; block 0
     /// is the entry.
     pub blocks: Vec<Block>,
@@ -121,6 +119,58 @@ impl Inst {
     pub fn write(&self, reg: Reg) -> Option<Value> {
         self.writes.iter().find(|w| w.0 == reg).map(|w| w.1)
     }
+}
+
+/// `p` with each `s_cbranch_execz` that leaves for a bare `s_endpgm` block
+/// dropped: the lanes the branch would end run on to the program's end with
+/// EXEC off, as the console's do while their wave has a lane left. Only a
+/// wave whose every lane is off now runs that code too, which changes
+/// nothing but scalar memory writes (none allowed here). `None`: no such
+/// branch, or a scalar memory write.
+///
+/// For a console wave the host splits into 32-lane halves: the common early
+/// exit (`if (id < n) { whole shader }`) made the lanes that leave skip the
+/// group barriers the halves meet at, so such programs were refused.
+/// Ported from LakshanSivakumar/Native-Victory-macOS 0a8bee7 (GPL-3.0).
+pub(crate) fn keep_lanes_to_end(p: &Program) -> Option<Program> {
+    let insts = || p.blocks.iter().flat_map(|b| &b.insts);
+    if insts().any(|i| {
+        let n = i.name();
+        n.starts_with("s_store")
+            || n.starts_with("s_buffer_store")
+            || n.starts_with("s_") && n.contains("atomic")
+    }) {
+        return None;
+    }
+    let bare_end = |b: &Block| {
+        b.exit == Exit::End
+            && b.phis.is_empty()
+            && b
+                .insts
+                .iter()
+                .all(|i| matches!(i.name(), "s_endpgm" | "s_inst_prefetch" | "s_nop"))
+    };
+    let mut q = p.clone();
+    let mut changed = false;
+    for b in 0..q.blocks.len() {
+        let Exit::Branch { taken, not_taken } = q.blocks[b].exit else {
+            continue;
+        };
+        let end = &q.blocks[taken];
+        if taken == not_taken
+            || q.blocks[b].insts.last().map(Inst::name) != Some("s_cbranch_execz")
+            || !bare_end(end)
+            || end.preds.len() < 2
+        {
+            continue;
+        }
+        let k = end.preds.iter().position(|&x| x == b)?;
+        q.blocks[taken].preds.remove(k);
+        q.blocks[b].insts.pop();
+        q.blocks[b].exit = Exit::Jump(not_taken);
+        changed = true;
+    }
+    changed.then_some(q)
 }
 
 /// Decodes `code` and builds its SSA form; `vgprs` is the program's VGPR
@@ -210,13 +260,12 @@ pub fn build_bounded(
             };
         }
         let m0 = m0_max.get(&machine.offset).copied();
-        if let Some((reads, writes)) = effects(&machine, &fields, name, lanes, vgprs, m0)? {
-            let unset = |regs: Vec<Reg>| regs.into_iter().map(|r| (r, NONE)).collect();
+        if let Some((reads, writes)) = effects(&machine, &fields, name, lanes, vgprs, m0, true)? {
             blocks[b].insts.push(Inst {
                 machine,
                 fields,
-                reads: unset(reads),
-                writes: unset(writes),
+                reads,
+                writes,
             });
         }
     }
@@ -286,10 +335,9 @@ pub fn build_bounded(
             debug_assert!(!phi.args.contains(&NONE), "{phi:?}");
         }
     }
-    remove_trivial_phis(&mut blocks, values);
+    remove_trivial_phis_steps(&mut blocks, values);
     Ok(Program {
         wave64,
-        vgprs,
         blocks,
         inputs,
     })
@@ -329,9 +377,19 @@ fn contains(set: &RegSet, reg: Reg) -> bool {
 
 /// In [`Reg`] order, which is also index order.
 fn members(set: &RegSet) -> impl Iterator<Item = Reg> + '_ {
-    (0..REGS)
-        .filter(|&i| set[i / 64] >> (i % 64) & 1 != 0)
-        .map(reg_at)
+    let (mut word, mut bits) = (0, set[0]);
+    std::iter::from_fn(move || loop {
+        if bits != 0 {
+            let b = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            return Some(reg_at(word * 64 + b));
+        }
+        word += 1;
+        if word >= set.len() {
+            return None;
+        }
+        bits = set[word];
+    })
 }
 
 /// `outs` is sorted by register, and holds every register live out.
@@ -521,35 +579,14 @@ fn split_irreducible(blocks: &mut Vec<Block>) -> Result<(), ShaderError> {
 /// its entries. Loops nested in a single-entry loop are searched with its
 /// header removed, so one is found whenever the control flow is irreducible.
 fn multi_entry_loop(blocks: &[Block], inside: &[bool]) -> Option<(Vec<bool>, Vec<usize>)> {
-    let reach = |from: usize, forward: bool| {
-        let mut seen = vec![false; blocks.len()];
-        let mut stack = vec![from];
-        while let Some(b) = stack.pop() {
-            let next = if forward {
-                blocks[b].exit.successors()
-            } else {
-                blocks[b].preds.clone()
-            };
-            for n in next {
-                if inside[n] && !seen[n] {
-                    seen[n] = true;
-                    stack.push(n);
-                }
-            }
-        }
-        seen
-    };
+    let component = cycles(blocks, inside);
     let mut done = vec![false; blocks.len()];
     for v in (0..blocks.len()).filter(|&v| inside[v]) {
-        if done[v] {
+        if done[v] || component[v] == usize::MAX {
             continue;
         }
-        // Blocks on a cycle through `v`; `v` itself only if there is one.
-        let (ahead, behind) = (reach(v, true), reach(v, false));
-        let region: Vec<bool> = ahead.iter().zip(&behind).map(|(a, b)| a & b).collect();
-        if !region[v] {
-            continue;
-        }
+        // Blocks on a cycle through `v`.
+        let region: Vec<bool> = component.iter().map(|&c| c == component[v]).collect();
         let members = (0..blocks.len()).filter(|&b| region[b]);
         for b in members.clone() {
             done[b] = true;
@@ -570,6 +607,62 @@ fn multi_entry_loop(blocks: &[Block], inside: &[bool]) -> Option<(Vec<bool>, Vec
         }
     }
     None
+}
+
+/// Labels each of the `inside` blocks that shares a cycle with another, in the
+/// subgraph they form, with a block of its strongly connected component, and
+/// every other block with `usize::MAX`: a loop of one block, with or without
+/// an edge to itself, has no second entry. Tarjan's algorithm, without
+/// recursion: shaders can be large.
+fn cycles(blocks: &[Block], inside: &[bool]) -> Vec<usize> {
+    let mut label = vec![usize::MAX; blocks.len()];
+    // Discovery numbers from 1: 0 before a block is met, `usize::MAX` once its
+    // component is closed. `low` is the least number its subtree reaches.
+    let mut number = vec![0; blocks.len()];
+    let mut low = vec![0; blocks.len()];
+    let (mut met, mut open) = (0, Vec::new());
+    for root in (0..blocks.len()).filter(|&b| inside[b]) {
+        if number[root] != 0 {
+            continue;
+        }
+        met += 1;
+        (number[root], low[root]) = (met, met);
+        open.push(root);
+        let mut stack = vec![(root, 0)];
+        while let Some(top) = stack.last_mut() {
+            let (b, i) = *top;
+            top.1 += 1;
+            match blocks[b].exit.successors().get(i) {
+                Some(&s) if !inside[s] => {}
+                Some(&s) if number[s] == 0 => {
+                    met += 1;
+                    (number[s], low[s]) = (met, met);
+                    open.push(s);
+                    stack.push((s, 0));
+                }
+                Some(&s) => low[b] = low[b].min(number[s]),
+                None => {
+                    stack.pop();
+                    if let Some(&(parent, _)) = stack.last() {
+                        low[parent] = low[parent].min(low[b]);
+                    }
+                    if low[b] == number[b] {
+                        // `b` heads its component: it and everything opened
+                        // since, which `open` holds in discovery order.
+                        let first = open.partition_point(|&m| number[m] < number[b]);
+                        let alone = first + 1 == open.len();
+                        for m in open.drain(first..) {
+                            number[m] = usize::MAX;
+                            if !alone {
+                                label[m] = b;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    label
 }
 
 /// Registers live into and out of each block.
@@ -616,10 +709,7 @@ fn liveness(blocks: &[Block], order: &[usize]) -> (Vec<RegSet>, Vec<RegSet>) {
 
 /// Phis are placed for every live register at every join; those whose
 /// arguments are all one value (or the phi itself) are replaced by it.
-fn remove_trivial_phis(blocks: &mut [Block], values: u32) {
-    remove_trivial_phis_steps(blocks, values);
-}
-
+/// Returns the steps its union-find took, which a test bounds.
 fn remove_trivial_phis_steps(blocks: &mut [Block], values: u32) -> usize {
     fn find(replaced: &mut [Value], v: Value, steps: &mut usize) -> Value {
         let mut root = v;
@@ -700,8 +790,27 @@ const DROPPED: &[&str] = &[
     "v_clrexcp",
 ];
 
-/// Registers read, registers written.
-type Effects = (Vec<Reg>, Vec<Reg>);
+/// Registers read, registers written, each with a placeholder value the
+/// SSA pass fills in.
+type Effects = (Vec<(Reg, Value)>, Vec<(Reg, Value)>);
+
+/// Registers `inst` reads as operands (excluding implicit keep-old reads
+/// of written registers added for lanes disabled in EXEC).
+pub(crate) fn operand_reads(p: &Program, vgprs: u16, inst: &Inst) -> Vec<Reg> {
+    let lanes = 1 + u8::from(p.wave64);
+    effects(
+        &inst.machine,
+        &inst.fields,
+        inst.name(),
+        lanes,
+        vgprs,
+        None,
+        false,
+    )
+    .ok()
+    .flatten()
+    .map_or_else(Vec::new, |e| e.0.into_iter().map(|(reg, _)| reg).collect())
+}
 
 /// Registers an instruction reads and writes, one per dword, or `None` if
 /// the IR drops it.
@@ -712,6 +821,7 @@ fn effects(
     lanes: u8,
     vgprs: u16,
     m0_max: Option<u8>,
+    keep_old: bool,
 ) -> Result<Option<Effects>, ShaderError> {
     if DROPPED.contains(&name) {
         return Ok(None);
@@ -720,9 +830,9 @@ fn effects(
         offset: inst.offset,
         what: name,
     };
-    let mask = |code: u8| (0..lanes).map(move |i| Reg::S(code + i));
+    let mask = |code: u8| (0..lanes).map(move |i| (Reg::S(code + i), NONE));
     let (mut r, mut w) = (Vec::new(), Vec::new());
-    let regs = |op: &Operand, out: &mut Vec<Reg>| {
+    let regs = |op: &Operand, out: &mut Vec<(Reg, Value)>| {
         add_regs(op, lanes, out).map_err(|_| ShaderError::Isa {
             offset: inst.offset,
             reason: "register range out of bounds",
@@ -757,21 +867,21 @@ fn effects(
                 || name.starts_with("s_cselect_")
                 || name.starts_with("s_cmov_")
             {
-                r.push(Reg::Scc);
+                r.push((Reg::Scc, NONE));
             }
             if name.contains("saveexec") || name.contains("wrexec") {
                 r.extend(mask(EXEC));
                 w.extend(mask(EXEC));
             }
             if writes_scc(inst.encoding, name) {
-                w.push(Reg::Scc);
+                w.push((Reg::Scc, NONE));
             }
         }
         Fields::Sopp { .. } => match name {
-            "s_cbranch_scc0" | "s_cbranch_scc1" => r.push(Reg::Scc),
+            "s_cbranch_scc0" | "s_cbranch_scc1" => r.push((Reg::Scc, NONE)),
             "s_cbranch_vccz" | "s_cbranch_vccnz" => r.extend(mask(VCC)),
             "s_cbranch_execz" | "s_cbranch_execnz" => r.extend(mask(EXEC)),
-            "s_sendmsg" | "s_sendmsghalt" => r.push(Reg::S(M0)),
+            "s_sendmsg" | "s_sendmsghalt" => r.push((Reg::S(M0), NONE)),
             "s_endpgm"
             | "s_endpgm_saved"
             | "s_endpgm_ordered_ps_done"
@@ -818,10 +928,10 @@ fn effects(
             };
             // v[reg + M0] for any M0 that stays inside the program's VGPRs
             // (and below the proven bound).
-            let indexed = |op: &Operand, out: &mut Vec<Reg>| match *op {
+            let indexed = |op: &Operand, out: &mut Vec<(Reg, Value)>| match *op {
                 Operand::Vector { reg, .. } if u16::from(reg) < vgprs => {
                     let end = m0_max.map_or(vgprs, |m| vgprs.min(u16::from(reg) + u16::from(m) + 1));
-                    out.extend((u16::from(reg)..end).map(|r| Reg::V(r as u8)));
+                    out.extend((u16::from(reg)..end).map(|r| (Reg::V(r as u8), NONE)));
                     Ok(())
                 }
                 _ => Err(ShaderError::Isa {
@@ -865,12 +975,12 @@ fn effects(
                 _ => {}
             }
             if name.starts_with("v_interp_") || src_indexed || dst_indexed {
-                r.push(Reg::S(M0));
+                r.push((Reg::S(M0), NONE));
             }
         }
         Fields::Vintrp { dst, src, .. } => {
             regs(src, &mut r)?;
-            r.push(Reg::S(M0));
+            r.push((Reg::S(M0), NONE));
             regs(dst, &mut w)?;
         }
         Fields::Ds {
@@ -891,7 +1001,7 @@ fn effects(
                 || name.contains("addtid")
                 || matches!(name, "ds_ordered_count" | "ds_append" | "ds_consume")
             {
-                r.push(Reg::S(M0));
+                r.push((Reg::S(M0), NONE));
             }
         }
         Fields::Buffer {
@@ -911,7 +1021,7 @@ fn effects(
             regs(rsrc, &mut r)?;
             regs(soffset, &mut r)?;
             if *lds {
-                r.push(Reg::S(M0));
+                r.push((Reg::S(M0), NONE));
             }
             if let Some(d) = data {
                 if name.contains("_load_") {
@@ -974,13 +1084,15 @@ fn effects(
     }
     if vector {
         r.extend(mask(EXEC));
-        // Lanes disabled in EXEC keep the old value.
-        r.extend(w.iter().filter(|w| matches!(w, Reg::V(_))));
+        if keep_old {
+            // Lanes disabled in EXEC keep the old value.
+            r.extend(w.iter().filter(|(w, _)| matches!(w, Reg::V(_))).cloned());
+        }
     }
-    let mut seen = Vec::with_capacity(r.len());
-    r.retain(|reg| {
-        let new = !seen.contains(reg);
-        seen.push(*reg);
+    let mut seen: RegSet = [0; REGS.div_ceil(64)];
+    r.retain(|&(reg, _)| {
+        let new = !contains(&seen, reg);
+        insert(&mut seen, reg);
         new
     });
     Ok(Some((r, w)))
@@ -1047,7 +1159,7 @@ fn atomic_result(data: &Operand, name: &str) -> Operand {
 
 /// Appends the register dwords an operand names; reading `vccz`, `execz`,
 /// `scc` or `lds_direct` reads the register behind it.
-fn add_regs(op: &Operand, lanes: u8, out: &mut Vec<Reg>) -> Result<(), ()> {
+fn add_regs(op: &Operand, lanes: u8, out: &mut Vec<(Reg, Value)>) -> Result<(), ()> {
     match *op {
         Operand::Scalar { code, .. } if code == gfx10::NULL => {}
         Operand::Scalar { code, dwords } => {
@@ -1055,18 +1167,18 @@ fn add_regs(op: &Operand, lanes: u8, out: &mut Vec<Reg>) -> Result<(), ()> {
             if end > 128 {
                 return Err(());
             }
-            out.extend((code..end as u8).map(Reg::S));
+            out.extend((code..end as u8).map(|c| (Reg::S(c), NONE)));
         }
         Operand::Vector { reg, dwords } => {
             if u16::from(reg) + u16::from(dwords) > 256 {
                 return Err(());
             }
-            out.extend((0..dwords).map(|i| Reg::V(reg + i)));
+            out.extend((0..dwords).map(|i| (Reg::V(reg + i), NONE)));
         }
-        Operand::Const(251) => out.extend((0..lanes).map(|i| Reg::S(VCC + i))),
-        Operand::Const(252) => out.extend((0..lanes).map(|i| Reg::S(EXEC + i))),
-        Operand::Const(253) => out.push(Reg::Scc),
-        Operand::Const(254) => out.push(Reg::S(M0)),
+        Operand::Const(251) => out.extend((0..lanes).map(|i| (Reg::S(VCC + i), NONE))),
+        Operand::Const(252) => out.extend((0..lanes).map(|i| (Reg::S(EXEC + i), NONE))),
+        Operand::Const(253) => out.push((Reg::Scc, NONE)),
+        Operand::Const(254) => out.push((Reg::S(M0), NONE)),
         Operand::Const(_) | Operand::Literal(_) | Operand::Attr { .. } => {}
     }
     Ok(())
@@ -1269,6 +1381,18 @@ mod tests {
         assert!(build(&code, false, 4).is_err(), "v4 is past 4 VGPRs");
     }
 
+    #[test]
+    fn a_relative_move_reads_each_register_once_in_the_order_met() {
+        // v_movreld_b32 v2, v3 writes v2-v255, among them its own source.
+        let p = build_words(&[0x7E04_8503, S_ENDPGM], true);
+        let reads: Vec<Reg> = p.blocks[0].insts[0].reads.iter().map(|r| r.0).collect();
+        let expected: Vec<Reg> = [Reg::V(3), Reg::S(M0), Reg::S(EXEC), Reg::S(EXEC + 1)]
+            .into_iter()
+            .chain((2..=255).filter(|&v| v != 3).map(Reg::V))
+            .collect();
+        assert_eq!(reads, expected);
+    }
+
     const fn s_branch(simm16: i16) -> u32 {
         0xBF82_0000 | simm16 as u16 as u32
     }
@@ -1467,5 +1591,175 @@ mod tests {
         assert_eq!(header.insts[0].read(Reg::S(2)), Some(lp_s2));
         assert_eq!(exit.insts[0].read(Reg::S(1)), Some(next_s1));
         assert_eq!(exit.insts[0].read(Reg::S(2)), Some(lp_s2));
+    }
+
+    #[test]
+    fn irreducible_loops_are_split_in_code_order() {
+        let p = build_words(
+            &[
+                0xBF06_0100, // 0: s_cmp_eq_u32 s0, s1
+                s_cbranch_scc1(1),
+                0x8002_8102, // 8: s_add_u32 s2, s2, 1
+                0xBF84_FFFE, // 12: s_cbranch_scc0 -> 8
+                0xBF06_0100, // 16: s_cmp_eq_u32 s0, s1
+                s_cbranch_scc1(1),
+                0x8002_8102, // 24: s_add_u32 s2, s2, 1
+                0xBF84_FFFE, // 28: s_cbranch_scc0 -> 24
+                S_ENDPGM,
+            ],
+            false,
+        );
+        // The first loop's copy is block 7, the second's block 8.
+        let copies: Vec<_> = p.blocks[7..].iter().map(|b| (b.offset, b.exit)).collect();
+        assert_eq!(copies, [(8, Exit::Jump(2)), (24, Exit::Jump(5))]);
+        assert_eq!(p.blocks[0].exit.successors(), [2, 7]);
+        assert_eq!(p.blocks[3].exit.successors(), [5, 8]);
+    }
+
+    /// Blocks with no instructions, from their exits.
+    fn graph(exits: &[Exit]) -> Vec<Block> {
+        let mut blocks: Vec<Block> = exits
+            .iter()
+            .enumerate()
+            .map(|(i, &exit)| Block {
+                offset: 4 * i,
+                preds: Vec::new(),
+                phis: Vec::new(),
+                insts: Vec::new(),
+                exit,
+            })
+            .collect();
+        link(&mut blocks);
+        blocks
+    }
+
+    #[test]
+    fn the_loop_with_the_first_block_is_found_first() {
+        use Exit::{End, Jump};
+        let br = |taken, not_taken| Exit::Branch { taken, not_taken };
+        // Two loops, each entered at both its blocks, the second reached from
+        // the first: the strongly connected components close in the opposite
+        // order to the one searched.
+        let blocks = graph(&[
+            br(1, 2),
+            Jump(2),
+            br(1, 3),
+            br(4, 5),
+            Jump(5),
+            br(4, 6),
+            End,
+        ]);
+        let (region, entries) = multi_entry_loop(&blocks, &[true; 7]).unwrap();
+        assert_eq!(region, [false, true, true, false, false, false, false]);
+        assert_eq!(entries, [1, 2]);
+
+        // Numbered the other way round, the loop reached second comes first.
+        let blocks = graph(&[
+            br(4, 5),
+            Jump(2),
+            br(1, 6),
+            br(1, 2),
+            Jump(5),
+            br(4, 3),
+            End,
+        ]);
+        let (region, entries) = multi_entry_loop(&blocks, &[true; 7]).unwrap();
+        assert_eq!(region, [false, true, true, false, false, false, false]);
+        assert_eq!(entries, [1, 2]);
+    }
+
+    /// [`multi_entry_loop`] as it was: two walks of the subgraph from each
+    /// block not yet in a loop.
+    fn multi_entry_loop_by_walks(
+        blocks: &[Block],
+        inside: &[bool],
+    ) -> Option<(Vec<bool>, Vec<usize>)> {
+        let reach = |from: usize, forward: bool| {
+            let mut seen = vec![false; blocks.len()];
+            let mut stack = vec![from];
+            while let Some(b) = stack.pop() {
+                let next = if forward {
+                    blocks[b].exit.successors()
+                } else {
+                    blocks[b].preds.clone()
+                };
+                for n in next {
+                    if inside[n] && !seen[n] {
+                        seen[n] = true;
+                        stack.push(n);
+                    }
+                }
+            }
+            seen
+        };
+        let mut done = vec![false; blocks.len()];
+        for v in (0..blocks.len()).filter(|&v| inside[v]) {
+            if done[v] {
+                continue;
+            }
+            let (ahead, behind) = (reach(v, true), reach(v, false));
+            let region: Vec<bool> = ahead.iter().zip(&behind).map(|(a, b)| a & b).collect();
+            if !region[v] {
+                continue;
+            }
+            let members = (0..blocks.len()).filter(|&b| region[b]);
+            for b in members.clone() {
+                done[b] = true;
+            }
+            let entries: Vec<usize> = members
+                .filter(|&b| blocks[b].preds.iter().any(|&p| !region[p]))
+                .collect();
+            match entries[..] {
+                [] => {}
+                [header] => {
+                    let mut nested = region;
+                    nested[header] = false;
+                    if let Some(found) = multi_entry_loop_by_walks(blocks, &nested) {
+                        return Some(found);
+                    }
+                }
+                _ => return Some((region, entries)),
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn loops_are_found_as_the_walks_found_them() {
+        let mut s = 7u64;
+        let mut next = |n: usize| {
+            s = s
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (s >> 33) as usize % n
+        };
+        let mut found = 0;
+        for _ in 0..20_000 {
+            let n = 1 + next(12);
+            let exits: Vec<Exit> = (0..n)
+                .map(|_| match next(12) {
+                    0 => Exit::End,
+                    1 => Exit::Indirect,
+                    2..6 => Exit::Jump(next(n)),
+                    _ => Exit::Branch {
+                        taken: next(n),
+                        not_taken: next(n),
+                    },
+                })
+                .collect();
+            let blocks = graph(&exits);
+            // All the blocks, and some, as when the body of a loop is searched.
+            let some: Vec<bool> = (0..n).map(|_| next(4) != 0).collect();
+            for inside in [vec![true; n], some] {
+                let expect = multi_entry_loop_by_walks(&blocks, &inside);
+                found += usize::from(expect.is_some());
+                assert_eq!(
+                    multi_entry_loop(&blocks, &inside),
+                    expect,
+                    "{exits:?} within {inside:?}"
+                );
+            }
+        }
+        assert!(found > 1_000, "{found} of 40000 have a loop to split");
     }
 }

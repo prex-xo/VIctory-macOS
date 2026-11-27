@@ -150,6 +150,9 @@ struct Checks {
     keep: Option<Kept>,
     validator: Option<Validator>,
     host: Option<(Host, emit::HostShader)>,
+    /// Translate for a host of 32-lane waves (`--wave32`, or the GPU
+    /// `--pipelines` makes them on).
+    wave32: bool,
 }
 
 pub fn run(
@@ -158,6 +161,7 @@ pub fn run(
     pipelines: bool,
     list: bool,
     jobs: Option<usize>,
+    wave32: bool,
 ) -> Result<()> {
     // Dumped shaders and validator reports are game-derived (rule #1).
     if let Some(dir) = std::env::var_os("VICTORY_EMIT_DUMP") {
@@ -173,8 +177,15 @@ pub fn run(
                 .map_or("dxil.dll".into(), |p| p.display().to_string())
         );
     }
-    if pipelines {
-        Host::new(false).map_err(anyhow::Error::msg)?;
+    let wave32 = if pipelines {
+        let host = Host::new(false).map_err(anyhow::Error::msg)?;
+        // As `run` translates for this GPU.
+        wave32 || host.wave32().map_err(anyhow::Error::msg)?
+    } else {
+        wave32
+    };
+    if wave32 {
+        println!("waves        of 32 lanes at most (wave64 programs in halves)");
     }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
@@ -183,8 +194,7 @@ pub fn run(
         .map(|(v, p)| (v.trim().to_owned(), p.trim().to_owned()))
         .collect();
     let kept = std::sync::Arc::new(Mutex::new(Vec::new()));
-    let threads =
-        jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    let threads = thread_count(jobs);
     let seen = Mutex::new(HashSet::new());
     let total = Mutex::new(Tally::default());
     let started = std::time::Instant::now();
@@ -217,6 +227,7 @@ pub fn run(
                                 host: pipelines
                                     .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
                                     .flatten(),
+                                wave32,
                             };
                             while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                                 translate(job, entry.path(), &seen, &mut t, &mut checks);
@@ -328,8 +339,7 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
     let Some(dir) = victory_gpu::shader_cache::use_shader_cache(shaders.clone()) else {
         anyhow::bail!("no shader cache in {}", shaders.display());
     };
-    let threads =
-        jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    let threads = thread_count(jobs);
     // The pre-build's key listing (diagnostics) translates nothing.
     if pipelines && std::env::var_os("VICTORY_PREBUILD_KEYS").is_some() {
         return crate::prebuild::run(&paths, threads);
@@ -568,7 +578,8 @@ fn translate(
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    let marks = emit::Options { view_marks: true, ..Default::default() };
+                    let marks =
+                        emit_options(checks.wave32, victory_gpu::shader_cache::narrow_waves());
                     match emit::emit_with(&container, &p, &program, &s, &i, &r, marks) {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
@@ -590,6 +601,21 @@ fn translate(
                 t.fail(reason, || format!("{} {:?}", example(), p.stage));
             }
         }
+    }
+}
+
+/// The emit options for one program. For 32-lane waves (`wave32`), as
+/// `run` translates where its host narrows the waves (`narrow`: under Wine,
+/// D3DMetal runs wave64 programs in 32-lane waves whatever `WaveSize` says;
+/// `VICTORY_NARROW_WAVES` overrides): a group that is one console wave64
+/// with LDS then gets barriers between its halves instead of being refused.
+/// Without them the offline check refuses programs `run` translates.
+fn emit_options(wave32: bool, narrow: bool) -> emit::Options {
+    emit::Options {
+        view_marks: true,
+        host_wave32: wave32,
+        narrow_waves: wave32 && narrow,
+        ..Default::default()
     }
 }
 
@@ -848,19 +874,41 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
     }
 }
 
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+/// The worker threads to use: `--jobs`, else one per core.
+fn thread_count(jobs: Option<usize>) -> usize {
+    jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()))
+}
+
+pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 #[cfg(test)]
 mod tests {
+    /// `--wave32` translates as `run` does on a host that narrows the waves
+    /// (D3DMetal under Wine), and only then; without `--wave32` the waves are
+    /// never narrowed, as on a host whose waves hold a whole wave64.
+    #[test]
+    fn narrow_waves_follow_wave32_and_the_host() {
+        let o = super::emit_options(true, true);
+        assert!(o.host_wave32 && o.narrow_waves);
+        let o = super::emit_options(true, false);
+        assert!(
+            o.host_wave32 && !o.narrow_waves,
+            "NVIDIA, Intel: halves only"
+        );
+        let o = super::emit_options(false, true);
+        assert!(!o.host_wave32 && !o.narrow_waves);
+        assert!(super::emit_options(false, false).view_marks);
+    }
+
     /// Shader dumps are game-derived, so a dump directory in the repo is refused.
     #[test]
     fn emit_dump_inside_repo_is_refused() {
         // SAFETY: no other test in this binary touches the environment.
         unsafe { std::env::set_var("VICTORY_EMIT_DUMP", env!("CARGO_MANIFEST_DIR")) };
         let missing = std::env::temp_dir().join("victory-translate-no-such-dir");
-        let err = super::run(vec![missing], false, false, false, Some(1)).unwrap_err();
+        let err = super::run(vec![missing], false, false, false, Some(1), false).unwrap_err();
         // SAFETY: as above; unset so a later test's `run` is not refused.
         unsafe { std::env::remove_var("VICTORY_EMIT_DUMP") };
         assert!(

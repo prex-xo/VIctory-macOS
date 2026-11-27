@@ -926,9 +926,7 @@ fn translated_shaders_draw_as_pc_ones() {
             compile(&pc, &dir, src, vs, "vs_6_5"),
             compile(&pc, &dir, src, "ps", "ps_6_5"),
         );
-        // SAFETY: the PC container carries its root signature.
-        let root_p: ID3D12RootSignature =
-            unsafe { host.device.CreateRootSignature(0, &ps_p) }.unwrap();
+        let root_p = host.root_signature_bytes(&ps_p).unwrap();
         let pso_p = host.pipeline_with(&root_p, &vs_p, &ps_p).unwrap();
         let theirs = host
             .draw(
@@ -1043,9 +1041,7 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
             compile(&pc, &dir, src, "ms", "ms_6_5"),
             compile(&pc, &dir, src, "mps", "ps_6_5"),
         );
-        // SAFETY: the PC container carries its root signature.
-        let root_p: ID3D12RootSignature =
-            unsafe { host.device.CreateRootSignature(0, &ms_p) }.unwrap();
+        let root_p = host.root_signature_bytes(&ms_p).unwrap();
         let pso_p = host.mesh_pipeline_with(&root_p, &ms_p, &ps_p).unwrap();
         let theirs = host
             .draw(
@@ -1483,21 +1479,40 @@ fn translated_compute_matches_pc() {
             }
             Err(e) => panic!("{name}: {e}"),
         };
-        // Our root views follow the user data in root parameter order.
+        // A buffer of halves the translated program moves as unsigned
+        // integers is shown to it as its unsigned twin, as the host does
+        // (`HostShader::half_views`); the PC program keeps the float view.
+        let twins: Vec<View> = views
+            .iter()
+            .map(|&v| match v {
+                View::HalfUav(n) if !cs_c.half_views.is_empty() => View::HalfUintUav(n),
+                v => v,
+            })
+            .collect();
+        // Our root views follow the user data in root parameter order: the
+        // case's own, then the host's view-stride table (16-bit typed
+        // accesses read their view's format kind there).
         let mut roots = vec![(0, Root::Constants(user_data(&cs_c, &k)))];
         let mut root_views: Vec<(u8, bool)> = cs_c.root_cbvs.iter().map(|&s| (s, false)).collect();
         root_views.extend(cs_c.root_srvs.iter().map(|&s| (s, true)));
         root_views.sort_unstable();
         for (n, (slot, srv)) in root_views.into_iter().enumerate() {
-            assert_eq!(slot, 4 + u8::from(srv), "{name}: root view");
-            let data = if srv {
-                root_srv.clone()
+            let data = if srv && slot == super::VIEW_STRIDES {
+                super::host::view_strides(&twins)
             } else {
-                root_cbv.clone()
+                assert_eq!(slot, 4 + u8::from(srv), "{name}: root view");
+                if srv { root_srv.clone() } else { root_cbv.clone() }
             };
             roots.push((1 + n as u32, Root::View { srv, data }));
         }
-        let ours = host.dispatch(&root_t, &pso_t, &dispatch(roots));
+        let ours = host.dispatch(
+            &root_t,
+            &pso_t,
+            &Dispatch {
+                views: &twins,
+                ..dispatch(roots)
+            },
+        );
         if name.starts_with("terminates") {
             match ours {
                 Ok(_) => eprintln!("{name}: finished"),
@@ -1507,9 +1522,7 @@ fn translated_compute_matches_pc() {
         }
         let ours = ours.unwrap();
         let cs_p = compile(&pc, &dir, src, "cs", "cs_6_5");
-        // SAFETY: the PC container carries its root signature.
-        let root_p: ID3D12RootSignature =
-            unsafe { host.device.CreateRootSignature(0, &cs_p) }.unwrap();
+        let root_p = host.root_signature_bytes(&cs_p).unwrap();
         let pso_p = host.compute_pipeline_with(&root_p, &cs_p).unwrap();
         let table = |sampler, index| Root::Table { sampler, index };
         let theirs = host

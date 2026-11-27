@@ -4,6 +4,7 @@
 
 use super::bitcode::{Attr, Md, Module, Ty, V, pred};
 use super::container::{self, Binding, Psv, SigElement};
+use crate::native::HwStage;
 
 /// Where the shader reads its user data: `b0` in this space.
 pub const USER_DATA_SPACE: u32 = 0;
@@ -14,8 +15,17 @@ pub const SAMPLER_SPACE: u32 = 0;
 pub const ROOT_CBV_SPACE: u32 = 1;
 /// The root SRV slot (`t255` in [`ROOT_CBV_SPACE`], past every title root
 /// parameter) of the view-stride table: dword `i` is the byte stride of
-/// the buffer view at view-heap index `i`.
+/// the buffer view at view-heap index `i` ([`VIEW_STRIDE_BITS`]), with
+/// [`VIEW_INTEGER`] and [`VIEW_SIGNED`] for typed views of integer formats.
 pub const VIEW_STRIDES: u8 = 255;
+/// The bits of a view-stride table dword holding the stride.
+pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
+/// In a view-stride table dword: a typed buffer view of an integer format
+/// (`UINT` or `SINT`), whose 32-bit accesses use the `.i32` overloads and whose
+/// 16-bit typed accesses (`_d16`) pass bits.
+pub const VIEW_INTEGER: u32 = 1 << 31;
+/// With [`VIEW_INTEGER`]: a signed (`SINT`) format.
+pub const VIEW_SIGNED: u32 = 1 << 30;
 /// Where the title-memory page table is bound: `t0` (a raw root SRV) in
 /// this space (see `emit` "Title memory").
 pub const MEMORY_SPACE: u32 = 2;
@@ -40,21 +50,67 @@ pub const VIEW_MARK_NONE: u32 = u32::MAX;
 /// Bits in the written-pages bitmap of buffer views; marks past it go to
 /// the last bit.
 pub const VIEW_WRITE_BITS: u32 = 1 << 22;
-/// Lock words of emulated 64-bit image atomics, past the bitmap in the
-/// same buffer (`emit`, "Atomic locks"); a power of two.
+/// The first bit of the read marks of texture views (`emit`, "Read
+/// marks"), after the written pages in the same bitmap: one bit per
+/// resource-heap index, [`HEAP_VIEWS`] of them.
+pub const VIEW_READS: u32 = VIEW_WRITE_BITS;
+/// Lock words of emulated 64-bit image atomics, past the written pages and
+/// the read marks in the same buffer (`emit`, "Atomic locks"); a power of
+/// two.
 pub const ATOMIC_LOCKS: u32 = 1 << 16;
-/// The bytes of the buffer bound at `u`[`VIEW_WRITES`]: the bitmap, then
-/// the lock words.
-pub const VIEW_WRITES_BYTES: u32 = VIEW_WRITE_BITS / 8 + 4 * ATOMIC_LOCKS;
+/// Rounds in which every lane of a wave tries its lock once, before the
+/// lanes still not done take turns (`emit`, "Atomic locks", with
+/// [`Options::atomic_lock_rounds`](super::Options)).
+pub const ATOMIC_LOCK_ROUNDS: u32 = 4;
+/// Tries a lane of a compute or mesh program makes at a lock another wave
+/// holds before it goes on without it (`emit`, "Atomic locks"). A lane that
+/// waits it out can lose its update, so the bound has to outlast a busy
+/// lock: at 2^16 tries, 2,048 groups adding into one texel lost adds on an
+/// M5 Pro (2 of 100 runs in turns, 1 of 40 in rounds), as 8 groups did on
+/// an M2 Max (#240), and at 2^22 none did in 100 runs of each. macOS does
+/// not end a compute dispatch for running long, so the wait costs time only.
+pub const ATOMIC_LOCK_SPINS: u32 = 1 << 22;
+/// The same in the other stages, whose draws macOS ends when their pixels
+/// run about 50 ms (`docs/macos.md`, "Metal ends long draws"). An ended draw
+/// loses all it drew and can stop the queue, which is worse than one lost
+/// update, so a lane there keeps the shorter bound.
+pub const ATOMIC_LOCK_SPINS_DRAWN: u32 = 1 << 16;
+const _: () = assert!(ATOMIC_LOCK_SPINS_DRAWN < ATOMIC_LOCK_SPINS);
+
+/// How many tries a lane of `stage` makes at a held lock before it goes on
+/// without it: [`ATOMIC_LOCK_SPINS`] in compute and mesh programs,
+/// [`ATOMIC_LOCK_SPINS_DRAWN`] in the others.
+pub const fn atomic_lock_spins(stage: HwStage) -> u32 {
+    match stage {
+        HwStage::Cs | HwStage::Ms => ATOMIC_LOCK_SPINS,
+        _ => ATOMIC_LOCK_SPINS_DRAWN,
+    }
+}
+/// Where the lock words start in the buffer bound at `u`[`VIEW_WRITES`], in
+/// bytes: after the written pages and the read marks.
+pub const ATOMIC_LOCKS_AT: u32 = (VIEW_READS + HEAP_VIEWS) / 8;
+/// Where the count of lanes that gave up waiting for a lock is, in bytes
+/// of the buffer bound at `u`[`VIEW_WRITES`]: the dword after the lock
+/// words. Each lane that waits out its bound adds one before it goes on
+/// without the lock (`emit`, "Atomic locks"); the host reads and clears it
+/// after a submission.
+pub const ATOMIC_LOCKS_GAVE_UP_AT: u32 = ATOMIC_LOCKS_AT + 4 * ATOMIC_LOCKS;
+/// The bytes of the buffer bound at `u`[`VIEW_WRITES`]: the written pages,
+/// the read marks, the lock words, then the count of lanes that gave up.
+pub const VIEW_WRITES_BYTES: u32 = ATOMIC_LOCKS_GAVE_UP_AT + 4;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
+    pub const EARLY_DEPTH_STENCIL: u64 = 1 << 3;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
+    /// UAVs in a vertex, geometry or mesh program.
+    pub const UAVS_EVERY_STAGE: u64 = 1 << 16;
     pub const ROVS: u64 = 1 << 18;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const INT64: u64 = 1 << 20;
+    pub const BARYCENTRICS: u64 = 1 << 22;
     pub const ATOMIC64_TYPED: u64 = 1 << 27;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
@@ -87,6 +143,8 @@ pub(crate) struct Shader {
     pub m: Module,
     pub t: Types,
     pub pixel: bool,
+    /// Repack pruned signature rows in element order at `finish` time.
+    pub repack_signatures: bool,
     pub inputs: Vec<SigElement>,
     pub outputs: Vec<SigElement>,
     /// A mesh shader's per-primitive outputs.
@@ -125,6 +183,11 @@ pub(crate) struct Shader {
     /// The heap index of each handle of an unordered buffer view (writes
     /// through it are marked by the index's view-mark entry).
     pub view_index: std::collections::HashMap<V, V>,
+    /// The heap index of each handle of a texture shader view (its reads
+    /// are marked, `emit` "Read marks"), and those the instruction being
+    /// lowered uses.
+    pub texture_index: std::collections::HashMap<V, V>,
+    pub texture_reads: Vec<V>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -173,6 +236,7 @@ impl Shader {
                 res_ret_i32,
             },
             pixel,
+            repack_signatures: false,
             inputs: Vec::new(),
             outputs: Vec::new(),
             prims: Vec::new(),
@@ -191,6 +255,8 @@ impl Shader {
             view_marks: None,
             view_writes: None,
             view_index: std::collections::HashMap::new(),
+            texture_index: std::collections::HashMap::new(),
+            texture_reads: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
@@ -378,8 +444,9 @@ impl Shader {
     }
 
     /// The handle of the view addresses (`t1` in [`MEMORY_SPACE`], a raw
-    /// buffer: per resource-heap index, a buffer view's title address as a
-    /// buffer descriptor's dwords 0 and 1), made in the entry block.
+    /// buffer: per resource-heap index, a descriptor's dwords 0-3 as far as
+    /// the host knows them, `emit` "View addresses"), made in the entry
+    /// block.
     pub fn view_addresses_handle(&mut self) -> V {
         if let Some(h) = self.view_addresses {
             return h;
@@ -542,9 +609,15 @@ impl Shader {
             &[index, s, n],
         );
         let h = self.annotate(block, h, props.0, props.1);
-        // Unordered typed, raw and structured buffers (kinds 10-12).
-        if !sampler && props.0 & 0x1000 != 0 && (10..=12).contains(&(props.0 & 0xFF)) {
+        // Unordered typed, raw and structured buffers (kinds 10-12), and
+        // typed buffers read (their format kind, `Lower::view_word`).
+        let kind = props.0 & 0xFF;
+        if !sampler && (kind == 10 || props.0 & 0x1000 != 0 && (11..=12).contains(&kind)) {
             self.view_index.insert(h, index);
+        }
+        // Texture shader views (kinds 1-9).
+        if !sampler && props.0 & 0x1000 == 0 && (1..=9).contains(&kind) {
+            self.texture_index.insert(h, index);
         }
         h
     }
@@ -553,6 +626,26 @@ impl Shader {
     pub fn finish(mut self) -> Vec<u8> {
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
+        // The flags of what lowering made, as the module writes it: what only
+        // unread values or never-taken edges used is not written.
+        let uses = self.m.uses();
+        for (flag, used) in [
+            (flags::RESOURCE_HEAP, uses.heap),
+            (flags::SAMPLER_HEAP, uses.sampler_heap),
+            (flags::WAVE_OPS, uses.wave),
+            (flags::INT64, uses.int64),
+        ] {
+            self.flags = if used { self.flags | flag } else { self.flags & !flag };
+        }
+        // UAVs outside pixel and compute programs (the write and read marks
+        // of vertex, geometry and mesh programs), as DXC counts them: UAV
+        // ranges declared below, not UAVs indexed from the heap.
+        let compute = self.threads.is_some() && self.mesh.is_none() && self.gs.is_none();
+        let declared_uavs =
+            !self.root_uavs.is_empty() || self.memory_dirty.is_some() || self.view_writes.is_some();
+        if declared_uavs && !self.pixel && !compute {
+            self.flags |= flags::UAVS_EVERY_STAGE;
+        }
         let mut resources = None;
         let mut bindings = Vec::new();
         let i32c = |s: &mut Self, v: u32| {
@@ -665,7 +758,7 @@ impl Shader {
                 srvs = Some(self.m.md_node(list));
             }
             let mut uavs = None;
-            if !self.root_uavs.is_empty() || self.memory_dirty.is_some() || self.view_writes.is_some() {
+            if declared_uavs {
                 let ty = self
                     .m
                     .named_struct("struct.RWByteAddressBuffer", vec![self.t.i32]);
@@ -746,6 +839,19 @@ impl Shader {
             self.m.named_md("dx.resources", vec![r]);
         }
 
+        if self.pixel {
+            container::same_mode_per_row(&mut self.inputs, true);
+            if self.repack_signatures {
+                container::repack_rows(&mut self.inputs);
+            }
+        } else {
+            container::same_mode_per_row(&mut self.outputs, false);
+            if self.repack_signatures {
+                container::repack_rows(&mut self.outputs);
+                container::repack_rows(&mut self.prims);
+            }
+        }
+
         let graphics = self.threads.is_none() || self.mesh.is_some();
         if graphics {
             // shortcut: every output is declared to depend on every input; the
@@ -785,11 +891,6 @@ impl Shader {
             self.m.named_md("dx.viewIdState", vec![view_node]);
         }
 
-        if self.pixel {
-            container::same_mode_per_row(&mut self.inputs, true);
-        } else {
-            container::same_mode_per_row(&mut self.outputs, false);
-        }
         let sigs = if graphics {
             let ins = self.signature_md(self.inputs.clone());
             let outs = self.signature_md(self.outputs.clone());
@@ -888,6 +989,9 @@ impl Shader {
         dxil.extend(&bitcode);
 
         let mut features = 0u64;
+        if self.flags & flags::UAVS_EVERY_STAGE != 0 {
+            features |= 0x4;
+        }
         if self.flags & flags::STENCIL_REF != 0 {
             features |= 0x200;
         }
@@ -902,6 +1006,9 @@ impl Shader {
         }
         if self.flags & flags::INT64 != 0 {
             features |= 0x8000;
+        }
+        if self.flags & flags::BARYCENTRICS != 0 {
+            features |= 0x2_0000;
         }
         if self.flags & flags::RESOURCE_HEAP != 0 {
             features |= 0x200_0000;
@@ -993,5 +1100,57 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::super::bitcode::Term;
+    use super::*;
+
+    /// A program that sets a bit through the write marks' UAV, or (`heap`)
+    /// through a UAV indexed from the heap: a vertex (`pixel` false, no
+    /// thread-group size), pixel or compute program.
+    fn marked(pixel: bool, threads: Option<[u32; 3]>, heap: bool) -> Vec<u8> {
+        let mut s = Shader::new(pixel);
+        s.threads = threads;
+        let b = s.entry;
+        let h = if heap {
+            let index = s.m.i32(0);
+            s.heap_handle(b, index, false, false, (11 | 0x1000, 0))
+        } else {
+            s.view_writes_handle()
+        };
+        let (or, zero, one) = (s.m.i32(2), s.m.i32(0), s.m.i32(1));
+        let iu = s.m.undef(s.t.i32);
+        let i32t = s.t.i32;
+        s.op(b, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, or, zero, iu, iu, one]);
+        s.m.terminate(b, Term::Ret);
+        s.finish()
+    }
+
+    /// A vertex program writing a declared UAV declares UAVs at every stage
+    /// (the validator refuses it otherwise: "Flags must match usage", the
+    /// 5,046 programs of the title's list); pixel and compute programs need
+    /// not, nor a vertex program whose UAVs all come from the heap (the
+    /// validator counts declared ranges only: 26 mesh and vertex programs).
+    #[test]
+    fn uavs_outside_pixel_and_compute_programs_are_declared() {
+        let mut validator = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        )
+        .ok();
+        for (name, pixel, threads, heap) in [
+            ("vertex", false, None, false),
+            ("pixel", true, None, false),
+            ("compute", false, Some([1, 1, 1]), false),
+            ("vertex, heap", false, None, true),
+        ] {
+            let mut dxil = marked(pixel, threads, heap);
+            if let Some(v) = validator.as_mut() {
+                v.validate(&mut dxil)
+                    .unwrap_or_else(|e| panic!("{name}: {e}"));
+            }
+        }
     }
 }

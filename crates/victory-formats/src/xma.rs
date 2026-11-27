@@ -316,10 +316,6 @@ fn large_value(bits: &mut Bits) -> u32 {
     bits.read(n)
 }
 
-fn log2(v: usize) -> u32 {
-    usize::BITS - 1 - v.max(1).leading_zeros()
-}
-
 // The inverse transform.
 
 /// Half-length inverse MDCT as FFmpeg defines it (`av_tx` MDCT, inverse):
@@ -333,7 +329,7 @@ fn imdct_half(input: &[f32], out: &mut [f32], scale: f32) {
     let n = input.len();
     let m = n / 2;
     let built;
-    let rotations = match rotations().get(log2(n).wrapping_sub(7) as usize) {
+    let rotations = match rotations().get(n.max(1).ilog2().wrapping_sub(7) as usize) {
         Some(r) if r.pre_re.len() == m => r,
         _ => {
             built = Rotations::new(n);
@@ -703,10 +699,10 @@ impl Decoder {
         if b.bit() {
             // Trim at start and end, which only WMA Pro files apply.
             if b.bit() {
-                b.read(log2(FRAME_SAMPLES * 2));
+                b.read((FRAME_SAMPLES * 2).ilog2());
             }
             if b.bit() {
-                b.read(log2(FRAME_SAMPLES * 2));
+                b.read((FRAME_SAMPLES * 2).ilog2());
             }
         }
         self.parsed_all_subframes = false;
@@ -1005,10 +1001,10 @@ impl Decoder {
         if total_samples == 0 {
             self.parsed_all_subframes = true;
         }
-        self.table_idx = log2(FRAME_SAMPLES / subframe_len) as usize;
+        self.table_idx = (FRAME_SAMPLES / subframe_len).max(1).ilog2() as usize;
         self.num_bands = self.num_sfb[self.table_idx];
         self.subframe_len = subframe_len;
-        self.esc_len = log2(subframe_len - 1) + 1;
+        self.esc_len = (subframe_len - 1).max(1).ilog2() + 1;
 
         // Extended header: fill bits.
         if b.bit() {
@@ -1033,7 +1029,7 @@ impl Decoder {
         if transmit_coeffs {
             self.transmit_num_vec_coeffs = b.bit();
             if self.transmit_num_vec_coeffs {
-                let num_bits = log2(subframe_len.div_ceil(4)) + 1;
+                let num_bits = subframe_len.div_ceil(4).max(1).ilog2() + 1;
                 for i in 0..self.channels_for_cur_subframe {
                     let c = self.channel_indexes[i];
                     let n = (b.read(num_bits) << 2) as usize;
@@ -1141,7 +1137,7 @@ impl Decoder {
             }
             window_overlap(
                 &mut ch.out[start..start + winlen],
-                &windows()[log2(winlen) as usize - 7],
+                &windows()[winlen.max(1).ilog2() as usize - 7],
             );
             ch.prev_block_len = subframe_len;
         }

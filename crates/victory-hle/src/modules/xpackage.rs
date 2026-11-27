@@ -7,9 +7,11 @@ use std::ffi::{c_char, c_void};
 use std::path::Path;
 use std::sync::OnceLock;
 
+use super::storage;
 use super::xasync::{self, AsyncBlock};
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, put_string, text, token,
+    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, put_string, register,
+    text,
 };
 use crate::runtime;
 
@@ -48,23 +50,12 @@ fn is_ours(id: *const c_char) -> bool {
 
 /// Bytes in the package folder, counted once.
 fn package_bytes() -> u64 {
-    fn size(dir: &Path) -> u64 {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return 0;
-        };
-        entries
-            .flatten()
-            .map(|e| match e.metadata() {
-                Ok(m) if m.is_dir() => size(&e.path()),
-                Ok(m) => m.len(),
-                Err(_) => 0,
-            })
-            .sum()
-    }
     static BYTES: OnceLock<u64> = OnceLock::new();
     *BYTES.get_or_init(|| {
         let exe = runtime::main_image().and_then(runtime::image_path);
-        exe.as_deref().and_then(Path::parent).map_or(0, size)
+        exe.as_deref()
+            .and_then(Path::parent)
+            .map_or(0, storage::used_bytes)
     })
 }
 
@@ -125,18 +116,8 @@ extern "system" fn progress(_: This, _: *const c_void, out: *mut Progress) {
     );
 }
 
-/// The installation is complete, so progress never changes.
-extern "system" fn register_progress(
-    _: This,
-    _monitor: *const c_void,
-    _context: *mut c_void,
-    _callback: *const c_void,
-    out: *mut u64,
-) -> HRESULT {
-    put(out, token())
-}
-
 /// The completed installation has no pending progress callbacks to wait for.
+/// Unlike the shared `unregister`, it takes the monitor.
 extern "system" fn unregister_progress(
     _: This,
     _monitor: *const c_void,
@@ -288,7 +269,7 @@ static VTABLE: Methods<40> = Methods([
     close_monitor as *const (),         // 0x30
     progress as *const (),              // 0x38
     missing::<8> as *const (),          // 0x40 update a monitor
-    register_progress as *const (),     // 0x48
+    register as *const (),              // 0x48 progress changed (never: complete)
     unregister_progress as *const (),   // 0x50
     missing::<11> as *const (),         // 0x58 user locale
     find_availability as *const (),     // 0x60

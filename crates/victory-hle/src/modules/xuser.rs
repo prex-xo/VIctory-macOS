@@ -8,7 +8,8 @@ use std::ffi::{c_char, c_void};
 
 use super::xasync::{self, AsyncBlock, ProviderData};
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, put_string, text, token,
+    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, put_string, register,
+    text, unregister,
 };
 
 /// The user provider.
@@ -247,21 +248,6 @@ extern "system" fn token_result(
     xasync::XAsyncGetResult(block, (&raw const TOKEN).cast(), size, buffer, used)
 }
 
-/// The user never changes and no device is ever associated, so these
-/// callbacks are never called.
-extern "system" fn register(
-    _: This,
-    _queue: *const c_void,
-    _context: *mut c_void,
-    _callback: *const c_void,
-    out: *mut u64,
-) -> HRESULT {
-    put(out, token())
-}
-extern "system" fn unregister(_: This, _token: u64, _wait: bool) -> bool {
-    true
-}
-
 /// No input device belongs to a user.
 extern "system" fn find_for_device(_: This, _device: *const c_void, _: *mut Handle) -> HRESULT {
     USER_NOT_FOUND
@@ -303,7 +289,7 @@ static VTABLE: Methods<35> = Methods([
     missing::<30> as *const (),            // 0xf0 result
     missing::<31> as *const (),            // 0xf8 the same, UTF-16: begin
     missing::<32> as *const (),            // 0x100 result
-    register as *const (),                 // 0x108 change event
+    register as *const (),                 // 0x108 change event (never)
     unregister as *const (),               // 0x110
 ]);
 
@@ -319,7 +305,7 @@ static DEVICE_VTABLE: Methods<6> = Methods([
     add_ref as *const (),
     add_ref as *const (),
     find_for_device as *const (), // 0x18
-    register as *const (),        // 0x20 device association changed
+    register as *const (),        // 0x20 device association changed (never)
     unregister as *const (),      // 0x28
 ]);
 

@@ -583,6 +583,7 @@ fn build(wide: bool, memory: bool) -> HostShader {
     );
     let io = io::raise(&p, &native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
+        halves_rendezvous: false,
         native: &native,
         p: &p,
         st: &st,
@@ -593,6 +594,12 @@ fn build(wide: bool, memory: bool) -> HostShader {
         prims: Vec::new(),
         mesh_stride: 0,
         atomic_locks: false,
+        atomic_lock_rounds: false,
+        atomic_umax: false,
+        bias_as_gradients: false,
+        host_wave32: false,
+        narrow_waves: false,
+        uav_size_level0: false,
         view_marks: false,
     })
     .expect("lower");
@@ -605,12 +612,15 @@ fn build(wide: bool, memory: bool) -> HostShader {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        root_srv_bytes: lowered.root_srv_bytes,
         memory: lowered.memory,
         memory_writes: lowered.memory_writes,
         view_addresses: lowered.view_addresses,
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
+        heap_index_sources: Vec::new(),
         view_marks: lowered.view_marks,
+        half_views: lowered.half_views,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
@@ -835,4 +845,615 @@ fn page_table(view: u32, null: u32) -> Vec<u32> {
 fn intersections_on_nodes_in_title_memory_equal_the_reference() {
     run_cases(false, 4, true);
     run_cases(true, 4, true);
+}
+
+/// A box32 node in the last 64 bytes of a 64 KiB page has its last 48
+/// bytes in the next page, here another copy's: lanes whose node crosses
+/// look its tail up again (`Lower::raw_load_past`), the others read theirs
+/// through their node's first lookup; both equal the reference.
+#[test]
+fn box32_nodes_across_a_page_boundary_equal_the_reference() {
+    let shader = build(false, true);
+    let mut rng = Rng(17);
+    let cases: Vec<(Vec<u32>, u32, Ray)> = std::iter::repeat_with(|| case(&mut rng))
+        .filter(|c| c.1 == 5)
+        .take(LANES)
+        .collect();
+    // Copy A holds the page at TITLE: the rays, the even lanes' nodes, and
+    // in its last 64 bytes the odd lanes' one node (lane 1's), whose tail
+    // copy B holds, the next page.
+    let (nodes, across) = (LANES * 64, 0x1_0000 - 64);
+    let shared = &cases[1].0;
+    let mut a = vec![0u32; 0x1_0000 / 4];
+    a[across / 4..].copy_from_slice(&shared[..16]);
+    let b = shared[16..28].to_vec();
+    for (n, (w, _, ray)) in cases.iter().enumerate() {
+        let node = if n % 2 == 1 { across } else { nodes + 128 * n };
+        let r = &mut a[16 * n..16 * n + 12];
+        r[0] = (node >> 3 | 5) as u32;
+        r[1] = ray.extent.to_bits();
+        for k in 0..3 {
+            r[2 + k] = ray.origin[k].to_bits();
+            r[5 + k] = ray.dir[k].to_bits();
+            r[8 + k] = ray.inv[k].to_bits();
+        }
+        if n % 2 == 0 {
+            a[node / 4..node / 4 + 28].copy_from_slice(w);
+        }
+    }
+    // The next page's entry names copy B's views (heap index 5).
+    let mut table = page_table(1, 3);
+    let next = TITLE as u32 + 0x1_0000;
+    let entry = 4096 + 2 * (4096 + (next >> 16 & 0xFFF) as usize);
+    table[entry..entry + 2].copy_from_slice(&[5, next]);
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match (u.root, u.slot) {
+                (RootType::Table, 1) => 0,
+                (RootType::Constants, 0) => (TITLE >> (32 * u.dword)) as u32,
+                _ => panic!("{u:?}"),
+            };
+        }
+        let views = [
+            View::RawUav((LANES * 4) as u32),
+            View::Memory(&a),
+            View::Pair,
+            View::NullPair,
+            View::Pair,
+            View::Memory(&b),
+            View::Pair,
+        ];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (
+                            1,
+                            Root::View {
+                                srv: true,
+                                data: table.clone(),
+                            },
+                        ),
+                        (2, Root::Uav(2 * 4096 / 32)),
+                    ],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        for (n, (w, _, ray)) in cases.iter().enumerate() {
+            let node = if n % 2 == 1 { shared } else { w };
+            let want = intersect(node, 5, ray);
+            let got = &out[0][4 * n..4 * n + 4];
+            assert_eq!(got, want, "{label}: lane {n}, {ray:?}, node {node:08x?}");
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// Builds a multi-block title-memory page table mapping each `(address, view)`
+/// single-64-KiB-page copy, with `null` as the unmapped descriptor pair.
+fn page_table_for(mappings: &[(u64, u32)], null: u32) -> (Vec<u32>, u32) {
+    let mut t = vec![0u32; 4096];
+    // Block 0: unmapped sentinel entries.
+    for _ in 0..4096 {
+        t.extend([null, 0]);
+    }
+    let mut blocks: Vec<usize> = Vec::new();
+    for &(addr, view) in mappings {
+        assert!(addr < (1u64 << 40), "address {addr:#x} out of 40-bit range");
+        let l1 = (addr >> 28) as usize;
+        let block = match blocks.iter().position(|&b| b == l1) {
+            Some(idx) => idx + 1,
+            None => {
+                blocks.push(l1);
+                let b = blocks.len();
+                t[l1] = b as u32;
+                for _ in 0..4096 {
+                    t.extend([null, 0]);
+                }
+                b
+            }
+        };
+        let page = ((addr >> 16) & 0xFFF) as usize;
+        let entry = 4096 + 2 * (block * 4096 + page);
+        t[entry..entry + 2].copy_from_slice(&[view, addr as u32]);
+    }
+    let bitmap_dwords = ((blocks.len() + 1) * 4096 / 32) as u32;
+    (t, bitmap_dwords)
+}
+
+/// Encodes a ray record `(ptr_lo, ptr_hi, ray)` into `data` at lane `n`.
+fn write_ray(data: &mut [u32], n: usize, ptr_lo: u32, ptr_hi: u32, ray: &Ray) {
+    let r = &mut data[16 * n..16 * n + 12];
+    r[0] = ptr_lo;
+    r[1] = ray.extent.to_bits();
+    for k in 0..3 {
+        r[2 + k] = ray.origin[k].to_bits();
+        r[5 + k] = ray.dir[k].to_bits();
+        r[8 + k] = ray.inv[k].to_bits();
+    }
+    r[11] = ptr_hi;
+}
+
+/// Sentinel invalid pointers (`INVALID = 0xFFFF_FFFF`) and unhandled node types
+/// (6 = instance, 7 = procedural) must return `[INVALID; 4]` without issuing
+/// title-memory loads that set miss bits in the dirty-page bitmap (which would
+/// otherwise withhold title-memory writes).
+#[test]
+fn invalid_and_unhandled_node_pointers_return_invalid_without_miss_bitmap() {
+    let valid_box = box32([unit(2.0), EMPTY, EMPTY, EMPTY]);
+    let valid_tri = tri0([[0.0, 0.0, 2.0], [1.0, 0.0, 2.0], [0.0, 1.0, 2.0]]);
+    let box_ray = along_x();
+    let tri_ray = Ray::new([0.25, 0.25, -1.0], [0.0, 0.0, 1.0], 100.0);
+
+    let nodes_byte = (LANES * 64) as u32;
+    let box_ptr = (nodes_byte >> 3) | 5;
+    let tri_ptr = (nodes_byte + 128) >> 3;
+
+    let mut data = vec![0u32; LANES * 16 + 64];
+    let box_off = LANES * 16;
+    data[box_off..box_off + 28].copy_from_slice(&valid_box);
+    data[box_off + 32..box_off + 48].copy_from_slice(&valid_tri);
+
+    for n in 0..LANES {
+        match n % 5 {
+            0 => write_ray(&mut data, n, box_ptr, 0, &box_ray),
+            1 => write_ray(&mut data, n, tri_ptr, 0, &tri_ray),
+            // Canonical invalid sentinel pointer (type 7, unmapped +32 GiB offset).
+            2 => write_ray(&mut data, n, INVALID, 0, &box_ray),
+            // Instance node (type 6) with high unmapped offset.
+            3 => write_ray(&mut data, n, 0x8000_0006, 0x0000_0003, &box_ray),
+            // Procedural node (type 7) with high unmapped offset.
+            _ => write_ray(&mut data, n, 0xFFFF_FFF7, 0x0000_0005, &box_ray),
+        }
+    }
+
+    let (table, bitmap_dwords) = page_table_for(&[(TITLE, 1)], 3);
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    for (wide, memory) in [(false, false), (true, false), (false, true), (true, true)] {
+        let shader = build(wide, memory);
+        let mut ran = 0;
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                continue;
+            };
+            let (root, pso) = host
+                .compute_pipeline(&shader)
+                .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Table, 1) => 0,
+                    (RootType::Constants, 0) if memory => (TITLE >> (32 * u.dword)) as u32,
+                    (RootType::Descriptor, 0) if !memory => (TITLE >> (32 * u.dword)) as u32,
+                    _ => panic!("{u:?}"),
+                };
+            }
+            let views = [
+                View::RawUav((LANES * 4) as u32),
+                View::Memory(&data),
+                View::Pair,
+                View::NullPair,
+                View::Pair,
+            ];
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(ud)),
+                            (
+                                1,
+                                Root::View {
+                                    srv: true,
+                                    data: table.clone(),
+                                },
+                            ),
+                            (2, Root::Uav(bitmap_dwords)),
+                        ],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            for n in 0..LANES {
+                let got = &out[0][4 * n..4 * n + 4];
+                let want = match n % 5 {
+                    0 => intersect(&valid_box, 5, &box_ray),
+                    1 => intersect(&valid_tri, 0, &tri_ray),
+                    _ => [INVALID; 4],
+                };
+                assert_eq!(
+                    got, want,
+                    "{label} (wide={wide}, memory={memory}): lane {n} mismatch"
+                );
+            }
+            let bitmap = out.last().expect("miss bitmap readback");
+            let missed_words: Vec<(usize, u32)> = bitmap
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|&(_, w)| w != 0)
+                .collect();
+            assert!(
+                missed_words.is_empty(),
+                "{label} (wide={wide}, memory={memory}): invalid/unhandled node pointers set miss bitmap words {missed_words:x?}"
+            );
+            ran += 1;
+        }
+        assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+    }
+}
+
+/// 64-bit BVH pointers through a root SRV (`Source::Built` + `root_address`)
+/// must preserve all bits of `((ptr_hi << 32 | (ptr_lo & !7)) << 3)` so nodes
+/// at >= 4 GiB (35-bit low shift) and >= 32 GiB (non-zero high word) resolve
+/// accurately in title memory.
+#[test]
+fn wide_64bit_root_srv_pointers_honor_high_word_and_35bit_offset() {
+    let box_4g = box32([unit(4.0), unit(1.0), EMPTY, EMPTY]);
+    let tri_32g = tri0([[0.0, 0.0, 5.0], [2.0, 0.0, 5.0], [0.0, 2.0, 5.0]]);
+    let ray_box = along_x();
+    let ray_tri = Ray::new([0.5, 0.5, 0.0], [0.0, 0.0, 1.0], 100.0);
+
+    // Base page at TITLE holds rays; second page at TITLE + 4 GiB holds box_4g;
+    // third page at TITLE + 32 GiB holds tri_32g.
+    let addr_4g = TITLE + (1u64 << 32);
+    let addr_32g = TITLE + (8u64 << 32);
+
+    let mut rays_page = vec![0u32; LANES * 16];
+    let mut page_4g = vec![0u32; 64];
+    page_4g[..28].copy_from_slice(&box_4g);
+    let mut page_32g = vec![0u32; 64];
+    page_32g[32..48].copy_from_slice(&tri_32g);
+
+    // Byte offset 0x1_0000_0000 -> ptr = 0x2000_0000 (hi=0, lo=0x2000_0005).
+    // Byte offset 0x8_0000_0080 -> ptr = 0x1_0000_0010 (hi=1, lo=0x0000_0010).
+    let (ptr_4g_lo, ptr_4g_hi) = (0x2000_0000u32 | 5, 0u32);
+    let (ptr_32g_lo, ptr_32g_hi) = (128u32 >> 3, 1u32);
+
+    for n in 0..LANES {
+        if n % 2 == 0 {
+            write_ray(&mut rays_page, n, ptr_4g_lo, ptr_4g_hi, &ray_box);
+        } else {
+            write_ray(&mut rays_page, n, ptr_32g_lo, ptr_32g_hi, &ray_tri);
+        }
+    }
+
+    let (table, bitmap_dwords) =
+        page_table_for(&[(TITLE, 1), (addr_4g, 5), (addr_32g, 7)], 3);
+    let shader = build(true, false);
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match (u.root, u.slot) {
+                (RootType::Table, 1) => 0,
+                (RootType::Descriptor, 0) => (TITLE >> (32 * u.dword)) as u32,
+                _ => panic!("{u:?}"),
+            };
+        }
+        let views = [
+            View::RawUav((LANES * 4) as u32),
+            View::Memory(&rays_page),
+            View::Pair,
+            View::NullPair,
+            View::Pair,
+            View::Memory(&page_4g),
+            View::Pair,
+            View::Memory(&page_32g),
+            View::Pair,
+        ];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (
+                            1,
+                            Root::View {
+                                srv: true,
+                                data: table.clone(),
+                            },
+                        ),
+                        (2, Root::Uav(bitmap_dwords)),
+                    ],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        let want_4g = intersect(&box_4g, 5, &ray_box);
+        let want_32g = intersect(&tri_32g, 0, &ray_tri);
+        for n in 0..LANES {
+            let got = &out[0][4 * n..4 * n + 4];
+            let want = if n % 2 == 0 { want_4g } else { want_32g };
+            assert_eq!(got, want, "{label}: lane {n} mismatch");
+        }
+        let bitmap = out.last().expect("miss bitmap readback");
+        assert!(
+            bitmap.iter().all(|&w| w == 0),
+            "{label}: unexpected miss bitmap words on valid 64-bit offsets"
+        );
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// Builds a synthetic box16 node of 4 child pointers and 4 f16 AABBs.
+fn box16_node(children: [u32; 4], aabbs: [[f32; 6]; 4]) -> Vec<u32> {
+    let mut w = children.to_vec();
+    for b in aabbs {
+        let h = b.map(to_half);
+        w.push(h[0] | (h[1] << 16));
+        w.push(h[2] | (h[3] << 16));
+        w.push(h[4] | (h[5] << 16));
+    }
+    w
+}
+
+/// End-to-end synthetic 2-level BVH GPU validation on the host device:
+/// 1) Initial build: root Box32 -> Box16 -> Tri0 leaf hit & miss verification.
+/// 2) In-place refit: moving a leaf triangle + updating parent Box16/Box32 bounds
+///    causes the old ray to miss and the new ray to hit at the updated depth.
+/// 3) Malformed / corrupted BVH inputs (zeroed nodes, NaN vertices/bounds,
+///    inverted +/-inf bounds, zero-area triangles, zero ray direction) all miss
+///    cleanly without hangs or device removal.
+#[test]
+fn synthetic_multi_level_bvh_traversal_refit_and_malformed_nodes() {
+    let shader = build(false, true);
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let run = |host: &Host,
+               root_sig: &windows::Win32::Graphics::Direct3D12::ID3D12RootSignature,
+               pso: &windows::Win32::Graphics::Direct3D12::ID3D12PipelineState,
+               ud: &[u32],
+               table: &[u32],
+               bitmap_dwords: u32,
+               data: &[u32]|
+     -> Vec<u32> {
+        let views = [
+            View::RawUav((LANES * 4) as u32),
+            View::Memory(data),
+            View::Pair,
+            View::NullPair,
+            View::Pair,
+        ];
+        let out = host
+            .dispatch(
+                root_sig,
+                pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud.to_vec())),
+                        (
+                            1,
+                            Root::View {
+                                srv: true,
+                                data: table.to_vec(),
+                            },
+                        ),
+                        (2, Root::Uav(bitmap_dwords)),
+                    ],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("BVH dispatch failed");
+        out[0].clone()
+    };
+
+    let (table, bitmap_dwords) = page_table_for(&[(TITLE, 1)], 3);
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            continue;
+        };
+        let (root_sig, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match (u.root, u.slot) {
+                (RootType::Table, 1) => 0,
+                (RootType::Constants, 0) => (TITLE >> (32 * u.dword)) as u32,
+                _ => panic!("{u:?}"),
+            };
+        }
+
+        // Layout in `data`:
+        // - dwords 0..4096: 256 rays (64 bytes each)
+        // - byte 16384 (dword 4096): root Box32 (128 B)
+        // - byte 16512 (dword 4128): left Box16 (64 B)
+        // - byte 16640 (dword 4160): right Box16 (64 B)
+        // - byte 16768 (dword 4192): left Tri0 (64 B)
+        // - byte 16896 (dword 4224): right Tri0 (64 B)
+        // - byte 17024 (dword 4256): zeroed node (128 B)
+        // - byte 17152 (dword 4288): NaN/inf corrupted Box32 (128 B)
+        // - byte 17280 (dword 4320): NaN vertex Tri0 (64 B)
+        // - byte 17408 (dword 4352): zero-area Tri0 (64 B)
+        let base_byte = (LANES * 64) as u32;
+        let ptr_root = (base_byte >> 3) | 5;
+        let ptr_left_box = ((base_byte + 128) >> 3) | 4;
+        let ptr_right_box = ((base_byte + 256) >> 3) | 4;
+        let ptr_left_tri = (base_byte + 384) >> 3;
+        let ptr_right_tri = (base_byte + 512) >> 3;
+        let ptr_zero_box = ((base_byte + 640) >> 3) | 5;
+        let ptr_zero_tri = (base_byte + 640) >> 3;
+        let ptr_nan_box = ((base_byte + 768) >> 3) | 5;
+        let ptr_nan_tri = (base_byte + 896) >> 3;
+        let ptr_degen_tri = (base_byte + 1024) >> 3;
+
+        let mut data = vec![0u32; LANES * 16 + 32 * 10];
+        let write_node = |buf: &mut [u32], slot: usize, words: &[u32]| {
+            let at = LANES * 16 + slot * 32;
+            buf[at..at + words.len()].copy_from_slice(words);
+        };
+
+        // Initial scene: left triangle at z=4 (x in [-3,-1]), right at z=8 (x in [1,3]).
+        let left_v = [[-3.0, -1.0, 4.0], [-1.0, -1.0, 4.0], [-3.0, 1.0, 4.0]];
+        let right_v = [[1.0, -1.0, 8.0], [3.0, -1.0, 8.0], [1.0, 1.0, 8.0]];
+        let left_aabb = [-3.0, -1.0, 3.5, -1.0, 1.0, 4.5];
+        let right_aabb = [1.0, -1.0, 7.5, 3.0, 1.0, 8.5];
+
+        let mut root_w = vec![ptr_left_box, ptr_right_box, INVALID, INVALID];
+        root_w.extend(
+            [left_aabb, right_aabb, EMPTY, EMPTY]
+                .iter()
+                .flatten()
+                .map(|x| x.to_bits()),
+        );
+        let left_box_w = box16_node(
+            [ptr_left_tri, INVALID, INVALID, INVALID],
+            [left_aabb, EMPTY, EMPTY, EMPTY],
+        );
+        let right_box_w = box16_node(
+            [ptr_right_tri, INVALID, INVALID, INVALID],
+            [right_aabb, EMPTY, EMPTY, EMPTY],
+        );
+        write_node(&mut data, 0, &root_w);
+        write_node(&mut data, 1, &left_box_w);
+        write_node(&mut data, 2, &right_box_w);
+        write_node(&mut data, 3, &tri0(left_v));
+        write_node(&mut data, 4, &tri0(right_v));
+
+        // Malformed nodes for Pass 3:
+        // Slot 5 is already all zeros.
+        let mut nan_box_w = vec![ptr_left_tri, ptr_right_tri, ptr_left_tri, ptr_right_tri];
+        nan_box_w.extend(
+            [
+                [f32::NAN, -1.0, -1.0, 1.0, 1.0, 1.0],
+                [f32::INFINITY, f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY],
+                [-1.0, -1.0, -1.0, f32::NAN, 1.0, 1.0],
+                EMPTY,
+            ]
+            .iter()
+            .flatten()
+            .map(|x| x.to_bits()),
+        );
+        let nan_tri_w = tri0([[f32::NAN, 0.0, 4.0], [1.0, 0.0, 4.0], [0.0, 1.0, 4.0]]);
+        let degen_tri_w = tri0([[0.0, 0.0, 4.0], [1.0, 0.0, 4.0], [2.0, 0.0, 4.0]]);
+        write_node(&mut data, 6, &nan_box_w);
+        write_node(&mut data, 7, &nan_tri_w);
+        write_node(&mut data, 8, &degen_tri_w);
+
+        let ray_left = Ray::new([-2.5, -0.5, 0.0], [0.0, 0.0, 1.0], 100.0);
+        let ray_right = Ray::new([1.5, -0.5, 0.0], [0.0, 0.0, 1.0], 100.0);
+        let ray_miss = Ray::new([0.0, 5.0, 0.0], [0.0, 0.0, 1.0], 100.0);
+        let ray_zero_dir = Ray::new([0.0, 0.0, 0.0], [0.0, 0.0, 0.0], 100.0);
+
+        // Pass 1: Step 1 (root Box32) -> verify exact child pointers returned.
+        write_ray(&mut data, 0, ptr_root, 0, &ray_left);
+        write_ray(&mut data, 1, ptr_root, 0, &ray_right);
+        write_ray(&mut data, 2, ptr_root, 0, &ray_miss);
+        let out = run(&host, &root_sig, &pso, &ud, &table, bitmap_dwords, &data);
+        assert_eq!(&out[0..4], [ptr_left_box, INVALID, INVALID, INVALID], "{label}: root->left");
+        assert_eq!(&out[4..8], [ptr_right_box, INVALID, INVALID, INVALID], "{label}: root->right");
+        assert_eq!(&out[8..12], [INVALID; 4], "{label}: root->miss");
+
+        // Pass 1: Step 2 (Box16 -> Tri0) using the child pointers returned by the GPU.
+        let child_l = out[0];
+        let child_r = out[4];
+        write_ray(&mut data, 0, child_l, 0, &ray_left);
+        write_ray(&mut data, 1, child_r, 0, &ray_right);
+        let out = run(&host, &root_sig, &pso, &ud, &table, bitmap_dwords, &data);
+        assert_eq!(&out[0..4], [ptr_left_tri, INVALID, INVALID, INVALID], "{label}: box16->left tri");
+        assert_eq!(&out[4..8], [ptr_right_tri, INVALID, INVALID, INVALID], "{label}: box16->right tri");
+
+        let leaf_l = out[0];
+        let leaf_r = out[4];
+        write_ray(&mut data, 0, leaf_l, 0, &ray_left);
+        write_ray(&mut data, 1, leaf_r, 0, &ray_right);
+        let out = run(&host, &root_sig, &pso, &ud, &table, bitmap_dwords, &data);
+        let (tl, ul, vl, _) = ratio(out[0..4].try_into().unwrap());
+        let (tr, ur, vr, _) = ratio(out[4..8].try_into().unwrap());
+        assert!((tl - 4.0).abs() < 1e-5 && (ul - 0.25).abs() < 1e-5 && (vl - 0.25).abs() < 1e-5, "{label}: left tri hit ({tl}, {ul}, {vl})");
+        assert!((tr - 8.0).abs() < 1e-5 && (ur - 0.25).abs() < 1e-5 && (vr - 0.25).abs() < 1e-5, "{label}: right tri hit ({tr}, {ur}, {vr})");
+
+        // Pass 2: In-place refit — move left triangle to x in [5, 7], z = 12, update Box16 & root Box32.
+        let moved_v = [[5.0, -1.0, 12.0], [7.0, -1.0, 12.0], [5.0, 1.0, 12.0]];
+        let moved_aabb = [5.0, -1.0, 11.5, 7.0, 1.0, 12.5];
+        let mut refit_root = vec![ptr_left_box, ptr_right_box, INVALID, INVALID];
+        refit_root.extend(
+            [moved_aabb, right_aabb, EMPTY, EMPTY]
+                .iter()
+                .flatten()
+                .map(|x| x.to_bits()),
+        );
+        let refit_left_box = box16_node(
+            [ptr_left_tri, INVALID, INVALID, INVALID],
+            [moved_aabb, EMPTY, EMPTY, EMPTY],
+        );
+        write_node(&mut data, 0, &refit_root);
+        write_node(&mut data, 1, &refit_left_box);
+        write_node(&mut data, 3, &tri0(moved_v));
+
+        let ray_moved = Ray::new([5.5, -0.5, 0.0], [0.0, 0.0, 1.0], 100.0);
+        write_ray(&mut data, 0, ptr_root, 0, &ray_left);
+        write_ray(&mut data, 1, ptr_root, 0, &ray_moved);
+        write_ray(&mut data, 2, ptr_left_tri, 0, &ray_moved);
+        let out = run(&host, &root_sig, &pso, &ud, &table, bitmap_dwords, &data);
+        assert_eq!(&out[0..4], [INVALID; 4], "{label}: old ray must miss after refit");
+        assert_eq!(&out[4..8], [ptr_left_box, INVALID, INVALID, INVALID], "{label}: moved ray must hit refit box");
+        let (tm, um, vm, _) = ratio(out[8..12].try_into().unwrap());
+        assert!((tm - 12.0).abs() < 1e-5 && (um - 0.25).abs() < 1e-5 && (vm - 0.25).abs() < 1e-5, "{label}: moved tri hit ({tm}, {um}, {vm})");
+
+        // Pass 3: Malformed / corrupted nodes must miss cleanly on the GPU.
+        let tri_miss = [f32::INFINITY.to_bits(), 1.0f32.to_bits(), 0, 0];
+        write_ray(&mut data, 0, ptr_zero_box, 0, &ray_miss);
+        write_ray(&mut data, 1, ptr_zero_tri, 0, &ray_left);
+        write_ray(&mut data, 2, ptr_nan_box, 0, &ray_left);
+        write_ray(&mut data, 3, ptr_nan_tri, 0, &ray_left);
+        write_ray(&mut data, 4, ptr_degen_tri, 0, &ray_left);
+        write_ray(&mut data, 5, ptr_left_tri, 0, &ray_zero_dir);
+        let out = run(&host, &root_sig, &pso, &ud, &table, bitmap_dwords, &data);
+        assert_eq!(&out[0..4], [INVALID; 4], "{label}: zeroed box away from origin misses");
+        assert_eq!(&out[4..8], tri_miss, "{label}: zeroed triangle misses");
+        assert_eq!(&out[8..12], [INVALID; 4], "{label}: NaN/inf box misses");
+        assert_eq!(&out[12..16], tri_miss, "{label}: NaN triangle misses");
+        assert_eq!(&out[16..20], tri_miss, "{label}: degenerate triangle misses");
+        assert_eq!(&out[20..24], tri_miss, "{label}: zero-direction ray misses");
+
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }

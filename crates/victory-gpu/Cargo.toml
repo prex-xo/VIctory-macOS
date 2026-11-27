@@ -9,14 +9,15 @@ publish.workspace = true
 
 [dependencies]
 blake3.workspace = true
+sha2.workspace = true
 miniz_oxide.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
 victory-formats.workspace = true
-victory-pipeline.workspace = true
 victory-shader = { workspace = true, features = ["host"] }
 
 [dev-dependencies]
+tracing-subscriber.workspace = true
 tempfile.workspace = true
 
 [features]
@@ -27,6 +28,8 @@ diagnostics = []
 workspace = true
 
 [target.'cfg(windows)'.dependencies]
+rayon.workspace = true
+victory-pipeline.workspace = true
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Performance", "Win32_System_ProcessStatus", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 windows = { workspace = true, features = [
     "Win32_Graphics_Direct3D",

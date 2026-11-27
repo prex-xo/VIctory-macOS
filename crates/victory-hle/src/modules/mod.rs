@@ -5,8 +5,7 @@
 //! Run `victory census` over your titles to see what is still missing.
 //!
 //! Planned areas (driven by census results, not by completeness):
-//! `file` (package paths), `thread` (TLS callbacks for title threads),
-//! `xaudio2`, `xstore` stubs.
+//! `thread` (TLS callbacks for title threads), `xaudio2`.
 
 #[cfg(windows)]
 pub mod apu;
@@ -21,6 +20,7 @@ pub mod fidelityfx;
 #[cfg(windows)]
 pub mod files;
 pub mod gameinput;
+pub mod gameinput_script;
 pub mod kernel;
 #[cfg(windows)]
 pub mod lifecycle;
@@ -28,6 +28,7 @@ pub mod lifecycle;
 pub mod media;
 #[cfg(windows)]
 pub mod net;
+pub mod read_stats;
 pub mod rpcrt4;
 pub mod speech;
 pub mod storage;
@@ -45,7 +46,14 @@ pub mod xstore;
 pub mod xsystem;
 pub mod xuser;
 
+use std::sync::{Mutex, MutexGuard};
+
 use crate::HleModule;
+
+/// Locks `mutex`, taking the data even if a thread panicked holding it.
+pub(crate) fn lock<T: ?Sized>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 pub(crate) fn all() -> Vec<HleModule> {
     let mut all = vec![
@@ -60,6 +68,8 @@ pub(crate) fn all() -> Vec<HleModule> {
     #[cfg(windows)]
     all.push(apu::module());
     #[cfg(windows)]
+    all.push(audio::silent::module());
+    #[cfg(windows)]
     all.push(media::module());
     #[cfg(windows)]
     all.push(dstorage::module());
@@ -72,6 +82,8 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(rpcrt4::module());
     #[cfg(windows)]
     all.push(xmem::module());
+    #[cfg(windows)]
+    all.push(xmem::virtual_free_module());
     #[cfg(windows)]
     all.push(xsystem::module());
     #[cfg(windows)]

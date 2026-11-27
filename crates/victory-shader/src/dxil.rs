@@ -66,7 +66,6 @@ impl ShaderKind {
 pub struct DxilProgram<'a> {
     pub kind: ShaderKind,
     pub shader_model: (u8, u8),
-    pub dxil_version: u32,
     /// LLVM bitcode (starts with `BC C0 DE`).
     pub bitcode: &'a [u8],
     /// Bytes between the bitcode header and the bitcode. Empty on PC.
@@ -97,7 +96,6 @@ impl<'a> DxilProgram<'a> {
         if part.get(8..12) != Some(b"DXIL") {
             return Err(ShaderError::Malformed("missing DXIL magic"));
         }
-        let dxil_version = u32_at(part, 12)?;
         let offset = u32_at(part, 16)?;
         let len = u32_at(part, 20)? as usize;
         let start = 8 + offset as usize;
@@ -113,7 +111,6 @@ impl<'a> DxilProgram<'a> {
         Ok(DxilProgram {
             kind: ShaderKind::from_raw((version >> 16) as u16),
             shader_model: (((version >> 4) & 0xF) as u8, (version & 0xF) as u8),
-            dxil_version,
             bitcode,
             prefix,
             trailer: &part[start + len..],

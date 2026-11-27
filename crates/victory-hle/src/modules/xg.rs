@@ -15,11 +15,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use victory_formats::texture::{Dimension, Error, Layout, Swizzle, Texture, TextureDesc};
 
-use super::xasync::{E_INVALIDARG, E_NOTIMPL};
+use super::xasync::{E_FAIL, E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleModule, hle_export};
-
-const E_FAIL: HRESULT = 0x8000_4005_u32 as i32;
 
 /// `D3D12_RESOURCE_DESC`, whose layout field carries `0x100 | swizzle
 /// mode` on the console (1 row major, 0 "pick one").

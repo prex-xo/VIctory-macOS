@@ -165,11 +165,39 @@ pub fn text(s: *const c_char) -> Option<String> {
     (!s.is_null()).then(|| unsafe { CStr::from_ptr(s) }.to_string_lossy().into_owned())
 }
 
+/// The title's NUL-terminated UTF-16 string, if any.
+pub fn wide(s: *const u16) -> Option<String> {
+    // SAFETY: the title passes a NUL-terminated UTF-16 string or null.
+    (!s.is_null()).then(|| unsafe {
+        let len = (0..).take_while(|&i| *s.add(i) != 0).count();
+        String::from_utf16_lossy(std::slice::from_raw_parts(s, len))
+    })
+}
+
 /// A new registration token for callbacks we never call (events nobody
 /// raises offline).
 pub fn token() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Registers a callback for an event nothing raises offline (a changed
+/// user, port or invitation, installation progress): it gets a token and
+/// never runs. The argument after the object is ignored: the queue, or the
+/// progress monitor for `xpackage`.
+pub extern "system" fn register(
+    _: *const Object,
+    _queue: *const c_void,
+    _context: *mut c_void,
+    _callback: *const c_void,
+    out: *mut u64,
+) -> HRESULT {
+    put(out, token())
+}
+
+/// Unregisters one of those; there is nothing to wait for.
+pub extern "system" fn unregister(_: *const Object, _token: u64, _wait: bool) -> bool {
+    true
 }
 
 /// Calls method `slot` (byte offset) of `object` as title code would.

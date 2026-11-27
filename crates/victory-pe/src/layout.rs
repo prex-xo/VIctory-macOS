@@ -29,10 +29,13 @@ pub const DATA_DIRECTORY_SIZE: usize = 8;
 
 /// `IMAGE_TLS_DIRECTORY64::AddressOfCallBacks` (u64 VA).
 pub const TLS64_ADDRESS_OF_CALLBACKS: usize = 24;
+/// Size of an `IMAGE_TLS_DIRECTORY64`.
+pub const TLS64_SIZE: usize = 40;
 
 /// Data directory indices.
 pub mod dir {
     pub const IMPORT: usize = 1;
+    pub const TLS: usize = 9;
     pub const EXCEPTION: usize = 3;
     pub const BASERELOC: usize = 5;
     pub const LOAD_CONFIG: usize = 10;
@@ -52,8 +55,18 @@ pub mod dll_flags {
     pub const DYNAMIC_BASE: u16 = 0x0040;
     pub const FORCE_INTEGRITY: u16 = 0x0080;
     pub const NX_COMPAT: u16 = 0x0100;
+    pub const NO_ISOLATION: u16 = 0x0200;
+    pub const NO_SEH: u16 = 0x0400;
+    pub const NO_BIND: u16 = 0x0800;
     pub const APPCONTAINER: u16 = 0x1000;
+    pub const WDM_DRIVER: u16 = 0x2000;
     pub const GUARD_CF: u16 = 0x4000;
+    pub const TERMINAL_SERVER_AWARE: u16 = 0x8000;
+}
+
+/// `IMAGE_SECTION_HEADER::Characteristics` flags.
+pub mod section_flags {
+    pub const MEM_EXECUTE: u32 = 0x2000_0000;
 }
 
 /// `IMAGE_OPTIONAL_HEADER64::Subsystem` values.
@@ -259,9 +272,11 @@ mod tests {
         assert_eq!(OPT_DATA_DIRECTORY, OPT_NUMBER_OF_RVA_AND_SIZES + 4);
         assert_eq!(DATA_DIRECTORY_SIZE, 8);
         assert_eq!(TLS64_ADDRESS_OF_CALLBACKS, 24);
+        assert_eq!(TLS64_SIZE, 40);
 
         // Data directory indices, which `prepare` patches by number.
         assert_eq!(dir::IMPORT, 1);
+        assert_eq!(dir::TLS, 9);
         assert_eq!(dir::EXCEPTION, 3);
         assert_eq!(dir::BASERELOC, 5);
         assert_eq!(dir::LOAD_CONFIG, 10);

@@ -98,17 +98,20 @@ fn modules(file: &std::fs::File) {
     unsafe { CloseHandle(snapshot) };
 }
 
-/// [`dump_stacks`] into `file`, with a line before each step, so a dump
-/// that stops shows where.
-fn dump_raw(file: &std::fs::File, at: u64, ids: &mut Vec<u32>) {
-    line(file, format_args!("dump at {at} s: taking a thread snapshot"));
+/// Replaces `ids` with the ids of this process's other threads, at most
+/// `limit` of them. False if no snapshot could be taken. Allocates nothing
+/// itself while `ids` has room for `limit`.
+fn other_threads(ids: &mut Vec<u32>, limit: usize) -> bool {
     // SAFETY: plain queries and a snapshot of this process's threads.
     let (me, process, snapshot) = unsafe {
-        (GetCurrentThreadId(), GetCurrentProcessId(), CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0))
+        (
+            GetCurrentThreadId(),
+            GetCurrentProcessId(),
+            CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0),
+        )
     };
     if snapshot == INVALID_HANDLE_VALUE {
-        line(file, format_args!("dump at {at} s: no snapshot"));
-        return;
+        return false;
     }
     ids.clear();
     // SAFETY: zeroed is a valid THREADENTRY32; its size is set before use.
@@ -116,7 +119,7 @@ fn dump_raw(file: &std::fs::File, at: u64, ids: &mut Vec<u32>) {
     entry.dwSize = size_of::<THREADENTRY32>() as u32;
     // SAFETY: `snapshot` is open; `entry` is sized.
     let mut more = unsafe { Thread32First(snapshot, &mut entry) } != 0;
-    while more && ids.len() < ids.capacity() {
+    while more && ids.len() < limit {
         if entry.th32OwnerProcessID == process && entry.th32ThreadID != me {
             ids.push(entry.th32ThreadID);
         }
@@ -125,6 +128,17 @@ fn dump_raw(file: &std::fs::File, at: u64, ids: &mut Vec<u32>) {
     }
     // SAFETY: we opened it.
     unsafe { CloseHandle(snapshot) };
+    true
+}
+
+/// [`dump_stacks`] into `file`, with a line before each step, so a dump
+/// that stops shows where.
+fn dump_raw(file: &std::fs::File, at: u64, ids: &mut Vec<u32>) {
+    line(file, format_args!("dump at {at} s: taking a thread snapshot"));
+    if !other_threads(ids, ids.capacity()) {
+        line(file, format_args!("dump at {at} s: no snapshot"));
+        return;
+    }
     line(file, format_args!("dump at {at} s: {} threads", ids.len()));
     for &id in ids.iter() {
         line(file, format_args!("  thread {id}: opening"));
@@ -179,33 +193,11 @@ struct Aligned(CONTEXT);
 /// Prints every other thread's stack to stderr. Each thread is suspended
 /// only while its context is read and unwound into a buffer allocated
 /// beforehand (it may hold the heap lock).
-pub fn dump_stacks() {
-    // SAFETY: plain queries and a snapshot of this process's threads.
-    let (me, process, snapshot) = unsafe {
-        (
-            GetCurrentThreadId(),
-            GetCurrentProcessId(),
-            CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0),
-        )
-    };
-    if snapshot == INVALID_HANDLE_VALUE {
+fn dump_stacks() {
+    let mut ids = Vec::new();
+    if !other_threads(&mut ids, usize::MAX) {
         return;
     }
-    let mut ids = Vec::new();
-    // SAFETY: zeroed is a valid THREADENTRY32; its size is set before use.
-    let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
-    entry.dwSize = size_of::<THREADENTRY32>() as u32;
-    // SAFETY: `snapshot` is open; `entry` is sized.
-    let mut more = unsafe { Thread32First(snapshot, &mut entry) } != 0;
-    while more {
-        if entry.th32OwnerProcessID == process && entry.th32ThreadID != me {
-            ids.push(entry.th32ThreadID);
-        }
-        // SAFETY: as above.
-        more = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
-    }
-    // SAFETY: we opened it.
-    unsafe { CloseHandle(snapshot) };
     eprintln!("VIctory: stacks of {} threads", ids.len());
     for id in ids {
         // SAFETY: opens a thread of our own process.

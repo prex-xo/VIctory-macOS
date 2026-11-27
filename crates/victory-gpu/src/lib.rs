@@ -17,10 +17,29 @@
 //! `present` (swap chain).
 
 #[cfg(windows)]
+mod alias;
+pub mod bench;
+#[cfg(windows)]
+mod backend;
+#[cfg(windows)]
+mod ambient;
+#[cfg(windows)]
+mod ambient_estimate;
+// Plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod ambient_estimate_set;
+// Plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod ambient_set;
+#[cfg(windows)]
 mod bindless;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
+mod caption;
+// Plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod census_fast;
 #[cfg(windows)]
 mod composite;
 #[cfg(windows)]
@@ -38,18 +57,37 @@ pub mod external;
 pub mod fence;
 pub mod frame;
 #[cfg(windows)]
+mod heap_worker;
+#[cfg(any(windows, test))]
+mod hdr_probe;
+mod hold;
+#[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod indirect;
 pub mod list;
+#[cfg(all(windows, test))]
+mod list_bench;
+#[cfg(windows)]
+mod mac_pressure;
 #[cfg(windows)]
 mod memory;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
+mod placement;
+#[cfg(windows)]
 mod primitive;
 pub mod query;
 pub mod queue;
+// Plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod ranges;
+// Plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod ray_skip;
+#[cfg(any(windows, test))]
+mod recent;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
@@ -62,20 +100,43 @@ pub mod signature;
 mod switch;
 #[cfg(windows)]
 mod tdr;
+#[cfg(any(windows, test))]
+mod texback;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
 mod twin;
 #[cfg(windows)]
 mod watch;
-
 #[cfg(windows)]
-pub use host::on_failure;
+mod widened;
+// Whether the host opens heaps over process memory (ignored by default).
+#[cfg(all(windows, test))]
+mod inplace_probe;
+
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use copystat::CountingAlloc;
+#[cfg(windows)]
+pub use alias::{alias_region, enabled as alias_buffers, unalias_region};
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use alias::{PhysicalHeap, physical_heap};
+#[cfg(windows)]
+pub use host::{MeshSupport, host_mesh_support, on_failure};
 #[cfg(windows)]
 pub use watch::{
-    Writing as KernelWrite, fault_tracking, title_memory_aliased, title_memory_remapped,
-    writing as kernel_will_write,
+    Writing as KernelWrite, fault_tracking, rosetta, stores_need_patching, title_memory_aliased,
+    title_memory_remapped, title_memory_unmapping, writing as kernel_will_write,
 };
+
+/// [`shader_cache::under_wine`], asked once: it looks `wine_get_version` up
+/// in ntdll, which takes Wine's loader lock, and draws ask it per descriptor,
+/// barrier and heap write. Not in `shader_cache`, whose bytes key the
+/// translation caches.
+#[cfg(windows)]
+pub(crate) fn under_wine() -> bool {
+    static WINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WINE.get_or_init(shader_cache::under_wine)
+}
 
 /// A whole file, read without asking for its size or other metadata.
 /// `std::fs::read` and `read_to_end` call `File::metadata()`, which Wine
@@ -99,18 +160,8 @@ pub fn read_file(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
     }
 }
 
-/// Makes folder `dir` and its parents unless it is there. Not
-/// `std::fs::create_dir_all` alone, which on a folder that is there asks for
-/// its metadata (`Path::is_dir`): the same mount manager call as in
-/// [`read_file`]. The pipeline library makes its folder at every save, on
-/// the pipeline workers.
-pub fn make_dir(dir: &std::path::Path) -> std::io::Result<()> {
-    match std::fs::create_dir(dir) {
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir_all(dir),
-        made => made,
-    }
-}
+#[cfg(windows)]
+pub use victory_pipeline::make_dir;
 
 #[cfg(test)]
 mod read_file_tests {

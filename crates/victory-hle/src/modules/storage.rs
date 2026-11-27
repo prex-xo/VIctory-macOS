@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use super::xasync::{self, AsyncBlock, E_ABORT};
+use super::xasync::{self, AsyncBlock, E_ABORT, E_FAIL};
 use super::xgameruntime::{
     Guid, HRESULT, Interface, Methods, NOT_SUPPORTED, Object, S_OK, add_ref, missing, put,
     put_string,
@@ -37,8 +37,6 @@ pub const IID_2026: Guid = Guid::new(
 
 pub static OBJECT: Object = Object::new("persistent local storage", &VTABLE);
 pub const INTERFACES: &[Interface] = &[(PROVIDER, IID, &OBJECT), (PROVIDER, IID_2026, &OBJECT)];
-
-const E_FAIL: HRESULT = 0x8000_4005_u32 as i32;
 
 type This = *const Object;
 
@@ -87,7 +85,8 @@ pub struct SpaceInfo {
     pub total: u64,
 }
 
-fn used_bytes(dir: &Path) -> u64 {
+/// Bytes in the files under `dir`.
+pub(crate) fn used_bytes(dir: &Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };

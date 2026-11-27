@@ -51,6 +51,30 @@ static LOG: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new()
 /// Read before installing the exception handler.
 static LOG_FIRST_CHANCE_BREAKPOINTS: AtomicBool = AtomicBool::new(false);
 
+/// Diagnostics: title `int3` asserts to step over and resume, the way a
+/// debugger continues past one, to see how far init gets. Their RVAs in
+/// the title image, from `VICTORY_SKIP_TITLE_INT3=1dac734,...` (#24).
+/// Every other assert still stops the run.
+#[cfg(feature = "diagnostics")]
+static SKIP_TITLE_INT3: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+
+/// Diagnostics: on the first title `int3`, write the title's subsystem-registry
+/// state to files in this directory, so an assert that checks the registry can
+/// be read after the fact (the singleton, its tables, and their raw memory).
+/// From `VICTORY_DUMP_REGISTRY=<dir>` (#24).
+#[cfg(feature = "diagnostics")]
+static DUMP_REGISTRY: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// The RVAs in a `VICTORY_SKIP_TITLE_INT3` list (hex, `0x` optional,
+/// comma-separated); entries that do not parse are left out.
+#[cfg(any(feature = "diagnostics", test))]
+fn skip_list(value: &str) -> Vec<u32> {
+    value
+        .split(',')
+        .filter_map(|v| u32::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok())
+        .collect()
+}
+
 /// Also appends every unhandled-exception report and panic to `file`, so a
 /// crash can be read after the console is gone.
 pub fn log_crashes_to(file: std::path::PathBuf) {
@@ -78,21 +102,49 @@ pub fn log_crash(text: &str) {
 }
 
 fn append_to_log(text: &str) {
-    use std::io::Write;
     let Some(file) = LOG.get() else { return };
+    let _ = append_record(file, text);
+}
+
+/// Held while a record is appended. Wine appends at the size `fstat` gives
+/// and `pwrite`s there, so two threads appending at once can write over each
+/// other's records. A bounded spin stands in for a lock: a thread that
+/// faults while holding it delays a report but cannot stop it.
+static APPENDING: AtomicBool = AtomicBool::new(false);
+const APPEND_TRIES: u32 = 1 << 16;
+
+fn append_record(file: &std::path::Path, text: &str) -> std::io::Result<()> {
+    let held = (0..APPEND_TRIES).any(|_| {
+        let won = APPENDING
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok();
+        if !won {
+            std::thread::yield_now();
+        }
+        won
+    });
+    let appended = append_once(file, text);
+    if held {
+        APPENDING.store(false, Ordering::Release);
+    }
+    appended
+}
+
+fn append_once(file: &std::path::Path, text: &str) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind, Write};
+
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let opened = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(file);
-    if let Ok(mut f) = opened {
-        let _ = write!(
-            f,
-            "unix time {now}, process {}\n{text}\n",
-            std::process::id()
-        );
+    let record = format!("unix time {now}, process {}\n{text}\n", std::process::id());
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(file)?;
+    // Formatting directly into the file can append fragments separately.
+    // Use one append, with no lock to acquire from an exception handler.
+    if file.write(record.as_bytes())? == record.len() {
+        Ok(())
+    } else {
+        // Retrying a short write could put another report between its pieces.
+        Err(Error::new(ErrorKind::WriteZero, "incomplete crash record append"))
     }
 }
 
@@ -175,8 +227,149 @@ fn windows_version() -> String {
     format!("{major}.{minor}.{build}")
 }
 
+/// The title's breakpoints a thread goes on behind
+/// (`VICTORY_STEP_OVER=<hex offset>[,<hex offset>...]`, offsets into a title
+/// image; off unless set), with how often each was met. The word `pool` in
+/// the list is [`STEP_OVER_POOLS`].
+///
+/// The title asserts with `int3`, which ends it without a debugger. Some of
+/// those traps sit on a function's own way out: the allocate of a
+/// fixed-size pool that is full traps and then returns NULL (retail
+/// 1.0.2.1: `5149aec` and `63966f`, the instance lists' pool, which fills
+/// about six minutes into the opening when frames take seconds; reported
+/// in Marvisak/VIctory#698). Stepping over that one byte lets the caller
+/// have its NULL: what asked for the element is not drawn, and the run
+/// goes on.
+static STEP_OVER: std::sync::OnceLock<Vec<(usize, std::sync::atomic::AtomicU64)>> =
+    std::sync::OnceLock::new();
+
+/// `VICTORY_STEP_OVER=pool`: every breakpoint of a title image that is
+/// followed by an instruction that zeroes a register (`xor r, r`) is
+/// stepped over, without a list of places: that is the shape of the pool
+/// allocators' "no free element" trap, whose next instruction makes the
+/// NULL the function returns (the handler alexodee describes in
+/// fxceless/victory-fork#378). A caller that does not expect NULL may
+/// still fault later; without this the title has stopped already.
+static STEP_OVER_POOLS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// How often [`STEP_OVER_POOLS`] stepped over a trap.
+static POOL_STEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether the bytes behind an `int3` are `xor r, r` of one register with
+/// itself (`31 /r` or `33 /r` with both fields the same, under any REX
+/// prefix that extends both or neither).
+fn zeroes_a_register(behind: &[u8]) -> bool {
+    let (rex, rest) = match behind {
+        [rex @ 0x40..=0x4f, rest @ ..] => (*rex, rest),
+        rest => (0, rest),
+    };
+    // REX.R and REX.B must agree for the two fields to name one register.
+    if (rex >> 2 & 1) != (rex & 1) {
+        return false;
+    }
+    matches!(rest, [0x31 | 0x33, modrm, ..] if modrm >> 6 == 3 && (modrm >> 3 & 7) == (modrm & 7))
+}
+
+/// Where title images are mapped, for [`STEP_OVER`]'s offsets: read by the
+/// exception handler, which takes no lock. 0 is an empty place.
+static IMAGE_BASES: [std::sync::atomic::AtomicUsize; 32] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 32];
+
+/// The ends of the images of [`IMAGE_BASES`], place by place.
+static IMAGE_ENDS: [std::sync::atomic::AtomicUsize; 32] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 32];
+
+/// A title image of `size` bytes was mapped at `base`.
+pub(crate) fn note_image(base: usize, size: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if IMAGE_BASES.iter().any(|b| b.load(Relaxed) == base) {
+        return;
+    }
+    for (place, end) in IMAGE_BASES.iter().zip(&IMAGE_ENDS) {
+        if place.compare_exchange(0, base, Relaxed, Relaxed).is_ok() {
+            end.store(base + size, Relaxed);
+            return;
+        }
+    }
+}
+
+/// Whether the exception is a breakpoint of [`STEP_OVER`]: then the thread
+/// continues behind it.
+///
+/// # Safety
+/// `info` comes from the system, for an exception being dispatched.
+unsafe fn step_over(info: *mut EXCEPTION_POINTERS) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(list) = STEP_OVER
+        .get()
+        .filter(|l| !l.is_empty() || STEP_OVER_POOLS.load(Relaxed))
+    else {
+        return false;
+    };
+    // SAFETY: the system passes valid exception pointers.
+    let record = unsafe { &*(*info).ExceptionRecord };
+    if record.ExceptionCode != EXCEPTION_BREAKPOINT {
+        return false;
+    }
+    let at = record.ExceptionAddress as usize;
+    let named = list.iter().find(|(offset, _)| {
+        at.checked_sub(*offset)
+            .is_some_and(|base| base != 0 && IMAGE_BASES.iter().any(|b| b.load(Relaxed) == base))
+    });
+    let (offset, n) = if let Some((offset, count)) = named {
+        (*offset, count.fetch_add(1, Relaxed) + 1)
+    } else {
+        if !STEP_OVER_POOLS.load(Relaxed) {
+            return false;
+        }
+        // In a title image, with the bytes behind it in the same image.
+        let Some(base) = IMAGE_BASES
+            .iter()
+            .zip(&IMAGE_ENDS)
+            .map(|(b, e)| (b.load(Relaxed), e.load(Relaxed)))
+            .find(|&(b, e)| b != 0 && at >= b && at + 4 <= e)
+            .map(|(b, _)| b)
+        else {
+            return false;
+        };
+        // SAFETY: four bytes of a mapped image's code, where the thread just ran.
+        let code = unsafe { std::slice::from_raw_parts(at as *const u8, 4) };
+        if code[0] != 0xcc || !zeroes_a_register(&code[1..]) {
+            return false;
+        }
+        (at - base, POOL_STEPS.fetch_add(1, Relaxed) + 1)
+    };
+    // SAFETY: the faulting thread's context, for the exception being dispatched.
+    let ctx = unsafe { &mut *(*info).ContextRecord };
+    if ctx.Rip as usize == at {
+        ctx.Rip += 1;
+    }
+    if n <= 3 || n.is_power_of_two() {
+        tracing::warn!(
+            offset = format_args!("{offset:#x}"),
+            n,
+            "stepped over the title's breakpoint (VICTORY_STEP_OVER): the code behind the trap goes on"
+        );
+    }
+    true
+}
+
 /// Installs the handlers; call once before running title code.
 pub fn report_crashes() {
+    STEP_OVER.get_or_init(|| {
+        let asked = std::env::var("VICTORY_STEP_OVER").unwrap_or_default();
+        if asked
+            .split(',')
+            .any(|o| o.trim().eq_ignore_ascii_case("pool"))
+        {
+            STEP_OVER_POOLS.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        asked
+            .split(',')
+            .filter_map(|o| usize::from_str_radix(o.trim().trim_start_matches("0x"), 16).ok())
+            .filter(|&o| o != 0)
+            .map(|o| (o, std::sync::atomic::AtomicU64::new(0)))
+            .collect()
+    });
     unsafe extern "system" fn filter(info: *const EXCEPTION_POINTERS) -> i32 {
         // SAFETY: the system passes the exception being dispatched.
         unsafe { report_unhandled(info) };
@@ -187,6 +380,14 @@ pub fn report_crashes() {
             && std::env::var_os("VICTORY_CRASH_BREAKPOINTS").is_some_and(|value| value == "1"),
         Ordering::Relaxed,
     );
+    #[cfg(feature = "diagnostics")]
+    SKIP_TITLE_INT3.get_or_init(|| {
+        std::env::var("VICTORY_SKIP_TITLE_INT3").map(|v| skip_list(&v)).unwrap_or_default()
+    });
+    #[cfg(feature = "diagnostics")]
+    if let Some(dir) = std::env::var_os("VICTORY_DUMP_REGISTRY") {
+        let _ = DUMP_REGISTRY.set(std::path::PathBuf::from(dir));
+    }
     // SAFETY: registers handlers that only read the exception they are
     // given; the title's own filter, once it sets one, takes the place of
     // ours and calls `report_unhandled` first.
@@ -370,6 +571,75 @@ fn clwb_loop(code: &[u8]) -> Option<ClwbLoop> {
     (limit != base).then_some(ClwbLoop { base, limit, len })
 }
 
+/// Where `code` has a [`clwb_loop`]: the offset of its `clwb` and that
+/// instruction's length (66, an optional REX, 0f ae, ModRM).
+fn clwb_loop_sites(code: &[u8]) -> Vec<(usize, usize)> {
+    (0..code.len())
+        .filter(|&at| code[at] == 0x66)
+        .filter_map(|at| {
+            clwb_loop(&code[at..(at + 32).min(code.len())])?;
+            Some((at, if matches!(code[at + 1], 0x40 | 0x41) { 5 } else { 4 }))
+        })
+        .collect()
+}
+
+/// The write-back loops the supported build has (#135). Anything else is
+/// not that build, or a pattern that is no loop, and nothing is patched.
+const CLWB_LOOPS: usize = 8;
+
+/// Turns the `clwb` of every [`clwb_loop`] in the executable sections of
+/// the image mapped at `base` into a NOP of its length, and returns how
+/// many. Under Rosetta `clwb` faults and each loop costs an exception
+/// (~300 us through Wine): the world load ran ~15,000 a second on job
+/// threads and crawled (#135). The loop's `add`/`cmp`/`jbe` stay, so its
+/// registers end as before. Before any title thread runs.
+///
+/// Nothing is patched, and 0 returned, unless exactly [`CLWB_LOOPS`] loops
+/// are found: the count found is logged otherwise.
+pub fn nop_clwb_loops(base: u64, info: &victory_pe::ImageInfo) -> usize {
+    use victory_pe::layout::section_flags::MEM_EXECUTE;
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut sites = Vec::new();
+    for s in info.sections.iter().filter(|s| s.characteristics & MEM_EXECUTE != 0) {
+        let start = base + u64::from(s.rva);
+        let len = s.virtual_size.min(s.file_size) as usize;
+        // SAFETY: the mapped section, readable code.
+        let code = unsafe { std::slice::from_raw_parts(start as *const u8, len) };
+        sites.extend(clwb_loop_sites(code).into_iter().map(|(at, n)| (start, at, n)));
+    }
+    if sites.len() != CLWB_LOOPS {
+        tracing::warn!(
+            found = sites.len(),
+            expected = CLWB_LOOPS,
+            "clwb write-back loops are not patched: this is not the build they were counted in"
+        );
+        return 0;
+    }
+    let mut patched = 0;
+    for (start, at, n) in sites {
+        const NOP4: [u8; 4] = [0x0f, 0x1f, 0x40, 0x00];
+        const NOP5: [u8; 5] = [0x0f, 0x1f, 0x44, 0x00, 0x00];
+        let site = (start + at as u64) as *mut u8;
+        let mut old = 0;
+        // SAFETY: the title's code, writable for the moment of the
+        // write, before any title thread runs.
+        unsafe {
+            if VirtualProtect(site.cast(), n, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+                continue;
+            }
+            let nop: &[u8] = if n == 5 { &NOP5 } else { &NOP4 };
+            std::ptr::copy_nonoverlapping(nop.as_ptr(), site, n);
+            VirtualProtect(site.cast(), n, old, &mut old);
+        }
+        patched += 1;
+    }
+    // SAFETY: flushes the whole instruction cache of our process.
+    unsafe { FlushInstructionCache(GetCurrentProcess(), std::ptr::null(), 0) };
+    patched
+}
+
 /// `clzero` at `context.Rip`. An exception costs about a microsecond and
 /// titles clear tens of kilobytes at a time, a line per pass, so the two
 /// loops compilers build around the instruction are done whole in one
@@ -547,12 +817,41 @@ unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
 }
 
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
+    // A trap of the title's that `VICTORY_STEP_OVER` lets it go on behind.
+    // SAFETY: the system passes valid exception pointers.
+    if unsafe { step_over(info) } {
+        return -1; // EXCEPTION_CONTINUE_EXECUTION
+    }
     // SAFETY: the system passes valid exception pointers.
     if unsafe { emulate_amd_only(info) } {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
     // SAFETY: as above.
     let code = unsafe { (*(*info).ExceptionRecord).ExceptionCode };
+    #[cfg(feature = "diagnostics")]
+    if code == EXCEPTION_BREAKPOINT && DUMP_REGISTRY.get().is_some() {
+        // SAFETY: the context record is valid for the faulting thread.
+        unsafe { dump_title_registry(&*(*info).ContextRecord) };
+    }
+    #[cfg(feature = "diagnostics")]
+    if code == EXCEPTION_BREAKPOINT
+        && let Some(list) = SKIP_TITLE_INT3.get()
+        && !list.is_empty()
+    {
+        // SAFETY: the context record is valid.
+        let rip = unsafe { (*(*info).ContextRecord).Rip } as usize;
+        if let Some(base) = crate::threads::title_image_base(rip)
+            && let Ok(rva) = u32::try_from(rip - base)
+            && list.contains(&rva)
+        {
+            // Logged every time, so a log never hides a patched run.
+            tracing::warn!(rva = format_args!("{rva:#x}"), "stepped over a title int3 (VICTORY_SKIP_TITLE_INT3)");
+            // Step over the one-byte `int3` and resume, the way a debugger
+            // continues past an assert. SAFETY: the context record is valid.
+            unsafe { (*(*info).ContextRecord).Rip += 1 };
+            return -1; // EXCEPTION_CONTINUE_EXECUTION
+        }
+    }
     if FATAL.contains(&code) {
         let to_file =
             code == EXCEPTION_BREAKPOINT && LOG_FIRST_CHANCE_BREAKPOINTS.load(Ordering::Relaxed);
@@ -750,6 +1049,10 @@ pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mu
             // SAFETY: `rsp` is inside this thread's stack.
             context.Rip = unsafe { (rsp as *const u64).read() };
             context.Rsp += 8;
+        } else if !frame_register_inside(context, image, entry, low, high) {
+            // The unwind would read through it and fault (#50: the stack
+            // dump killed the process in `RtlVirtualUnwind2` reading 0x8).
+            break;
         } else {
             let (mut data, mut frame) = (null_mut(), 0);
             // SAFETY: `entry` belongs to `image`; the context is our copy.
@@ -771,6 +1074,30 @@ pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mu
         }
         frames.push(context.Rip);
     }
+}
+
+/// Whether the frame register the function at `entry` unwinds through, if
+/// it has one, points into the stack `low..high`. Another thread caught in
+/// a prologue, or with a register cleared, can have it anywhere.
+fn frame_register_inside(
+    context: &CONTEXT,
+    image: u64,
+    entry: *const windows_sys::Win32::System::Diagnostics::Debug::IMAGE_RUNTIME_FUNCTION_ENTRY,
+    low: usize,
+    high: usize,
+) -> bool {
+    // SAFETY: `entry` is the loaded image's own table entry, and its unwind
+    // info (version and flags, prologue size, code count, frame register and
+    // offset) lies in that image.
+    let register = unsafe {
+        let info = (image as usize + (*entry).Anonymous.UnwindInfoAddress as usize) as *const u8;
+        info.add(3).read() & 0xf
+    };
+    let c = context;
+    let value = [
+        c.Rax, c.Rcx, c.Rdx, c.Rbx, c.Rsp, c.Rbp, c.Rsi, c.Rdi, c.R8, c.R9, c.R10, c.R11, c.R12, c.R13, c.R14, c.R15,
+    ][usize::from(register)] as usize;
+    register == 0 || (low..high).contains(&value)
 }
 
 /// `module+rva`, or the bare address.
@@ -841,12 +1168,168 @@ fn memory_at(address: usize) -> String {
     }
 }
 
+/// Whether the page at `address` is committed and readable (so a read of it
+/// will not fault inside this handler).
+#[cfg(feature = "diagnostics")]
+fn page_readable(address: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    // SAFETY: a zeroed MEMORY_BASIC_INFORMATION is valid.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: reads the address space's bookkeeping, not `address` itself.
+    let n = unsafe { VirtualQuery(address as *const _, &mut info, size_of_val(&info)) };
+    n != 0
+        && info.State == MEM_COMMIT
+        && info.Protect & PAGE_GUARD == 0
+        && info.Protect & 0xff != PAGE_NOACCESS
+}
+
+/// Reads up to `len` bytes from `address`, stopping at the first page that is
+/// not committed and readable, so a wild or partly-mapped pointer is safe.
+#[cfg(feature = "diagnostics")]
+fn read_guarded(address: usize, len: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut at = address;
+    while out.len() < len {
+        if !page_readable(at) {
+            break;
+        }
+        let take = ((at & !0xfff) + 0x1000).min(address + len) - at;
+        // SAFETY: `take` bytes from `at` stay inside a committed, readable page.
+        out.extend_from_slice(unsafe { std::slice::from_raw_parts(at as *const u8, take) });
+        at += take;
+    }
+    out
+}
+
+/// Reads a `usize` at `address`, or `None` if its page is not readable.
+#[cfg(feature = "diagnostics")]
+fn read_usize(address: usize) -> Option<usize> {
+    let bytes = read_guarded(address, 8);
+    (bytes.len() == 8).then(|| usize::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+/// On the first title `int3`, write the title's subsystem-registry state to
+/// files, so an assert that checks the registry can be understood after the
+/// fact. The guard at `image+0x1dac680` reads a singleton `*[image+0x7f00510]`
+/// with a main hash table (`+0x2b0`; descriptor `+0x30` cap / `+0x38` base)
+/// and a second table (`+0x2a8`; `+0x8` cap / `+0x10` base); the enforced id's
+/// 32-bit key is at `image+0x63011dc`. Reads only: no title code is called,
+/// every read is page-guarded, and it runs once.
+#[cfg(feature = "diagnostics")]
+unsafe fn dump_title_registry(context: &CONTEXT) {
+    use std::sync::atomic::AtomicBool;
+    static DONE: AtomicBool = AtomicBool::new(false);
+    let Some(dir) = DUMP_REGISTRY.get() else {
+        return;
+    };
+    // The first title int3 is the registry assert; later ones add nothing.
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let Some(base) = crate::threads::title_image_base(context.Rip as usize) else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(dir);
+    let mut txt = String::new();
+    let mut add = |l: String| {
+        eprintln!("  registry: {l}");
+        txt.push_str(&l);
+        txt.push('\n');
+    };
+    add(format!("image base {base:#x} (rip {:#x})", context.Rip));
+    let key = read_guarded(base + 0x63011dc, 4);
+    let key = (key.len() == 4).then(|| u32::from_le_bytes(key.try_into().unwrap()));
+    add(format!("enforced id key {key:#010x?}"));
+    let Some(g) = read_usize(base + 0x7f00510).filter(|&g| g != 0) else {
+        add("singleton *[image+0x7f00510] null or unreadable".into());
+        let _ = std::fs::write(dir.join("registry.txt"), &txt);
+        return;
+    };
+    add(format!("singleton G {g:#x}"));
+    let _ = std::fs::write(dir.join("g.bin"), read_guarded(g, 0x400));
+    // Main table: id present here means registered; descriptor at [G+0x2b0].
+    if let Some(desc) = read_usize(g + 0x2b0).filter(|&d| d != 0) {
+        let cap = read_usize(desc + 0x30).unwrap_or(0) & 0xffff_ffff;
+        let tbl = read_usize(desc + 0x38).unwrap_or(0);
+        add(format!("main desc {desc:#x} cap {cap} base {tbl:#x}"));
+        if tbl != 0 && (1..=0x10_0000).contains(&cap) {
+            let n = cap.saturating_mul(0x110).min(8 << 20);
+            let _ = std::fs::write(dir.join("main.bin"), read_guarded(tbl, n));
+        }
+    }
+    // Second table (`verify`'s deeper check): empty here means the id is
+    // declared but never activated.
+    if let Some(x) = read_usize(g + 0x2a8).filter(|&v| v != 0) {
+        let cap = read_usize(x + 0x8).unwrap_or(0) & 0xffff_ffff;
+        let tbl = read_usize(x + 0x10).unwrap_or(0);
+        add(format!("second {x:#x} cap {cap} base {tbl:#x}"));
+        if tbl != 0 && (1..=0x10_0000).contains(&cap) {
+            let n = cap.saturating_mul(0x110).min(8 << 20);
+            let _ = std::fs::write(dir.join("second.bin"), read_guarded(tbl, n));
+        }
+    } else {
+        add("second table [G+0x2a8] is null".into());
+    }
+    let _ = std::fs::write(dir.join("registry.txt"), &txt);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skip_lists_take_hex_rvas() {
+        assert_eq!(skip_list("1dac734, 0x2d5f3e2,zz,"), vec![0x1dac734, 0x2d5f3e2]);
+        assert!(skip_list("").is_empty());
+    }
     use windows_sys::Win32::System::Diagnostics::Debug::{
         EXCEPTION_RECORD, RtlCaptureContext, RtlCaptureStackBackTrace,
     };
+
+    #[test]
+    fn concurrent_crash_records_stay_together() {
+        const THREADS: usize = 8;
+        const RECORDS: usize = 16;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("synthetic-crashes.txt");
+        let ready = std::sync::Barrier::new(THREADS);
+        let body = "x".repeat(8192);
+        std::thread::scope(|scope| {
+            for thread in 0..THREADS {
+                let (file, ready, body) = (&file, &ready, &body);
+                scope.spawn(move || {
+                    ready.wait();
+                    for record in 0..RECORDS {
+                        super::append_record(file, &format!("record {thread}:{record}\n{body}"))
+                            .unwrap();
+                    }
+                });
+            }
+        });
+
+        let log = std::fs::read_to_string(file).unwrap();
+        let mut lines = log.lines();
+        let mut seen = std::collections::BTreeSet::new();
+        let process = std::process::id().to_string();
+        while let Some(header) = lines.next() {
+            let (time, pid) = header
+                .strip_prefix("unix time ")
+                .and_then(|line| line.split_once(", process "))
+                .expect("each record starts with a complete header");
+            assert!(time.parse::<u64>().is_ok());
+            assert_eq!(pid, process);
+            assert!(seen.insert(lines.next().expect("record identifier")));
+            assert!(lines.next().is_some_and(|line| line == body));
+        }
+        for thread in 0..THREADS {
+            for record in 0..RECORDS {
+                assert!(seen.remove(format!("record {thread}:{record}").as_str()));
+            }
+        }
+        assert!(seen.is_empty());
+    }
 
     /// What [`capture_frames`] saw: our [`unwind`], then the system's walk.
     type Captured = (Vec<u64>, Vec<usize>);
@@ -870,6 +1353,25 @@ mod tests {
         // SAFETY: a non-null entry belongs to `image`, which the lookup wrote,
         // and `BeginAddress` is an offset into that image.
         Some(image + u64::from(unsafe { (*entry).BeginAddress }))
+    }
+
+    #[test]
+    fn an_off_stack_frame_register_ends_the_walk() {
+        use windows_sys::Win32::System::Diagnostics::Debug::IMAGE_RUNTIME_FUNCTION_ENTRY;
+        // Unwind info at offset 0 of a fake image: version 1, no prologue or
+        // codes, frame register 5 (rbp).
+        let image = [1u8, 0, 0, 5];
+        let entry = IMAGE_RUNTIME_FUNCTION_ENTRY::default();
+        // SAFETY: zeroed is a valid CONTEXT.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        let stack = [0u64; 16];
+        let (low, high) = (stack.as_ptr() as usize, stack.as_ptr() as usize + size_of_val(&stack));
+        assert!(!frame_register_inside(&context, image.as_ptr() as u64, &entry, low, high), "rbp 0");
+        context.Rbp = (low + 64) as u64;
+        assert!(frame_register_inside(&context, image.as_ptr() as u64, &entry, low, high));
+        let none = [1u8, 0, 0, 0];
+        context.Rbp = 0;
+        assert!(frame_register_inside(&context, none.as_ptr() as u64, &entry, low, high), "no frame register");
     }
 
     #[test]
@@ -985,7 +1487,10 @@ mod tests {
         assert_eq!(memory_at(base + 0x3008), "no access");
         // SAFETY: releases the reservation made above.
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
-        assert_eq!(memory_at(base + 8), "nothing mapped there");
+        // The released range is not asked about: another test's thread can
+        // reserve or map it again at once, and the answer is then that
+        // thread's memory (#162). Address 0 is free in the same way and
+        // stays free.
         assert_eq!(memory_at(0), "nothing mapped there");
         assert_eq!(memory_at(usize::MAX), "outside the address space");
         // This test's own code: an image page, named by its module.
@@ -1068,6 +1573,24 @@ mod tests {
         // just the 4-byte `clwb` instruction and let the CPU run add/cmp/jbe.
         assert_eq!(run(0, u64::MAX - 10), (4, 0));
         assert_eq!(run(u64::MAX - 16, 0x100), (4, u64::MAX - 16));
+    }
+
+    #[test]
+    fn clwb_write_back_loops_are_found_for_nops() {
+        // The title's loop (#135), behind a lea and a lone clwb that is no loop.
+        let code = [
+            0x48, 0x8d, 0x44, 0x0a, 0xff, // lea rax, [rdx+rcx-1]
+            0x66, 0x0f, 0xae, 0x39, // clflushopt [rcx], no loop
+            0x66, 0x0f, 0xae, 0x31, // top: clwb [rcx]
+            0x48, 0x83, 0xc1, 0x40, //      add rcx, 0x40
+            0x48, 0x39, 0xc1, //            cmp rcx, rax
+            0x76, 0xf3, //                  jbe top
+            0xc3,
+        ];
+        assert_eq!(clwb_loop_sites(&code), vec![(9, 4)]);
+        // With REX.B: clwb [r9]; add r9, 0x40; cmp r9, rax.
+        let rex = [0x66, 0x41, 0x0f, 0xae, 0x31, 0x49, 0x83, 0xc1, 0x40, 0x49, 0x39, 0xc1, 0x76, 0xf2];
+        assert_eq!(clwb_loop_sites(&rex), vec![(0, 5)]);
     }
 
     #[test]

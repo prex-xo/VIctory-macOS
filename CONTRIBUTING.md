@@ -17,7 +17,7 @@ cargo test --workspace
 ```
 
 ```bash
-WINE="$HOME/Library/Caches/victory-macos/target/wine-cx/bin/wine" WINEDLLOVERRIDES="d3d12,d3d12core,dxgi=b" tools/macos/test-wine.sh --workspace --no-fail-fast
+WINEDLLOVERRIDES="d3d12,d3d12core,dxgi=b" tools/macos/test-wine.sh --workspace --no-fail-fast
 ```
 
 Read [docs/macos.md](docs/macos.md) for how the port works and what was already found, and [docs/architecture.md](docs/architecture.md) for VIctory itself.
@@ -38,7 +38,17 @@ These are the open areas, roughly from most to least useful.
 1. Fork the repository and make a branch for your change.
 2. Keep each commit small, with a short subject line that says what it changes, such as `fix(gpu): keep the clamp's budget per list`.
 3. Add or update a test when you change behaviour. GPU behaviour is best tested under Wine with D3DMetal, as in the second command above.
-4. Run `cargo fmt`, `cargo clippy` and both test runs.
+4. Run clippy, format your changes, and run both test runs. Lint the Windows build, with and without `--all-features`, as CI does; on a Mac, plain `cargo clippy` lints the macOS build, where the Windows-only code is unused and fails as dead code:
+
+   ```bash
+   cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnullvm -- -D warnings
+   ```
+
+   ```bash
+   cargo clippy --workspace --all-targets --all-features --target x86_64-pc-windows-gnullvm -- -D warnings
+   ```
+
+   Not all of the code is `cargo fmt`-clean yet and CI does not check formatting, so format the code you change rather than running `cargo fmt` over everything, which would put unrelated changes in your pull request.
 5. Open a pull request that says what changed, why, and how you tested it.
 
 ## Reporting a problem

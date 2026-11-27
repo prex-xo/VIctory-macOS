@@ -90,12 +90,17 @@ fn query(kind: usize, iid: *const Iid, known: &[Iid], found: This, out: *mut Thi
     object::answer(kind, iid, object::is(iid, known).then_some(found), out)
 }
 
-fn enumeration_not_found(out: *mut This) -> HRESULT {
-    if !out.is_null() {
-        // SAFETY: the caller supplies a writable output slot when non-null.
-        unsafe { out.write(std::ptr::null()) };
+/// An enumeration of the one `object` there is, answering as interface
+/// `iid`: `object` at index 0, `NOT_FOUND` after it with `out` cleared.
+fn enumerate_one(kind: usize, index: u32, iid: &Iid, object: This, out: *mut This) -> HRESULT {
+    if index != 0 {
+        if !out.is_null() {
+            // SAFETY: the caller supplies a writable output slot when non-null.
+            unsafe { out.write(std::ptr::null()) };
+        }
+        return NOT_FOUND;
     }
-    NOT_FOUND
+    object::answer(kind, iid, Some(object), out)
 }
 
 /// The DXGI device also answers for the D3D12 device.
@@ -119,10 +124,7 @@ extern "system" fn adapter_parent(_: This, iid: *const Iid, out: *mut This) -> H
     query(ADAPTER, iid, &FACTORY_IIDS, &FACTORY_OBJECT, out)
 }
 extern "system" fn adapter_outputs(_: This, index: u32, out: *mut This) -> HRESULT {
-    if index != 0 {
-        return enumeration_not_found(out);
-    }
-    object::answer(ADAPTER, &OUTPUT_IIDS[0], Some(&OUTPUT_OBJECT), out)
+    enumerate_one(ADAPTER, index, &OUTPUT_IIDS[0], &OUTPUT_OBJECT, out)
 }
 
 #[repr(C)]
@@ -172,10 +174,7 @@ extern "system" fn factory_query(this: This, iid: *const Iid, out: *mut This) ->
     query(FACTORY, iid, &FACTORY_IIDS, this, out)
 }
 extern "system" fn factory_adapters(_: This, index: u32, out: *mut This) -> HRESULT {
-    if index != 0 {
-        return enumeration_not_found(out);
-    }
-    object::answer(FACTORY, &ADAPTER_IIDS[0], Some(&ADAPTER_OBJECT), out)
+    enumerate_one(FACTORY, index, &ADAPTER_IIDS[0], &ADAPTER_OBJECT, out)
 }
 
 extern "system" fn output_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {

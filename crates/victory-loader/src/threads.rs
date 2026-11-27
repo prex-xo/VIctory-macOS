@@ -31,6 +31,8 @@ fn images() -> std::sync::MutexGuard<'static, Vec<Mapped>> {
 }
 
 pub(crate) fn mapped(image: &LoadedImage) {
+    #[cfg(windows)]
+    crate::crash::note_image(image.base(), image.info().size_of_image as usize);
     // SAFETY: reads our own static, so the linker keeps it (and its section).
     unsafe { std::ptr::from_ref(&ON_THREAD).read_volatile() };
     let image = Arc::new(image.clone());
@@ -368,6 +370,15 @@ fn starts_in(thread: windows_sys::Win32::Foundation::HANDLE, module: &std::ffi::
         } != 0
         // SAFETY: a module handle by name (or our exe's); no reference taken.
         && found == unsafe { GetModuleHandleA(name) }
+}
+
+/// The base of the title image `address` lies in, if any.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn title_image_base(address: usize) -> Option<usize> {
+    images().iter().find_map(|m| {
+        let base = m.image.base();
+        (base..base + m.image.info().size_of_image as usize).contains(&address).then_some(base)
+    })
 }
 
 /// Whether `address` lies in an image the title loaded (its executable or

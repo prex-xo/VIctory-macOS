@@ -1,5 +1,6 @@
-//! Query heaps. Nothing runs on a GPU yet, so no query ever produces a
-//! result; the heap only remembers its description.
+//! Query heaps. No query runs on the host GPU: the heap only remembers its
+//! description, and the command list writes plausible results when the
+//! title resolves them (`list::resolve_queries`).
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUERY_HEAP, Table, This, guid};

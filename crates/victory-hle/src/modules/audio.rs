@@ -12,29 +12,27 @@
 //! Mixed audio leaves through the host's WASAPI, which titles and
 //! middleware reach through COM like on PC. fmod's console build sets up
 //! the coprocessor inside `System_Create` and waits there for its first
-//! command to be acknowledged; Grand Theft Auto VI uses only XMA contexts.
+//! command to be acknowledged. Grand Theft Auto VI uses XMA contexts here;
+//! its Opus audio goes through the decoder in `apu` (`xapu.dll`).
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::alloc::Layout;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard};
 use std::time::Instant;
 
-use super::xasync::E_INVALIDARG;
+use super::lock;
+use super::xasync::{E_FAIL, E_INVALIDARG, E_OUTOFMEMORY};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleModule, hle_export};
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub mod capture;
-
-const E_FAIL: HRESULT = 0x8000_4005_u32 as i32;
-const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
-
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
+#[cfg(windows)]
+pub(crate) mod silent;
 
 // The APU heap.
 
@@ -100,21 +98,60 @@ impl Heap {
     }
 }
 
+/// Why the APU heap could not give a block.
+#[derive(Debug)]
+enum HeapRefusal {
+    /// No free device-address range fits the request.
+    NoDeviceRange { size: usize, align: usize },
+    /// The host allocator returned null for the block.
+    HostAllocator { len_bytes: usize },
+}
+
+impl HeapRefusal {
+    /// Reports the refusal. Called with no lock held: a host refusal is
+    /// written to `crashes.log`, so its cause is on record if the title fails
+    /// after it.
+    fn report(&self) {
+        match *self {
+            Self::NoDeviceRange { size, align } => tracing::warn!(
+                size,
+                align,
+                "no free APU device-address range fits the request"
+            ),
+            #[cfg(windows)]
+            Self::HostAllocator { len_bytes } => super::xmem::report_allocator_refusal(len_bytes),
+            #[cfg(not(windows))]
+            Self::HostAllocator { len_bytes } => {
+                tracing::warn!(len_bytes, "the host allocator refused a heap block")
+            }
+        }
+    }
+}
+
 /// Zeroed host memory and its device address.
-fn heap_alloc(size: usize, align: usize) -> Option<(*mut u8, u32)> {
-    let layout = Layout::from_size_align(size.max(1), align.max(16)).ok()?;
+fn heap_alloc(size: usize, align: usize) -> Result<(*mut u8, u32), HeapRefusal> {
     let mut heap = lock(&HEAP);
-    let apu = heap.take(u32::try_from(layout.size()).ok()?, align as u32)?;
+    let fit = Layout::from_size_align(size.max(1), align.max(16))
+        .ok()
+        .and_then(|layout| {
+            let apu = heap.take(u32::try_from(layout.size()).ok()?, align as u32)?;
+            Some((layout, apu))
+        });
+    let Some((layout, apu)) = fit else {
+        return Err(HeapRefusal::NoDeviceRange { size, align });
+    };
     // SAFETY: non-zero size.
     let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
     if ptr.is_null() {
         heap.give_back(apu, apu + layout.size() as u32);
-        return None;
+        return Err(HeapRefusal::HostAllocator {
+            len_bytes: layout.size(),
+        });
     }
     heap.blocks
         .insert(ptr as usize, Block { size, apu, layout });
     heap.by_apu.insert(apu, ptr as usize);
-    Some((ptr, apu))
+    Ok((ptr, apu))
 }
 
 fn heap_free(ptr: *mut u8) {
@@ -195,8 +232,12 @@ pub extern "system" fn ApuAlloc(
     if out.is_null() || size == 0 || align < 4 || !align.is_power_of_two() {
         return E_INVALIDARG;
     }
-    let Some((ptr, address)) = heap_alloc(size as usize, align as usize) else {
-        return E_OUTOFMEMORY;
+    let (ptr, address) = match heap_alloc(size as usize, align as usize) {
+        Ok(block) => block,
+        Err(refusal) => {
+            refusal.report();
+            return E_OUTOFMEMORY;
+        }
     };
     // SAFETY: checked non-null; optional out parameter checked below.
     unsafe {
@@ -254,9 +295,14 @@ pub extern "system" fn AcpHalAllocateShapeContexts(contexts: *mut ShapeContexts)
         if counts[i] == 0 {
             continue;
         }
-        let Some((ptr, apu)) = heap_alloc(counts[i] as usize * CONTEXT_BYTES[i], 256) else {
-            arrays.iter().for_each(|&p| heap_free(p.cast()));
-            return E_OUTOFMEMORY;
+        let (ptr, apu) = match heap_alloc(counts[i] as usize * CONTEXT_BYTES[i], 256) {
+            Ok(block) => block,
+            Err(refusal) => {
+                arrays.iter().for_each(|&p| heap_free(p.cast()));
+                drop(allocated);
+                refusal.report();
+                return E_OUTOFMEMORY;
+            }
         };
         (arrays[i], addresses[i]) = (ptr.cast(), apu);
     }
@@ -269,6 +315,9 @@ pub extern "system" fn AcpHalAllocateShapeContexts(contexts: *mut ShapeContexts)
     let mut xma = XMA.write().unwrap_or_else(|e| e.into_inner());
     xma.array = arrays[4] as usize;
     xma.voices = (0..counts[4]).map(|_| Mutex::new(None)).collect();
+    xma.occupied = (0..counts[4].div_ceil(64))
+        .map(|_| AtomicU64::new(0))
+        .collect();
     S_OK
 }
 
@@ -350,14 +399,21 @@ struct Xma {
     array: usize,
     /// One entry per context, `Some` while enabled. Each has its own lock,
     /// so a command for one voice never waits for others to decode (the
-    /// title sends them from its time-critical mixer thread).
-    voices: Vec<Mutex<Option<Voice>>>,
+    /// title sends them from its time-critical mixer thread). A voice is
+    /// boxed: it holds a decoder of about 14 KB, which would otherwise be
+    /// resident for each of the 512 contexts a title asks for, enabled or not.
+    voices: Vec<Mutex<Option<Box<Voice>>>>,
+    /// Bit `index % 64` of word `index / 64` is set while `voices[index]` is
+    /// `Some`, so a pass visits only the enabled voices. Changed only with
+    /// the voice's lock held, which keeps the two in step.
+    occupied: Vec<AtomicU64>,
 }
 
 impl Xma {
     const EMPTY: Xma = Xma {
         array: 0,
         voices: Vec::new(),
+        occupied: Vec::new(),
     };
 }
 
@@ -417,7 +473,7 @@ impl Xma {
         );
         #[cfg(feature = "diagnostics")]
         dump_input(index, context);
-        *slot = Some(Voice {
+        *slot = Some(Box::new(Voice {
             decoder: None,
             pcm: VecDeque::new(),
             skip: context.field(1, 24, 3) as usize * xma::SUBFRAME_SAMPLES,
@@ -433,7 +489,8 @@ impl Xma {
                 peak: 0,
                 ended_ms: None,
             },
-        });
+        }));
+        self.occupied[index as usize / 64].fetch_or(1 << (index % 64), Ordering::Release);
         drop(slot);
         wake_decoder();
     }
@@ -442,9 +499,12 @@ impl Xma {
         let Some(context) = self.context(index) else {
             return;
         };
-        let Some(voice) = lock(&self.voices[index as usize]).take() else {
+        let mut slot = lock(&self.voices[index as usize]);
+        let Some(voice) = slot.take() else {
             return;
         };
+        self.occupied[index as usize / 64].fetch_and(!(1 << (index % 64)), Ordering::Release);
+        drop(slot);
         let t = &voice.trace;
         tracing::debug!(
             index,
@@ -487,11 +547,26 @@ impl Xma {
         wake_decoder();
     }
 
-    /// Fills every enabled context's output as far as it has room.
-    fn pump(&self) {
+    /// The indices of the enabled contexts, in ascending order.
+    fn enabled(&self) -> impl Iterator<Item = u32> + '_ {
+        self.occupied.iter().enumerate().flat_map(|(n, word)| {
+            let mut bits = word.load(Ordering::Acquire);
+            std::iter::from_fn(move || {
+                (bits != 0).then(|| {
+                    let index = n as u32 * 64 + bits.trailing_zeros();
+                    bits &= bits - 1;
+                    index
+                })
+            })
+        })
+    }
+
+    /// Fills every enabled context's output as far as it has room; false
+    /// when there was none to fill.
+    fn pump(&self) -> bool {
         let start = Instant::now();
         let mut active = 0;
-        for index in 0..self.voices.len() as u32 {
+        for index in self.enabled() {
             if let (Some(context), Some(voice)) = (
                 self.context(index),
                 &mut *lock(&self.voices[index as usize]),
@@ -504,6 +579,7 @@ impl Xma {
         if took.as_millis() >= 4 {
             tracing::debug!(active, ms = took.as_millis(), "slow XMA decoding pass");
         }
+        active > 0
     }
 }
 
@@ -665,6 +741,12 @@ fn dump_input(index: u32, context: Context) {
 
 /// Starts the decoding thread on the first enabled voice, and has it fill
 /// rings now: a voice just enabled or read from.
+///
+/// The thread parks with no timeout while no voice is enabled, so this is
+/// what wakes it for the next one. Callers enable the voice first and the
+/// thread looks for voices before it parks; an unpark that lands before the
+/// park leaves a token that makes it return at once. So the thread either
+/// sees the voice or is woken, and a wake-up is never missed.
 fn wake_decoder() {
     static DECODER: OnceLock<std::thread::Thread> = OnceLock::new();
     DECODER
@@ -673,9 +755,14 @@ fn wake_decoder() {
                 .name("victory XMA decoder".into())
                 .spawn(|| {
                     loop {
-                        xma().pump();
-                        // A 256-byte output block lasts 2.7 ms at 48 kHz mono.
-                        std::thread::park_timeout(std::time::Duration::from_millis(2));
+                        if xma().pump() {
+                            // A 256-byte output block lasts 2.7 ms at 48 kHz
+                            // mono. Polling also sees what a title writes to
+                            // a context without a command.
+                            std::thread::park_timeout(std::time::Duration::from_millis(2));
+                        } else {
+                            std::thread::park();
+                        }
                     }
                 })
                 .map_or_else(|_| std::thread::current(), |h| h.thread().clone())
@@ -933,6 +1020,7 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn heap_maps_every_byte_of_a_block() {
@@ -1257,6 +1345,121 @@ mod tests {
         ApuFree(input);
         ApuFree(output);
         assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+    }
+
+    /// A slot holds a pointer, not the voice (and its decoder of several KB):
+    /// a title asks for 512 contexts, enabled or not.
+    #[test]
+    fn xma_slots_do_not_hold_voices_inline() {
+        fn slot_size<T>(_: &[T]) -> usize {
+            size_of::<T>()
+        }
+        assert!(size_of::<Voice>() > 1024);
+        assert!(slot_size(&Xma::EMPTY.voices) <= 32);
+    }
+
+    /// A pass visits the enabled voices and only those, in ascending order
+    /// of context, from whichever word of the bitmap their bits are in; it
+    /// reports whether there was one.
+    #[test]
+    fn xma_passes_visit_the_enabled_voices_in_order() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let mut request = ShapeContexts {
+            counts: [0, 0, 0, 0, 200, 0],
+            arrays: [std::ptr::null_mut(); 6],
+            apu: [0; 6],
+        };
+        assert_eq!(AcpHalAllocateShapeContexts(&mut request), S_OK);
+        let enabled = || xma().enabled().collect::<Vec<_>>();
+        assert!(enabled().is_empty());
+        assert!(!xma().pump(), "nothing is enabled");
+
+        let mut words = [0u32; 7];
+        for index in [130, 3, 64, 199] {
+            words[index / 32] |= 1 << (index % 32);
+        }
+        assert!(xma_command(ENABLE_XMAS, |i| words.get(i).copied()));
+        assert_eq!(enabled(), [3, 64, 130, 199]);
+        xma().enable(63);
+        xma().enable(0);
+        xma().enable(3);
+        // Past the last context: nothing to enable (or to mark).
+        xma().enable(200);
+        xma().enable(u32::MAX);
+        assert_eq!(enabled(), [0, 3, 63, 64, 130, 199]);
+        assert!(xma().pump());
+
+        xma().disable(5);
+        xma().disable(63);
+        xma().disable(130);
+        assert_eq!(enabled(), [0, 3, 64, 199]);
+        for index in [0, 3, 64, 199] {
+            xma().disable(index);
+        }
+        assert!(enabled().is_empty());
+        assert!(!xma().pump(), "nothing is enabled again");
+        assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+    }
+
+    /// With no voice enabled the decoding thread sleeps with no timeout to
+    /// wake it, so a voice enabled later (right after the last one, or while
+    /// the thread is about to park, or long after) must wake it: this
+    /// enables one at different moments after the last, and has only the
+    /// thread decode it. A wake-up missed once leaves a ring empty for good.
+    #[test]
+    fn xma_voices_enabled_after_idle_are_decoded() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let mut request = ShapeContexts {
+            counts: [0, 0, 0, 0, 4, 0],
+            arrays: [std::ptr::null_mut(); 6],
+            apu: [0; 6],
+        };
+        assert_eq!(AcpHalAllocateShapeContexts(&mut request), S_OK);
+        let context = Context(request.arrays[4].cast::<u32>().wrapping_add(16));
+        let (mut input, mut input_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut input, &mut input_apu, 0x1000, 0x800, 1), S_OK);
+        let stream = silent_stream();
+        // SAFETY: two packets were allocated.
+        unsafe { std::ptr::copy_nonoverlapping(stream.as_ptr(), input.cast(), stream.len()) };
+        let (mut output, mut output_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(
+            ApuAlloc(&mut output, &mut output_apu, 0x400, 0x100, 2),
+            S_OK
+        );
+
+        // Microseconds of idling after a voice, around the thread's 2 ms poll.
+        let idle = [0, 100, 500, 1000, 1500, 1900, 2000, 2100, 2500, 3000, 5000];
+        let mut filled = 0;
+        for round in 0..220 {
+            // SAFETY: the ring, which no voice is writing to.
+            unsafe { output.cast::<u8>().write_bytes(0x55, 0x400) };
+            // As in `xma_contexts_decode_into_their_output_rings`.
+            context.set(0, 2 | 1 << 20 | 4 << 22);
+            context.set(1, 1 << 31 | 3 << 27);
+            context.set(2, 32);
+            context.set(5, input_apu);
+            context.set(7, output_apu);
+            context.set(9, 0);
+            xma().enable(1);
+            // The thread fills the ring; this one only looks.
+            let start = Instant::now();
+            while context.field(1, 31, 1) == 1 && start.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_micros(20));
+            }
+            xma().disable(1);
+            // SAFETY: the ring, again.
+            let ring = unsafe { std::slice::from_raw_parts(output.cast::<u8>(), 0x400) };
+            if context.field(1, 31, 1) == 1 || !ring.iter().all(|&b| b == 0) {
+                break;
+            }
+            filled += 1;
+            std::thread::sleep(Duration::from_micros(idle[round % idle.len()]));
+        }
+
+        ApuFree(input);
+        ApuFree(output);
+        assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+        assert_eq!(filled, 220, "a voice enabled after idling was not decoded");
     }
 
     /// A loop over the first two frames, which ends after the second

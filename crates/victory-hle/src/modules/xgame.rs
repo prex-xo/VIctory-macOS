@@ -6,7 +6,8 @@
 use std::ffi::{CStr, c_char, c_void};
 
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, text, token,
+    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, register, text,
+    unregister,
 };
 use crate::runtime;
 
@@ -172,20 +173,6 @@ extern "system" fn is_feature_available(_: This, feature: u32) -> bool {
     AVAILABLE.contains(&feature)
 }
 
-/// Nothing raises these events offline, so the callback never runs.
-extern "system" fn register(
-    _: This,
-    _queue: *const c_void,
-    _context: *mut c_void,
-    _callback: *const c_void,
-    out: *mut u64,
-) -> HRESULT {
-    put(out, token())
-}
-extern "system" fn unregister(_: This, _token: u64, _wait: bool) -> bool {
-    true
-}
-
 /// Accepted and dropped; the name goes to the debug log.
 extern "system" fn write_event(
     _: This,
@@ -223,7 +210,7 @@ static INVITES_VTABLE: Methods<5> = Methods([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
-    register as *const (),   // 0x18
+    register as *const (),   // 0x18 (never)
     unregister as *const (), // 0x20
 ]);
 

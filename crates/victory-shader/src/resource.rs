@@ -193,7 +193,7 @@ pub fn track(
             let mut first_lane = Vec::new();
             let mut offset = Vec::new();
             let mut descriptor = |op: &Operand, role| -> Result<(), ShaderError> {
-                let source = t.descriptor(inst, op, b).map_err(fail)?;
+                let source = t.descriptor(inst, op, site).map_err(fail)?;
                 first_lane.extend(t.first_lane_words(inst, op).unwrap_or_default());
                 if let Source::Loaded { load, .. } = source
                     && let Some((_, a)) = out.scalar.iter().find(|s| s.0 == load)
@@ -339,6 +339,8 @@ struct Tracer<'a> {
     /// The loads from that memory by code offset, with their user-data byte
     /// offset.
     spill_at: std::collections::HashMap<usize, Result<u32, &'static str>>,
+    /// Address sums already traced, indexed by SSA value.
+    sums: std::cell::RefCell<Vec<Option<Sum>>>,
 }
 
 /// What lanes are known to satisfy: each [`Bool`] where its flag is set,
@@ -376,6 +378,25 @@ fn few_atoms(bools: &crate::structure::Bools, b: Bool) -> bool {
         stack.extend([lo, hi]);
     }
     true
+}
+
+/// `words` with each picked one (`Tracer::picked`, `Tracer::lane_picked`) as
+/// its pick takes it where the condition holds (`set`), or where it does not.
+fn picked_side(words: &[Term], picks: &[Option<(Value, Term, Term)>], set: bool) -> Vec<Term> {
+    words
+        .iter()
+        .zip(picks)
+        .map(|(w, p)| match p {
+            Some((_, t, f)) => {
+                if set {
+                    *t
+                } else {
+                    *f
+                }
+            }
+            None => *w,
+        })
+        .collect()
 }
 
 const MAX_ROUNDS: usize = 64;
@@ -436,6 +457,7 @@ impl<'a> Tracer<'a> {
             spilled: Default::default(),
             first_spilled: Default::default(),
             spill_at: Default::default(),
+            sums: Default::default(),
         };
         t.origin = t.propagate_copies(n)?;
         // Loads from the root signature's memory are found by their address,
@@ -452,6 +474,8 @@ impl<'a> Tracer<'a> {
         }
         if !t.spilled.is_empty() {
             t.origin = t.propagate_copies(n)?;
+            // Sums traced to find them are older than these origins.
+            t.sums.take();
         }
         Ok(t)
     }
@@ -660,6 +684,10 @@ impl<'a> Tracer<'a> {
             }
             Term::Value(v) => v,
         };
+        let index = v.0 as usize;
+        if let Some(&Some(sum)) = self.sums.borrow().get(index) {
+            return sum;
+        }
         let dynamic = Sum {
             base: None,
             offset: 0,
@@ -667,7 +695,7 @@ impl<'a> Tracer<'a> {
         };
         if self.inputs[v.0 as usize].is_some() || self.spilled.contains_key(&v) {
             return match self.param_value(v) {
-                Some((_, 0)) => Sum {
+                Some((p, 0)) if self.layout[p].root != RootType::Constants => Sum {
                     base: Some(v),
                     offset: 0,
                     dynamic: None,
@@ -690,14 +718,24 @@ impl<'a> Tracer<'a> {
             return dynamic;
         };
         let (x, y) = (self.sum(a), self.sum(b));
-        if x.base.is_some() && y.base.is_some() || x.dynamic.is_some() && y.dynamic.is_some() {
-            return dynamic;
+        let sum =
+            if x.base.is_some() && y.base.is_some() || x.dynamic.is_some() && y.dynamic.is_some() {
+                dynamic
+            } else {
+                Sum {
+                    base: x.base.or(y.base),
+                    offset: x.offset.wrapping_add(y.offset),
+                    dynamic: x.dynamic.or(y.dynamic),
+                }
+            };
+        // The operands' origins are settled before tracing starts. Every
+        // use of this value can reuse its sum, including an opaque result.
+        let mut sums = self.sums.borrow_mut();
+        if index >= sums.len() {
+            sums.resize(index + 1, None);
         }
-        Sum {
-            base: x.base.or(y.base),
-            offset: x.offset.wrapping_add(y.offset),
-            dynamic: x.dynamic.or(y.dynamic),
-        }
+        sums[index] = Some(sum);
+        sum
     }
 
     /// The `s_getpc_b64` writing `lo` as its low dword.
@@ -950,6 +988,25 @@ impl<'a> Tracer<'a> {
             || matches!(hi, Term::Value(v) if self.sop2(v, &["s_addc_u32"]).is_some_and(
                 |(_, [a, b])| a == want && b == Term::Const(0) || b == want && a == Term::Const(0)
             ))
+            || self.joined_on_taken_edges(hi) == Some(want)
+    }
+
+    /// What phi `t` holds in every lane that reads it: the one value its
+    /// args bring along the edges some lane takes (a register set inside a
+    /// region that only a skip no lane takes bypasses, as
+    /// `indirect_light_probes:CS_Alpha_Schedule`'s table address).
+    fn joined_on_taken_edges(&self, t: Term) -> Option<Term> {
+        let Term::Value(v) = t else { return None };
+        let (b, i) = self.phis[v.0 as usize]?;
+        let block = &self.p.blocks[b];
+        let mut taken = block.phis[i]
+            .args
+            .iter()
+            .zip(&block.preds)
+            .filter(|&(_, &q)| self.edge_taken(q, b))
+            .map(|(&a, _)| self.origin(a));
+        let first = taken.next()?;
+        taken.all(|x| x == first).then_some(first)
     }
 
     /// `hi` adds something (with carry) to `high`: `s_addc_u32` or
@@ -1040,8 +1097,8 @@ impl<'a> Tracer<'a> {
         self.address(lo, hi, extra)
     }
 
-    /// The source of the descriptor operand `op` of `inst`, in block `at`.
-    fn descriptor(&self, inst: &Inst, op: &Operand, at: usize) -> Result<Source, &'static str> {
+    /// The source of the descriptor operand `op` of `inst`, at `at`.
+    fn descriptor(&self, inst: &Inst, op: &Operand, at: Site) -> Result<Source, &'static str> {
         let Operand::Scalar { code, dwords } = *op else {
             return Err("a descriptor not in SGPRs");
         };
@@ -1056,8 +1113,17 @@ impl<'a> Tracer<'a> {
         {
             words = raw.to_vec();
         }
-        // Only the lanes that reach the access read the descriptor.
-        let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
+        // Only the lanes that reach and run the access read the descriptor:
+        // at a join, lanes whose EXEC bit is clear came by an edge where it
+        // may never have been made (cool_fox fork, after its own analysis
+        // dropped a program that way).
+        let mut known = Vec::new();
+        if let Some(l) = self.lanes {
+            known.push((l.reach[at.0], true));
+            if let Some(guard) = l.guards[at.0][at.1] {
+                known.push((guard, true));
+            }
+        }
         self.classify(&words, &mut Vec::new(), &mut known)
     }
 
@@ -1134,6 +1200,34 @@ impl<'a> Tracer<'a> {
         })
     }
 
+    /// The block and index of the phi that defines `w`, if one does.
+    fn phi_of(&self, w: &Term) -> Option<(usize, usize)> {
+        match *w {
+            Term::Value(v) => self.phis[v.0 as usize],
+            Term::Const(_) => None,
+        }
+    }
+
+    /// The block whose phis define some of `words` (`None` if none do); an
+    /// error if they are in several blocks, or in one a join in progress
+    /// (`joins`) came through, as a loop makes it.
+    fn joined_block(&self, words: &[Term], joins: &[usize]) -> Result<Option<usize>, &'static str> {
+        let Some((block, _)) = words.iter().find_map(|w| self.phi_of(w)) else {
+            return Ok(None);
+        };
+        if words
+            .iter()
+            .filter_map(|w| self.phi_of(w))
+            .any(|(b, _)| b != block)
+        {
+            return Err("a descriptor joined in several blocks");
+        }
+        if joins.contains(&block) {
+            return Err("a descriptor that changes in a loop");
+        }
+        Ok(Some(block))
+    }
+
     /// Words that phis of one block join, traced per predecessor (words
     /// defined before the join hold on every edge).
     fn phi(
@@ -1142,39 +1236,137 @@ impl<'a> Tracer<'a> {
         joins: &mut Vec<usize>,
         known: &mut Known,
     ) -> Result<Option<Source>, &'static str> {
-        let phi_of = |w: &Term| match *w {
-            Term::Value(v) => self.phis[v.0 as usize],
-            Term::Const(_) => None,
-        };
-        let Some((block, _)) = words.iter().find_map(phi_of) else {
+        let Some(block) = self.joined_block(words, joins)? else {
             return Ok(None);
         };
-        if words.iter().filter_map(phi_of).any(|(b, _)| b != block) {
-            return Err("a descriptor joined in several blocks");
-        }
-        if joins.contains(&block) {
-            return Err("a descriptor that changes in a loop");
-        }
         // Each level multiplies the sources by the predecessor count.
         if joins.len() >= MAX_JOINS {
             return Err("a descriptor joined too often");
         }
         joins.push(block);
         let phis = &self.p.blocks[block].phis;
-        let args = (0..self.p.blocks[block].preds.len())
-            .map(|j| {
-                let edge: Vec<Term> = words
-                    .iter()
-                    .map(|w| match phi_of(w) {
-                        Some((_, i)) => self.origin(phis[i].args[j]),
-                        None => *w,
-                    })
-                    .collect();
-                self.classify(&edge, joins, known)
-            })
-            .collect::<Result<_, _>>();
+        let preds = &self.p.blocks[block].preds;
+        // An edge no lane takes (a skip only helper lanes would take, say)
+        // brings nothing a lane reads: it takes a taken edge's source, and
+        // lowering joins no value there (`never_taken`).
+        let taken: Vec<bool> = preds.iter().map(|&q| self.edge_taken(q, block)).collect();
+        let edge = |j: usize, joins: &mut Vec<usize>, known: &mut Known| {
+            let edge: Vec<Term> = words
+                .iter()
+                .map(|w| match self.phi_of(w) {
+                    Some((_, i)) => self.origin(phis[i].args[j]),
+                    None => *w,
+                })
+                .collect();
+            self.classify(&edge, joins, known)
+        };
+        let args = match taken.iter().position(|&t| t) {
+            Some(first) if taken.contains(&false) => edge(first, joins, known).and_then(|live| {
+                (0..preds.len())
+                    .map(|j| if taken[j] { edge(j, joins, known) } else { Ok(live.clone()) })
+                    .collect::<Result<_, _>>()
+            }),
+            _ => (0..preds.len()).map(|j| edge(j, joins, known)).collect::<Result<_, _>>(),
+        };
+        let source = match args {
+            Ok(args) => Ok(Source::Phi { block, args }),
+            // An edge holds no descriptor. With only one edge the lanes
+            // that read the descriptor can have come by, it is what the
+            // registers hold on that one (a lane that took another edge
+            // does not read it), if that can be named where it is read.
+            Err(e) => match self.only_edge(block, known) {
+                Some(j) => match edge(j, joins, known) {
+                    Ok(source) if self.anywhere(&source) => Ok(source),
+                    _ => Err(e),
+                },
+                None => Err(e),
+            },
+        };
         joins.pop();
-        Ok(Some(Source::Phi { block, args: args? }))
+        source.map(Some)
+    }
+
+    /// The one edge into the join `block` that lanes satisfying `known`
+    /// can have taken, if the lanes' paths ([`Structured`]) rule out every
+    /// other: the console compiler makes a descriptor inside a branch that
+    /// lanes failing a test skip (with `s_cbranch_execz` when none is left)
+    /// and uses it after the join, where those lanes' EXEC bits are clear
+    /// (the access's guard). None at loop headers and without the lanes'
+    /// paths. After the cool_fox fork's `only_edge`.
+    fn only_edge(&self, block: usize, known: &mut Known) -> Option<usize> {
+        let lanes = self.lanes?;
+        let preds = &self.p.blocks[block].preds;
+        if preds.len() < 2 || preds.iter().any(|&q| self.rpo[q] >= self.rpo[block]) {
+            return None;
+        }
+        let mut only = None;
+        for (j, &q) in preds.iter().enumerate() {
+            let n = known.len();
+            known.push((lanes.reach[q], true));
+            if let LaneExit::Branch {
+                when,
+                taken,
+                not_taken,
+            } = lanes.exits[q]
+                && taken != not_taken
+            {
+                known.push((when, taken == block));
+            }
+            let possible = meet(lanes, known);
+            known.truncate(n);
+            if possible {
+                if only.is_some() {
+                    return None;
+                }
+                only = Some(j);
+            }
+        }
+        only
+    }
+
+    /// Whether lowering can make a handle for `source` in any block: its
+    /// heap index comes from root parameters and constants alone (a table
+    /// offset the code computes exists only where the load is).
+    fn anywhere(&self, source: &Source) -> bool {
+        match source {
+            Source::Constant(_) => true,
+            Source::Built { address, .. } => address.dynamic.is_none(),
+            Source::Loaded { load, .. } => {
+                let inst = self.inst(*load);
+                match &inst.fields {
+                    Fields::Smem {
+                        base,
+                        offset,
+                        soffset,
+                        ..
+                    } => self
+                        .smem_address(inst, base, *offset, soffset)
+                        .is_ok_and(|a| a.dynamic.is_none()),
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether some lane goes from block `q` to `b` (true without the
+    /// lanes' paths): `Lower::never_taken`'s test.
+    fn edge_taken(&self, q: usize, b: usize) -> bool {
+        let Some(lanes) = self.lanes else {
+            return true;
+        };
+        let mut edge = vec![(lanes.reach[q], true)];
+        if let LaneExit::Branch {
+            when,
+            taken,
+            not_taken,
+        } = lanes.exits[q]
+            && taken != not_taken
+        {
+            edge.push((when, taken == b));
+        }
+        // The very test lowering makes, so both drop the same edges.
+        lanes.bools.meet(&edge)
     }
 
     /// Words that `s_cselect` (or `s_cmov`) picks by one SCC value, traced
@@ -1204,25 +1396,9 @@ impl<'a> Tracer<'a> {
             return Err("a descriptor joined too often");
         }
         joins.push(usize::MAX);
-        let side = |set: bool| -> Vec<Term> {
-            words
-                .iter()
-                .zip(&picks)
-                .map(|(w, p)| match p {
-                    Some((_, t, f)) => {
-                        if set {
-                            *t
-                        } else {
-                            *f
-                        }
-                    }
-                    None => *w,
-                })
-                .collect()
-        };
         let args = [true, false]
             .into_iter()
-            .map(|set| self.classify(&side(set), joins, known))
+            .map(|set| self.classify(&picked_side(words, &picks, set), joins, known))
             .collect::<Result<_, _>>();
         joins.pop();
         Ok(Some(Source::Select { scc, args: args? }))
@@ -1655,28 +1831,12 @@ impl<'a> Tracer<'a> {
         joins.push(usize::MAX);
         // Each side holds where the lane's bit of the mask is set, or clear.
         let bit = self.lanes.and_then(|l| l.masks.get(&mask).copied());
-        let side = |set: bool| -> Vec<Term> {
-            words
-                .iter()
-                .zip(&picks)
-                .map(|(w, p)| match p {
-                    Some((_, t, f)) => {
-                        if set {
-                            *t
-                        } else {
-                            *f
-                        }
-                    }
-                    None => *w,
-                })
-                .collect()
-        };
         let args = [true, false]
             .into_iter()
             .map(|set| {
                 let n = known.len();
                 known.extend(bit.map(|b| (b, set)));
-                let arg = self.per_lane(&side(set), joins, known);
+                let arg = self.per_lane(&picked_side(words, &picks, set), joins, known);
                 known.truncate(n);
                 arg
             })
@@ -1727,19 +1887,9 @@ impl<'a> Tracer<'a> {
         joins: &mut Vec<usize>,
         known: &mut Known,
     ) -> Result<Option<Source>, &'static str> {
-        let phi_of = |w: &Term| match *w {
-            Term::Value(v) => self.phis[v.0 as usize],
-            Term::Const(_) => None,
-        };
-        let Some((block, _)) = words.iter().find_map(phi_of) else {
+        let Some(block) = self.joined_block(words, joins)? else {
             return Ok(None);
         };
-        if words.iter().filter_map(phi_of).any(|(b, _)| b != block) {
-            return Err("a descriptor joined in several blocks");
-        }
-        if joins.contains(&block) {
-            return Err("a descriptor that changes in a loop");
-        }
         let preds = &self.p.blocks[block].preds;
         if preds.iter().any(|&q| self.rpo[q] >= self.rpo[block]) {
             // shortcut: what a lane holds after some passes is not traced.
@@ -1753,7 +1903,7 @@ impl<'a> Tracer<'a> {
         // one the join does not reach.
         for w in words {
             if let Term::Value(v) = *w
-                && phi_of(w).is_none()
+                && self.phi_of(w).is_none()
                 && let Some((d, _)) = self.defs[v.0 as usize]
                 && (d == block || self.reaches(block, d))
             {
@@ -1781,7 +1931,7 @@ impl<'a> Tracer<'a> {
             let arg = if meet(lanes, known) {
                 let edge: Vec<Term> = words
                     .iter()
-                    .map(|w| match phi_of(w) {
+                    .map(|w| match self.phi_of(w) {
                         Some((_, i)) => Term::Value(phis[i].args[j]),
                         None => *w,
                     })
@@ -2529,6 +2679,249 @@ pub(crate) mod tests {
             HwStage::Cs,
         );
         assert_eq!(r.scalar, [((0, 0), at(MEMORY, 0)), ((0, 1), at(MEMORY, 0))]);
+    }
+
+    #[test]
+    fn root_constant_zero_offsets_tables_and_root_descriptors() {
+        // RootType::Constants dword 0 (s0) as an SMEM soffset and via s_add_u32
+        // on a descriptor table base (s2).
+        let r = track_words(
+            &[
+                0xBE84_0302, // s_mov_b32 s4, s2
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202,
+                0x0000_0020, // s_load_dwordx4 s[8:11], s[4:5], s0 offset:0x20
+                0x8006_0002, // s_add_u32 s6, s2, s0
+                0xBE87_0380, // s_mov_b32 s7, 0
+                0xF408_0303,
+                0xFA00_0040, // s_load_dwordx4 s[12:15], s[6:7], 0x40
+                0xE030_1000,
+                0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 offen
+                0xE070_1000,
+                0x8003_0100, // buffer_store_dword v1, v0, s[12:15], 0 offen
+                S_ENDPGM,
+            ],
+            &[param(Constants, 0, 2), param(Table, 2, 1)],
+            HwStage::Cs,
+        );
+        let c0 = r.params.iter().find(|p| (p.1, p.2) == (0, 0)).unwrap().0;
+        assert_eq!(
+            r.scalar,
+            [
+                (
+                    (0, 2),
+                    Address {
+                        param: 1,
+                        offset: 0x20,
+                        dynamic: Some(c0),
+                    },
+                ),
+                (
+                    (0, 5),
+                    Address {
+                        param: 1,
+                        offset: 0x40,
+                        dynamic: Some(c0),
+                    },
+                ),
+            ]
+        );
+        assert_eq!(r.descriptors.len(), 2);
+
+        // Spilled RootType::Constants dword 0 (user data 16) as a table soffset.
+        let spilled = track_words(
+            &[
+                0xBE82_0300, // s_mov_b32 s2, s0
+                0x8703_FF01,
+                0x0000_00FF, // s_and_b32 s3, s1, 0xff
+                0xF400_0101,
+                0xFA00_0000, // s_load_dword s4, s[2:3], 0x0 (user data 16)
+                0xBE87_0380, // s_mov_b32 s7, 0
+                0xF408_0203,
+                0x0800_0000, // s_load_dwordx4 s[8:11], s[6:7], s4
+                S_ENDPGM,
+            ],
+            &[param(Table, 6, 1), param(Constants, 16, 2)],
+            HwStage::Cs,
+        );
+        let sc0 = spilled
+            .params
+            .iter()
+            .find(|p| (p.1, p.2) == (1, 0))
+            .unwrap()
+            .0;
+        assert_eq!(
+            spilled.scalar,
+            [
+                ((0, 2), at(USER_DATA, 0x40)),
+                (
+                    (0, 4),
+                    Address {
+                        param: 0,
+                        offset: 0,
+                        dynamic: Some(sc0),
+                    },
+                ),
+            ]
+        );
+
+        // RootType::Constants dword 0 as byte offset on RootType::Descriptor
+        // (s_load_dword and global_load_dword), while (dword 0, dword 1) as a
+        // 64-bit pointer still classifies as MEMORY.
+        let desc = track_words(
+            &[
+                0xF400_0101,
+                0x0000_0008, // s_load_dword s4, s[2:3], s0 offset:0x8
+                0x7E02_0200, // v_mov_b32 v1, s0
+                0xDC30_800C,
+                0x0202_0001, // global_load_dword v2, v1, s[2:3] offset:12
+                0x4A06_0290, // v_add_nc_u32 v3, 16, v1
+                0xDC30_8004,
+                0x0402_0003, // global_load_dword v4, v3, s[2:3] offset:4
+                0xF400_0180,
+                0xFA00_0000, // s_load_dword s6, s[0:1], null
+                0xDC30_8000,
+                0x0500_0000, // global_load_dword v5, v0, s[0:1]
+                S_ENDPGM,
+            ],
+            &[param(Constants, 0, 2), param(Descriptor, 2, 2)],
+            HwStage::Cs,
+        );
+        let dc0 = desc.params.iter().find(|p| (p.1, p.2) == (0, 0)).unwrap().0;
+        assert_eq!(
+            desc.scalar,
+            [
+                (
+                    (0, 0),
+                    Address {
+                        param: 1,
+                        offset: 8,
+                        dynamic: Some(dc0),
+                    },
+                ),
+                (
+                    (0, 2),
+                    Address {
+                        param: 1,
+                        offset: 12,
+                        dynamic: Some(dc0),
+                    },
+                ),
+                (
+                    (0, 4),
+                    Address {
+                        param: 1,
+                        offset: 20,
+                        dynamic: Some(dc0),
+                    },
+                ),
+                ((0, 5), at(MEMORY, 0)),
+                ((0, 6), at(MEMORY, 0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn root_constant_zero_offsets_emit_to_dxil() {
+        use crate::native::{ComputeIo, NativeProgram, ResourceType, StageIo, UsedResource};
+
+        let words: &[u32] = &[
+            0xBE86_0302, // s_mov_b32 s6, s2
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF408_0203,
+            0x0000_0000, // s_load_dwordx4 s[8:11], s[6:7], s0
+            0x800C_0002, // s_add_u32 s12, s2, s0
+            0xBE8D_0380, // s_mov_b32 s13, 0
+            0xF408_0306,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[12:13], 0x20
+            0x7E02_0200, // v_mov_b32 v1, s0
+            0xDC30_8008,
+            0x0204_0001, // global_load_dword v2, v1, s[4:5] offset:8
+            0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
+            0xE030_1000,
+            0x8002_0300, // buffer_load_dword v3, v0, s[8:11], 0 offen
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0x4A04_0702, // v_add_nc_u32 v2, v2, v3
+            0xE070_1000,
+            0x8003_0200, // buffer_store_dword v2, v0, s[12:15], 0 offen
+            S_ENDPGM,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![
+                RootParam {
+                    slot: 0,
+                    ..param(Constants, 0, 2)
+                },
+                RootParam {
+                    slot: 1,
+                    ..param(Table, 2, 1)
+                },
+                RootParam {
+                    slot: 2,
+                    ..param(Descriptor, 4, 2)
+                },
+            ],
+            used: vec![
+                UsedResource {
+                    kind: ResourceType::Srv,
+                    root: Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 4,
+                    user_data: 2,
+                    slot: 1,
+                },
+                UsedResource {
+                    kind: ResourceType::Uav,
+                    root: Table,
+                    table_offset_dwords: 8,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 4,
+                    user_data: 2,
+                    slot: 1,
+                },
+                UsedResource {
+                    kind: ResourceType::Srv,
+                    root: Descriptor,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 2,
+                    user_data: 4,
+                    slot: 2,
+                },
+            ],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 6 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let res = track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let empty = crate::Container { parts: Vec::new() };
+        let shader = crate::emit::emit(&empty, &native, &p, &st, &io, &res).unwrap();
+        assert!(!shader.memory);
+        assert!(shader.user_data.contains(&crate::emit::UserData {
+            index: 0,
+            slot: 0,
+            root: Constants,
+            dword: 0,
+        }));
+        #[cfg(windows)]
+        if let Ok(mut v) = crate::emit::validator::Validator::load(
+            crate::emit::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut shader.dxil.clone())
+                .expect("DXIL validation failed");
+        }
     }
 
     #[test]
@@ -3580,5 +3973,65 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    #[test]
+    fn a_guarded_access_excludes_dead_lane_edges_at_a_join() {
+        // Lanes failing `v_cmp_gt_u32` clear EXEC and take `s_cbranch_execz`
+        // directly to the join block without initializing the immediate
+        // sampler `s[8:11]`. The join's `image_sample_lz` is guarded by EXEC,
+        // so only the arm where `s[8:11]` was built can execute it.
+        let code: Vec<u8> = [
+            0xBE84_0300u32, // s_mov_b32 s4, s0
+            0xBE85_0380,    // s_mov_b32 s5, 0
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+            0x7E06_0302, // v_mov_b32 v3, v2
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x877E_6A7E, // s_and_b32 exec_lo, exec_lo, vcc_lo
+            0xBF88_0004, // s_cbranch_execz -> join (skips 4 dwords)
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xBE8A_0380, // s_mov_b32 s10, 0
+            0xBE8B_0380, // s_mov_b32 s11, 0
+            0xF09C_0F08,
+            0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11]
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let text: Vec<String> = crate::gfx10::decode(&code)
+            .unwrap()
+            .iter()
+            .map(|i| i.text(true))
+            .collect();
+        for want in [
+            "v_cmp_gt_u32 vcc, 16, v0",
+            "s_and_b32 exec_lo, exec_lo, vcc_lo",
+            "s_cbranch_execz",
+            "image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11]",
+        ] {
+            assert!(
+                text.iter().any(|t| t.contains(want)),
+                "{want:?} not in {text:?}"
+            );
+        }
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let structured = lanes(&p).expect("structured form");
+        assert!(
+            structured.guards[2][0].is_some(),
+            "join access must carry an EXEC guard"
+        );
+        let r = track(&p, &[param(Table, 0, 1)], HwStage::Cs, Some(&structured)).unwrap();
+        assert!(
+            r.descriptors
+                .iter()
+                .any(|d| d.role == Role::Sampler && d.source == Source::Constant(vec![0; 4])),
+            "guarded join should resolve the immediate sampler from the live arm: {:?}",
+            r.descriptors
+        );
     }
 }

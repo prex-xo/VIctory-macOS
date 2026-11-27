@@ -8,7 +8,8 @@ use std::ffi::{c_char, c_void};
 
 use super::xasync::{self, AsyncBlock};
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, Object, add_ref, missing, put, text, token,
+    Guid, HRESULT, Interface, Methods, Object, add_ref, missing, put, register, text, unregister,
+    wide,
 };
 
 pub const PROVIDER: Guid = Guid::new(
@@ -79,14 +80,6 @@ extern "system" fn udp_port_result(_: This, block: *mut AsyncBlock, out: *mut u1
 
 static SECURITY: u8 = 0;
 
-fn wide(text: *const u16) -> Option<String> {
-    // SAFETY: the title passes a NUL-terminated UTF-16 string or null.
-    (!text.is_null()).then(|| unsafe {
-        let len = (0..).take_while(|&i| *text.add(i) != 0).count();
-        String::from_utf16_lossy(std::slice::from_raw_parts(text, len))
-    })
-}
-
 /// The allow list comes from the service: unreachable offline.
 extern "system" fn security_info_async(
     _: This,
@@ -141,20 +134,6 @@ extern "system" fn verify_certificate(
 
 extern "system" fn connectivity_hint(_: This, out: *mut ConnectivityHint) -> HRESULT {
     put(out, OFFLINE)
-}
-
-/// The hint and preferred port never change offline, so callbacks never run.
-extern "system" fn register(
-    _: This,
-    _queue: *const c_void,
-    _context: *mut c_void,
-    _callback: *const c_void,
-    out: *mut u64,
-) -> HRESULT {
-    put(out, token())
-}
-extern "system" fn unregister(_: This, _token: u64, _wait: bool) -> bool {
-    true
 }
 
 static VTABLE: Methods<18> = Methods([

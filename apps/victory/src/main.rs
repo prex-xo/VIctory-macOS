@@ -12,6 +12,9 @@ mod shader;
 #[cfg(windows)]
 mod translate;
 
+use std::num::NonZeroUsize;
+#[cfg(any(windows, test))]
+use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -93,9 +96,17 @@ enum Command {
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
-        /// Worker threads (default: every logical core).
+        /// Translate for a host whose waves have at most 32 lanes (NVIDIA,
+        /// Intel), as `run` does there: wave64 compute programs in halves.
+        /// Under Wine (D3DMetal) also as `run` does there: a group that is
+        /// one wave64 with LDS gets barriers between its halves
+        /// (`VICTORY_NARROW_WAVES=0` or `1` overrides). With `--pipelines`,
+        /// set by the GPU that makes them.
+        #[arg(long, conflicts_with = "cache")]
+        wave32: bool,
+        /// Positive worker thread count (default: every logical core).
         #[arg(long)]
-        jobs: Option<usize>,
+        jobs: Option<NonZeroUsize>,
         /// Only translate into the shader cache `run` reads (the warm-up):
         /// every container found, once, nothing else checked or listed
         /// (with `--pipelines`, then the shader pack's pipelines).
@@ -124,6 +135,8 @@ enum Command {
     },
     /// Show the resolved configuration and check it.
     Config,
+    /// Check the host D3D12 device for mesh shaders and shader model 6.6.
+    GpuCheck,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -137,6 +150,11 @@ enum Console {
     SeriesX,
     SeriesS,
 }
+
+/// Diagnostics: the heap bytes Rust code holds, for the statistics.
+#[cfg(all(windows, feature = "diagnostics"))]
+#[global_allocator]
+static ALLOC: victory_gpu::CountingAlloc = victory_gpu::CountingAlloc;
 
 fn main() -> Result<()> {
     victory_core::logging::init("info");
@@ -173,7 +191,7 @@ fn main() -> Result<()> {
         } => {
             #[cfg(windows)]
             {
-                translate::warm(paths, jobs, pipelines)
+                translate::warm(paths, jobs.map(NonZeroUsize::get), pipelines)
             }
             #[cfg(not(windows))]
             {
@@ -188,16 +206,17 @@ fn main() -> Result<()> {
             list,
             jobs,
             cache: false,
+            wave32,
         } => {
             #[cfg(windows)]
             {
-                translate::run(paths, validate, pipelines, list, jobs)
+                translate::run(paths, validate, pipelines, list, jobs.map(NonZeroUsize::get), wave32)
             }
             // Translation checks shaders with the Windows DXC host, which
             // other hosts do not have yet.
             #[cfg(not(windows))]
             {
-                let _ = (paths, validate, pipelines, list, jobs);
+                let _ = (paths, validate, pipelines, list, jobs, wave32);
                 anyhow::bail!("translate needs a Windows host for now")
             }
         }
@@ -217,7 +236,33 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Config => show_config(),
+        Command::GpuCheck => gpu_check(),
     }
+}
+
+#[cfg(windows)]
+fn gpu_check() -> Result<()> {
+    let support = victory_gpu::host_mesh_support()
+        .ok_or_else(|| anyhow::anyhow!("could not initialise VIctory's D3D12 host"))?;
+    let status = |feature| match feature {
+        Some(true) => "supported",
+        Some(false) => "unsupported",
+        None => "query failed",
+    };
+    println!("Mesh shaders: {}", status(support.mesh_shaders));
+    println!("Shader model 6.6: {}", status(support.shader_model_6_6));
+    anyhow::ensure!(
+        support.supported(),
+        "could not confirm both mesh pipeline requirements"
+    );
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn gpu_check() -> Result<()> {
+    anyhow::bail!(
+        "gpu-check requires the Windows build of VIctory. On macOS run tools/macos/victory.sh gpu-check"
+    )
 }
 
 fn show_config() -> Result<()> {
@@ -240,6 +285,13 @@ fn show_config() -> Result<()> {
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }
+    check_policy(&cfg)
+}
+
+/// Reports each configured path the asset policy refuses, and fails if
+/// there is one, so that `victory config` exits nonzero.
+fn check_policy(cfg: &victory_core::Config) -> Result<()> {
+    let mut violations = 0;
     for p in cfg
         .game_dir
         .iter()
@@ -248,8 +300,13 @@ fn show_config() -> Result<()> {
     {
         if let Err(e) = victory_core::ensure_outside_repo(p) {
             println!("POLICY VIOLATION: {e}");
+            violations += 1;
         }
     }
+    anyhow::ensure!(
+        violations == 0,
+        "{violations} configured path(s) violate the asset policy"
+    );
     Ok(())
 }
 
@@ -265,4 +322,77 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         "no paths given and none configured (see victory.example.toml)"
     );
     Ok(all)
+}
+
+/// Writes a game-derived report (the `VICTORY_PREBUILD_KEYS` listing) to
+/// `path`. Rule #1: the destination is checked first, so nothing is written
+/// inside any VIctory source tree. Compiled where it is used (Windows) or
+/// tested (any host).
+#[cfg(any(windows, test))]
+pub(crate) fn write_prebuild_keys(path: &Path, text: &str) -> Result<()> {
+    victory_core::ensure_outside_repo(path)?;
+    std::fs::write(path, text)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::{check_policy, write_prebuild_keys};
+
+    fn outside() -> PathBuf {
+        std::env::temp_dir().join("victory-config-test")
+    }
+
+    #[test]
+    fn config_check_passes_paths_outside_the_repository() {
+        let cfg = victory_core::Config {
+            cache_dir: outside().join("cache"),
+            data_dir: outside().join("data"),
+            ..Default::default()
+        };
+        assert!(check_policy(&cfg).is_ok());
+    }
+
+    #[test]
+    fn config_check_fails_a_path_inside_the_repository() {
+        let cfg = victory_core::Config {
+            game_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("game")),
+            cache_dir: outside().join("cache"),
+            data_dir: outside().join("data"),
+            ..Default::default()
+        };
+        let err = check_policy(&cfg).unwrap_err();
+        assert!(err.to_string().contains("1 configured path"), "{err}");
+    }
+
+    /// The `VICTORY_PREBUILD_KEYS` listing is game-derived (rule #1): a
+    /// destination inside a source tree (marked with `.victory-root`) is
+    /// refused and an existing file there is left byte for byte unchanged.
+    #[test]
+    fn prebuild_keys_refuse_repo_destinations() {
+        let report = "0123456789abcdef\tGraphics(0)\tvertex, pixel\n";
+        // A stand-in checkout: a temporary directory carrying the root marker,
+        // with a sentinel file the refused write must not touch.
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join(victory_core::policy::ROOT_MARKER), "").unwrap();
+        let sentinel = repo.path().join("keys.txt");
+        let original = b"sentinel bytes, unchanged";
+        std::fs::write(&sentinel, original).unwrap();
+        let err = write_prebuild_keys(&sentinel, report).unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref(),
+                Some(victory_core::PolicyError::InsideRepo { .. })
+            ),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(&sentinel).unwrap(), original);
+        // An unmarked directory is written as asked.
+        let out = tempfile::tempdir().unwrap();
+        let dest = out.path().join("keys.txt");
+        write_prebuild_keys(&dest, report).unwrap();
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), report);
+    }
 }

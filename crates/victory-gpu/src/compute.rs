@@ -8,9 +8,6 @@
 //! signature is version 1.1 with no flags, as Microsoft's compilers build
 //! it from an HLSL root signature string.
 
-// Tables and root shader resource views are used only by tests so far.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -22,6 +19,9 @@ pub(crate) enum Param<'a> {
     Table(&'a [Range]),
     /// `count` 32-bit constants in `b{register}`.
     Constants { register: u32, count: u32 },
+    /// A root constant buffer view in `b{register}, space{space}`.
+    #[cfg(test)]
+    Cbv { register: u32, space: u32 },
     /// A root shader resource view in `t{register}, space{space}`.
     Srv { register: u32, space: u32 },
     /// A root unordered access view in `u{register}`.
@@ -34,9 +34,6 @@ pub(crate) struct Range {
     register: u32,
     count: u32,
 }
-
-/// A range's count with no end: the table runs to the end of the heap.
-pub(crate) const UNBOUNDED: u32 = u32::MAX;
 
 /// `count` shader resource views from `t{register}`.
 pub(crate) const fn srv(register: u32, count: u32) -> Range {
@@ -113,7 +110,7 @@ pub(crate) fn pipeline(
     Ok((root, pso))
 }
 
-fn root_signature(device: &ID3D12Device, params: &[Param]) -> Result<ID3D12RootSignature> {
+pub(crate) fn root_signature(device: &ID3D12Device, params: &[Param]) -> Result<ID3D12RootSignature> {
     let ranges: Vec<Vec<D3D12_DESCRIPTOR_RANGE1>> = params
         .iter()
         .map(|p| match p {
@@ -167,6 +164,10 @@ fn root_signature(device: &ID3D12Device, params: &[Param]) -> Result<ID3D12RootS
                 },
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             },
+            #[cfg(test)]
+            Param::Cbv { register, space } => {
+                descriptor(D3D12_ROOT_PARAMETER_TYPE_CBV, register, space)
+            }
             Param::Srv { register, space } => {
                 descriptor(D3D12_ROOT_PARAMETER_TYPE_SRV, register, space)
             }

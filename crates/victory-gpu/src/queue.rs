@@ -28,6 +28,26 @@ pub(crate) struct QueueDesc {
     nodes: u32,
 }
 
+#[cfg(all(test, windows))]
+pub(crate) const QUEUE_IID: Iid = QUEUE_IIDS[0];
+
+#[cfg(all(test, windows))]
+impl QueueDesc {
+    pub(crate) fn compute() -> Self {
+        Self {
+            kind: 2,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn submit_one(queue: This, list: This) {
+    execute(queue, 1, &list);
+}
+
 /// The title reads the list type right after the header.
 #[repr(C)]
 struct Queue {
@@ -110,20 +130,34 @@ extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Queue>(this)
 }
 
-/// Runs the lists' host lists and waits for them (decision 0007).
-extern "system" fn execute(_: This, count: u32, lists: *const This) {
+/// Queues the lists' host lists behind what the queue holds, and runs what
+/// may run (`crate::hold`; decision 0007).
+extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
     }
     #[cfg(windows)]
-    if let Some(host) = crate::host::host() {
+    if crate::host::host().is_some() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
-        let host_lists: Vec<_> = lists
-            .iter()
-            .filter_map(|&l| crate::list::host_list(l))
-            .collect();
-        host.execute(&host_lists);
+        let mut held = held_for(Why::Submission);
+        for &l in lists {
+            for segment in crate::list::segments(l) {
+                let waits = segment.waits();
+                held.push(this as usize, Item::Segment(segment, waits));
+            }
+        }
+        account().submissions += 1;
+        if crate::host::async_submit_enabled() {
+            drop(held);
+            ensure_submit_worker();
+            wake_submit();
+        } else if crate::host::flight1_enabled() {
+            drop(held);
+            pump_unlocked(Why::Submission);
+        } else {
+            pump(&mut held, Why::Submission);
+        }
         return;
     }
     static ONCE: AtomicBool = AtomicBool::new(false);
@@ -132,20 +166,654 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+#[cfg(all(windows, test))]
+pub(crate) fn create_direct_for_test() -> This {
+    let null = std::ptr::null();
+    let desc = QueueDesc {
+        kind: 0,
+        priority: 0,
+        flags: 0,
+        nodes: 0,
+    };
+    let mut q = null;
+    assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+    q
+}
+
+#[cfg(all(windows, test))]
+pub(crate) fn execute_for_test(this: This, lists: &[This]) {
+    execute(this, lists.len() as u32, lists.as_ptr());
+}
+
+#[cfg(all(windows, test))]
+pub(crate) fn signal_for_test(this: This, fence: This, value: u64) -> HRESULT {
+    signal(this, fence, value)
+}
+
+/// What ran held work: the title's submission, a queue's Signal or Wait, a
+/// CPU fence call, PresentX, our timer, or a completed Flight-1 landing.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Why {
+    Submission,
+    Signal,
+    Wait,
+    Fence,
+    Present,
+    Timer,
+    #[cfg(windows)]
+    Flight,
+}
+
+#[cfg(windows)]
+use crate::hold::{Item, Ready};
+
+/// Every queue's held work.
+#[cfg(windows)]
+type Holding = crate::hold::Held<std::sync::Arc<crate::host::HostList>>;
+
+#[cfg(windows)]
+static HELD: std::sync::Mutex<Holding> = std::sync::Mutex::new(crate::hold::Held::new());
+
+/// Serializes unlocked pumping (`victory-submit`, `drain_submit`, and
+/// `VICTORY_FLIGHT1=1` direct calls). Strictly above `HELD` in the lock DAG.
+#[cfg(windows)]
+static SUBMIT_DRAIN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(windows)]
+static SUBMIT_WORK: (std::sync::Mutex<bool>, std::sync::Condvar) =
+    (std::sync::Mutex::new(false), std::sync::Condvar::new());
+
+#[cfg(windows)]
+thread_local! {
+    /// True while this thread holds `SUBMIT_DRAIN` (so nested `Host::execute`
+    /// calls on the submit worker do not re-enter `drain_submit`).
+    static ON_SUBMIT_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(windows)]
+struct OnSubmit(bool);
+
+#[cfg(windows)]
+impl OnSubmit {
+    fn enter() -> Self {
+        Self(ON_SUBMIT_THREAD.with(|c| c.replace(true)))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for OnSubmit {
+    fn drop(&mut self) {
+        ON_SUBMIT_THREAD.with(|c| c.set(self.0));
+    }
+}
+
+#[cfg(windows)]
+fn ensure_submit_worker() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let _ = std::thread::Builder::new()
+            .name("victory-submit".into())
+            .spawn(submit_worker);
+    });
+}
+
+#[cfg(windows)]
+fn wake_submit() {
+    *SUBMIT_WORK.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    SUBMIT_WORK.1.notify_one();
+}
+
+#[cfg(windows)]
+fn submit_worker() {
+    loop {
+        {
+            let mut work = SUBMIT_WORK.0.lock().unwrap_or_else(|e| e.into_inner());
+            while !*work {
+                work = SUBMIT_WORK.1.wait(work).unwrap_or_else(|e| e.into_inner());
+            }
+            *work = false;
+        }
+        pump_unlocked(Why::Submission);
+    }
+}
+
+#[cfg(windows)]
+fn start_held_timer() {
+    static TIMER: std::sync::Once = std::sync::Once::new();
+    TIMER.call_once(|| {
+        let _ = std::thread::Builder::new()
+            .name("victory held work".into())
+            .spawn(|| loop {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                pump_held_if_free(Why::Timer);
+            });
+    });
+}
+
+/// Pumps all currently ready segments/signals from `HELD` while holding
+/// `SUBMIT_DRAIN` and releasing `HELD` around every host GPU call.
+#[cfg(windows)]
+fn pump_ready_under_drain(why: Why) -> bool {
+    let Some(host) = crate::host::host() else {
+        return false;
+    };
+    let fence = |f: usize| crate::fence::value(f as This);
+    let max_lists = join_lists();
+    let mut moved_any = false;
+    let mut pieces = 0u32;
+    let mut segments_count = 0u32;
+    let mut unknown_count = 0u32;
+    let mut coalesced_bop_total = 0u32;
+    let mut hazard_splits_total = 0u32;
+    let mut waited_all = Vec::new();
+    let started = std::time::Instant::now();
+    let mut ran = std::time::Duration::ZERO;
+    loop {
+        let next = {
+            let mut held = held();
+            if held.is_empty() {
+                None
+            } else {
+                for (queue, waits) in held.force_older_than(VALVE) {
+                    account().forced += 1;
+                    tracing::warn!(
+                        queue = kind(queue),
+                        ?waits,
+                        "held work runs without its waits after {VALVE:?} (safety valve)"
+                    );
+                }
+                let will_write = |seg: &std::sync::Arc<crate::host::HostList>,
+                                  wait: &crate::hold::ValueWait| {
+                    seg.will_write(wait)
+                };
+                let can_join = |piece: &[(std::sync::Arc<crate::host::HostList>, bool)],
+                                next: &std::sync::Arc<crate::host::HostList>| {
+                    if piece.len() >= max_lists {
+                        return false;
+                    }
+                    let existing = piece
+                        .iter()
+                        .fold(crate::hold::BatchFlags::default(), |acc, (s, _)| {
+                            acc.merge(s.batch_flags())
+                        });
+                    crate::hold::can_join_batch(existing, next.batch_flags(), piece.len(), max_lists)
+                };
+                let item = held.take_ready_with(
+                    &read_value,
+                    &fence,
+                    &will_write,
+                    &can_join,
+                    coalesce_pieces(),
+                );
+                if item.is_none() && !held.is_empty() {
+                    start_held_timer();
+                }
+                item
+            }
+        };
+        let Some(ready) = next else {
+            break;
+        };
+        moved_any = true;
+        match ready {
+            Ready::Signal { fence, value } => {
+                if !crate::host::flight1_enabled()
+                    || !host.attach_signal(fence as This, value, true)
+                {
+                    crate::fence::set(fence as This, value);
+                    crate::fence::let_go(fence as This);
+                }
+            }
+            Ready::Segments {
+                queues,
+                segments,
+                signals,
+                waited,
+                unknown,
+                coalesced_bop_waits,
+                hazard_splits,
+            } => {
+                pieces += 1;
+                segments_count += segments.len() as u32;
+                unknown_count += unknown;
+                coalesced_bop_total += coalesced_bop_waits;
+                hazard_splits_total += hazard_splits;
+                waited_all.extend(waited);
+                let barriers: Vec<bool> = segments.iter().map(|&(_, b)| b).collect();
+                let run_segments: Vec<std::sync::Arc<crate::host::HostList>> =
+                    segments.into_iter().map(|(s, _)| s).collect();
+                let at = std::time::Instant::now();
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::PumpExecutes, 1);
+                if crate::host::flight1_enabled() {
+                    host.execute_flight1(run_segments, barriers);
+                } else {
+                    host.execute_sync_segments(run_segments, barriers);
+                }
+                for (fence, value) in signals {
+                    if !crate::host::flight1_enabled()
+                        || !host.attach_signal(fence as This, value, true)
+                    {
+                        crate::fence::set(fence as This, value);
+                        crate::fence::let_go(fence as This);
+                    }
+                }
+                ran += at.elapsed();
+                held().finish_running(&queues);
+            }
+        }
+    }
+    if segments_count > 0 || unknown_count > 0 {
+        let mut a = account();
+        a.pump += started.elapsed().saturating_sub(ran);
+        a.pieces += pieces;
+        a.segments += segments_count;
+        a.unknown += unknown_count;
+        a.coalesced_bop_waits += coalesced_bop_total;
+        a.hazard_splits += hazard_splits_total;
+        for (queue, waited) in waited_all {
+            a.released.push((kind(queue), waited, why));
+        }
+    }
+    moved_any
+}
+
+#[cfg(windows)]
+fn pump_unlocked(why: Why) {
+    let _drain = SUBMIT_DRAIN.lock().unwrap_or_else(|e| e.into_inner());
+    let _on = OnSubmit::enter();
+    pump_ready_under_drain(why);
+}
+
+/// Drains all runnable queued work on `victory-submit` and waits for any
+/// active Flight-1 submission to finish completely (repeating if landing a
+/// flight unblocks additional held work).
+#[cfg(windows)]
+pub(crate) fn drain_submit(why: Why) {
+    let Some(host) = crate::host::host() else {
+        return;
+    };
+    if ON_SUBMIT_THREAD.with(std::cell::Cell::get) {
+        host.finish_flight_now();
+        return;
+    }
+    let _drain = SUBMIT_DRAIN.lock().unwrap_or_else(|e| e.into_inner());
+    let _on = OnSubmit::enter();
+    loop {
+        let moved = pump_ready_under_drain(why);
+        let landed = host.finish_flight_now();
+        if !moved && !landed && !host.has_in_flight() {
+            break;
+        }
+    }
+}
+
+/// Called by synchronous `Host::execute` callers (`present`, `resource.rs`,
+/// `composite`, `capture`) before touching the GPU so they execute strictly
+/// after any queued async-submit work or in-flight Flight-1 submission.
+#[cfg(windows)]
+pub(crate) fn before_sync() {
+    if (crate::host::async_submit_enabled() || crate::host::flight1_enabled())
+        && !ON_SUBMIT_THREAD.with(std::cell::Cell::get)
+    {
+        drain_submit(Why::Submission);
+    }
+}
+
+/// Called by `victory-flight` (and `Quiet::drop`) strictly AFTER releasing
+/// `Host::submitted`, in case a landed flight's BoP writes or fence signals
+/// unblocked work held in `HELD`.
+#[cfg(windows)]
+pub(crate) fn on_flight_landed() {
+    if crate::host::async_submit_enabled() {
+        ensure_submit_worker();
+        wake_submit();
+    } else if crate::host::flight1_enabled()
+        && let Ok(_drain) = SUBMIT_DRAIN.try_lock()
+    {
+        let _on = OnSubmit::enter();
+        pump_ready_under_drain(Why::Flight);
+    }
+}
+
+#[cfg(windows)]
+fn held() -> std::sync::MutexGuard<'static, Holding> {
+    HELD.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Microseconds the threads that ran held work spent on it, by what ran it
+/// ([`Why`], in its order): `[0]` waiting for the queues' lock, `[1]` in
+/// the pump, the host submissions included. The thread that called is held
+/// for both: a title thread for all but [`Why::Timer`], which is ours. The
+/// frame report divides them by its frames ([`take_blocked`]).
+#[cfg(windows)]
+static BLOCKED_US: [[AtomicU64; 2]; 6] = [const { [const { AtomicU64::new(0) }; 2] }; 6];
+
+/// [`held`] for a caller that runs held work for `why`, its wait for the
+/// lock counted in [`BLOCKED_US`].
+#[cfg(windows)]
+fn held_for(why: Why) -> std::sync::MutexGuard<'static, Holding> {
+    lock_timed(&HELD, &BLOCKED_US[why as usize][0])
+}
+
+/// Locks `lock`, adding the microseconds it waited to `waited`.
+#[cfg(any(windows, test))]
+fn lock_timed<'a, T>(
+    lock: &'a std::sync::Mutex<T>,
+    waited: &AtomicU64,
+) -> std::sync::MutexGuard<'a, T> {
+    let asked = std::time::Instant::now();
+    let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    waited.fetch_add(asked.elapsed().as_micros() as u64, Ordering::Relaxed);
+    guard
+}
+
+/// [`Why`]'s variants in their order, as the frame report names them: the
+/// title's submissions, its queues' Signals and Waits, its CPU fence calls,
+/// its presents, and our timer thread.
+#[cfg(windows)]
+pub(crate) const WHY_NAMES: [&str; 6] = [
+    "title submissions",
+    "queue signals",
+    "queue waits",
+    "fence calls",
+    "presents",
+    "our timer",
+];
+#[cfg(windows)]
+const _: () = assert!(Why::Timer as usize + 1 == WHY_NAMES.len());
+
+/// [`BLOCKED_US`] since the last call, cleared: for each [`Why`], the
+/// microseconds waiting for the queues' lock and in the pump.
+#[cfg(windows)]
+pub(crate) fn take_blocked() -> [[u64; 2]; 6] {
+    BLOCKED_US
+        .each_ref()
+        .map(|w| w.each_ref().map(|a| a.swap(0, Ordering::Relaxed)))
+}
+
+/// Runs held work that may run now (`why` for the frame line).
+pub(crate) fn pump_held(why: Why) {
+    #[cfg(windows)]
+    {
+        if crate::host::async_submit_enabled() {
+            ensure_submit_worker();
+            wake_submit();
+        } else if crate::host::flight1_enabled() {
+            pump_unlocked(why);
+        } else {
+            pump(&mut held_for(why), why);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = why;
+}
+
+/// The same unless another thread is at it (calls that poll: a fence's
+/// value, our timer).
+pub(crate) fn pump_held_if_free(why: Why) {
+    #[cfg(windows)]
+    {
+        if crate::host::async_submit_enabled() {
+            if !held().is_empty() {
+                ensure_submit_worker();
+                wake_submit();
+            }
+        } else if crate::host::flight1_enabled() {
+            if let Ok(_drain) = SUBMIT_DRAIN.try_lock() {
+                let _on = OnSubmit::enter();
+                pump_ready_under_drain(why);
+            }
+        } else if let Ok(mut held) = HELD.try_lock() {
+            pump(&mut held, why);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = why;
+}
+
+/// How long a queue's head may wait before it runs anyway.
+// shortcut: a safety valve against a wait nothing satisfies (a write we do
+// not make), which would hold the title's fences until its 30 s watchdog
+// ends the run; counted and logged, remove once runs show it never fires.
+#[cfg(windows)]
+const VALVE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether ready segments across queues and chained bottom-of-pipe waits are
+/// coalesced into one host submission (`VICTORY_COALESCE_PIECES`, on by default
+/// unless `"0"`).
+#[cfg(windows)]
+fn coalesce_pieces() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_COALESCE_PIECES").is_none_or(|v| v != "0");
+        if !on {
+            tracing::info!("queue piece coalescing disabled (VICTORY_COALESCE_PIECES=0)");
+        }
+        on
+    })
+}
+
+/// Maximum number of host command lists joined into one coalesced submission
+/// (`VICTORY_JOIN_LISTS`, default 64).
+#[cfg(windows)]
+fn join_lists() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_JOIN_LISTS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(64)
+    })
+}
+
+/// Runs what held work may run now (`why`), its time counted in
+/// [`BLOCKED_US`].
+#[cfg(windows)]
+fn pump(held: &mut Holding, why: Why) {
+    let entered = std::time::Instant::now();
+    pump_work(held, why);
+    BLOCKED_US[why as usize][1].fetch_add(entered.elapsed().as_micros() as u64, Ordering::Relaxed);
+}
+
+#[cfg(windows)]
+fn pump_work(held: &mut Holding, why: Why) {
+    if held.is_empty() {
+        return;
+    }
+    let Some(host) = crate::host::host() else { return };
+    let read = read_value;
+    for (queue, waits) in held.force_older_than(VALVE) {
+        account().forced += 1;
+        tracing::warn!(queue = kind(queue), ?waits, "held work runs without its waits after {VALVE:?} (safety valve)");
+    }
+    let fence = |f: usize| crate::fence::value(f as This);
+    let max_lists = join_lists();
+    let will_write = |seg: &std::sync::Arc<crate::host::HostList>, wait: &crate::hold::ValueWait| {
+        seg.will_write(wait)
+    };
+    let can_join = |piece: &[(std::sync::Arc<crate::host::HostList>, bool)],
+                    next: &std::sync::Arc<crate::host::HostList>| {
+        if piece.len() >= max_lists {
+            return false;
+        }
+        let existing = piece
+            .iter()
+            .fold(crate::hold::BatchFlags::default(), |acc, (s, _)| {
+                acc.merge(s.batch_flags())
+            });
+        crate::hold::can_join_batch(existing, next.batch_flags(), piece.len(), max_lists)
+    };
+    let started = std::time::Instant::now();
+    let mut ran = std::time::Duration::ZERO;
+    let mut run = |segments: Vec<(std::sync::Arc<crate::host::HostList>, bool)>| {
+        let lists: Vec<&crate::host::HostList> = segments.iter().map(|(s, _)| &**s).collect();
+        let barriers: Vec<bool> = segments.iter().map(|&(_, b)| b).collect();
+        let at = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::PumpExecutes, 1);
+        host.execute_with_barriers(&lists, &barriers);
+        ran += at.elapsed();
+        drop(lists);
+        segments
+            .into_iter()
+            .for_each(|(s, _)| crate::list::recycle(s));
+    };
+    let mut signal = |f: usize, value: u64| {
+        crate::fence::set(f as This, value);
+        crate::fence::let_go(f as This);
+    };
+    let pumped = held.pump(&mut crate::hold::World {
+        read: &read,
+        fence: &fence,
+        will_write: &will_write,
+        can_join: &can_join,
+        coalesce: coalesce_pieces(),
+        run: &mut run,
+        signal: &mut signal,
+    });
+    if pumped.segments > 0 || pumped.unknown > 0 {
+        let mut a = account();
+        a.pump += started.elapsed().saturating_sub(ran);
+        a.pieces += pumped.pieces;
+        a.segments += pumped.segments;
+        a.unknown += pumped.unknown;
+        a.coalesced_bop_waits += pumped.coalesced_bop_waits;
+        a.hazard_splits += pumped.hazard_splits;
+        for (queue, waited) in pumped.waited {
+            a.released.push((kind(queue), waited, why));
+        }
+    }
+    // Once work stays held, a timer tests it every 2 ms: memory the title
+    // writes from the CPU, or the valve, may let it go with no call of ours.
+    if held.is_empty() {
+        return;
+    }
+    start_held_timer();
+}
+
+/// The value a wait tests (4 or 8 bytes), if the memory can be read.
+#[cfg(windows)]
+fn read_value(address: u64, bytes: u8) -> Option<u64> {
+    let mut value = [0u8; 8];
+    crate::host::read_into(address as *const u8, &mut value[..usize::from(bytes.min(8))]).then(|| u64::from_le_bytes(value))
+}
+
+/// A queue's type, for logs (0 graphics, 2 compute, 3 copy). Titles do not
+/// release queues that hold work.
+#[cfg(windows)]
+fn kind(queue: usize) -> u32 {
+    self::queue(queue as This).kind
+}
+
+/// What queues did with held work since the last presented frame.
+#[cfg(windows)]
+#[derive(Default)]
+struct Account {
+    submissions: u32,
+    pieces: u32,
+    segments: u32,
+    /// Segments that waited: queue type, how long, what ran them.
+    released: Vec<(u32, std::time::Duration, Why)>,
+    unknown: u32,
+    forced: u32,
+    mappings: u32,
+    coalesced_bop_waits: u32,
+    hazard_splits: u32,
+    /// Time in the pump outside host submissions.
+    pump: std::time::Duration,
+}
+
+#[cfg(windows)]
+fn account() -> std::sync::MutexGuard<'static, Account> {
+    static ACCOUNT: std::sync::OnceLock<std::sync::Mutex<Account>> = std::sync::OnceLock::new();
+    ACCOUNT.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The frame line of held work: what waited, how long and what released it,
+/// and what is still held at the present, with the waits that do not hold.
+#[cfg(windows)]
+fn account_frame(frame: u64) {
+    let (cuts, early) = crate::list::take_cuts();
+    let (fence_waits, fence_waited) = crate::fence::take_waited();
+    let a = std::mem::take(&mut *account());
+    let blocked = held().blocked(&read_value);
+    if a.released.is_empty() && blocked.is_empty() && a.forced == 0 && a.unknown == 0 && a.mappings == 0 {
+        return;
+    }
+    let longest = a.released.iter().map(|r| r.1).max().unwrap_or_default();
+    let mut by = [0u32; 7];
+    for r in &a.released {
+        by[r.2 as usize] += 1;
+    }
+    tracing::info!(
+        frame,
+        submissions = a.submissions,
+        pieces = a.pieces,
+        segments = a.segments,
+        cuts,
+        early_resets = early,
+        waited = a.released.len(),
+        coalesced_bop_waits = a.coalesced_bop_waits,
+        hazard_splits = a.hazard_splits,
+        longest_ms = longest.as_secs_f64() * 1e3,
+        pump_ms = a.pump.as_secs_f64() * 1e3,
+        fence_waits,
+        fence_wait_ms = fence_waited.as_secs_f64() * 1e3,
+        "held work this frame (submissions; host submissions, segments; lists cut at waits; lists reset or released \
+         while held, each keeping its own host list; segments that waited, released by \
+         submission/signal/wait/fence/present/timer {by:?}; coalesced BoP waits and hazard splits; time in the pump \
+         outside host submissions; events the title waited on for fence values and their summed waits); held at the \
+         present: {}",
+        blocked.len()
+    );
+    tracing::debug!(
+        frame,
+        "held work released this frame (queue type, ms, by): {:?}",
+        a.released.iter().map(|(k, d, w)| (k, d.as_secs_f64() * 1e3, w)).collect::<Vec<_>>()
+    );
+    for (queue, items, waited, unmet) in &blocked {
+        let level_warn = blocked.len() > 1;
+        let unmet: Vec<String> = unmet
+            .iter()
+            .map(|w| format!("{:#x} cmp {} {:#x} (is {:?})", w.address, w.comparison, w.reference, read_value(w.address, w.bytes)))
+            .collect();
+        if level_warn {
+            tracing::warn!(frame, queue = kind(*queue), items, waited_ms = waited.as_millis(), ?unmet, "two or more queues hold work at the present");
+        } else {
+            tracing::info!(frame, queue = kind(*queue), items, waited_ms = waited.as_millis(), ?unmet, "a queue holds work at the present");
+        }
+    }
+    if a.forced > 0 || a.unknown > 0 || a.mappings > 0 {
+        tracing::warn!(
+            frame,
+            forced = a.forced,
+            unknown = a.unknown,
+            mappings = a.mappings,
+            "held work: run without its waits (valve), waits with an unknown comparison (taken as holding), \
+             page mappings done ahead of held work"
+        );
+    }
+}
+
+/// One plane of a `PresentX` call (0x48-byte stride): frame token,
+/// resource count, and pointer to the plane's resources.
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
+    _rest: [u64; 6],
 }
+const _: () = assert!(std::mem::size_of::<Plane>() == 0x48);
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
     execute(this, count, lists);
 }
 /// Signal with sync settings for the top and bottom of the pipe; our
-/// submissions are complete when they return, so it signals at once.
+/// submissions are complete when they run, so it signals as Signal does.
 extern "system" fn signal2_x(
     this: This,
     fence: This,
@@ -157,15 +825,80 @@ extern "system" fn signal2_x(
 }
 /// Markers and events only matter to profilers.
 extern "system" fn marker(_: This) {}
-extern "system" fn signal(_: This, fence: This, value: u64) -> HRESULT {
+/// At once, or behind the work the queue holds (its fence, and the memory
+/// the title reads it at, move only once that work has run).
+extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
-    crate::fence::signal(fence, value)
+    #[cfg(windows)]
+    {
+        let mut held = held_for(Why::Signal);
+        if held.holds_work(this as usize) {
+            crate::fence::keep(fence);
+            held.push(this as usize, Item::Signal(fence as usize, value));
+            if crate::host::async_submit_enabled() {
+                drop(held);
+                ensure_submit_worker();
+                wake_submit();
+            } else if crate::host::flight1_enabled() {
+                drop(held);
+                pump_unlocked(Why::Signal);
+            } else {
+                pump(&mut held, Why::Signal);
+            }
+        } else if crate::host::flight1_enabled()
+            && crate::host::host().is_some_and(|h| h.attach_signal(fence, value, false))
+        {
+            drop(held);
+        } else {
+            crate::fence::set(fence, value);
+            // Another queue may wait for this fence.
+            if crate::host::async_submit_enabled() {
+                drop(held);
+                ensure_submit_worker();
+                wake_submit();
+            } else if crate::host::flight1_enabled() {
+                drop(held);
+                pump_unlocked(Why::Signal);
+            } else {
+                pump(&mut held, Why::Signal);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = this;
+        crate::fence::set(fence, value);
+    }
+    S_OK
 }
-/// Nothing runs on the queue, so waiting for a fence never blocks it.
-extern "system" fn wait(_: This, fence: This, _value: u64) -> HRESULT {
-    if fence.is_null() { E_INVALIDARG } else { S_OK }
+/// The queue's later work waits until the fence reaches `value`.
+///
+/// shortcut: the fence is not kept alive while the queue waits for it;
+/// Grand Theft Auto VI makes no queue wait for a fence.
+extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
+    if fence.is_null() {
+        return E_INVALIDARG;
+    }
+    #[cfg(windows)]
+    if crate::host::host().is_some() && crate::fence::value(fence) < value {
+        let mut held = held_for(Why::Wait);
+        held.push(this as usize, Item::FenceWait(fence as usize, value));
+        if crate::host::async_submit_enabled() {
+            drop(held);
+            ensure_submit_worker();
+            wake_submit();
+        } else if crate::host::flight1_enabled() {
+            drop(held);
+            pump_unlocked(Why::Wait);
+        } else {
+            pump(&mut held, Why::Wait);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (this, value);
+    S_OK
 }
 /// Ticks per second of GPU timestamps (see [`Written::GpuTimestamp`]).
 extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
@@ -227,7 +960,6 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "diagnostics")]
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
@@ -319,9 +1051,9 @@ fn log_planes(frame: u64, planes: u32, found: &[Vec<This>], shown: usize) {
 }
 
 /// The plane whose first resource is shown: `VICTORY_PRESENT_PLANE=<n>`
-/// (counted from 0) when that plane was found, else the plane whose first
-/// resource has the most pixels (#15: on Series S plane 0 is a 1920x1080
-/// overlay and plane 1 the 3840x2160 picture). Ties keep the earlier plane.
+/// (counted from 0) when that plane was found, else the first plane with a
+/// resource (#15: on Series S plane 0 is the scene, at the title's output
+/// size, and plane 1 the 3840x2160 UI drawn over it).
 #[cfg(windows)]
 fn shown_plane(found: &[Vec<This>]) -> usize {
     static PLANE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
@@ -342,7 +1074,8 @@ fn shown_plane(found: &[Vec<This>]) -> usize {
 }
 
 /// The plane to show given an override and each plane's first resource
-/// area (0 when unknown): the override when in range, else the largest.
+/// area (0 when unknown): the override when in range, else the first plane
+/// with a known resource, else plane 0.
 #[cfg(any(windows, test))]
 fn pick_plane(want: Option<usize>, areas: &[u64]) -> usize {
     if let Some(w) = want
@@ -350,17 +1083,11 @@ fn pick_plane(want: Option<usize>, areas: &[u64]) -> usize {
     {
         return w;
     }
-    let mut best = 0;
-    for (i, &a) in areas.iter().enumerate() {
-        if a > areas.get(best).copied().unwrap_or(0) {
-            best = i;
-        }
-    }
-    best
+    areas.iter().position(|&a| a > 0).unwrap_or(0)
 }
 
-/// Shows the first resource of one plane in our window (the largest
-/// plane unless `VICTORY_PRESENT_PLANE` picks another).
+/// Shows the first resource of one plane in our window (the first plane
+/// unless `VICTORY_PRESENT_PLANE` picks another).
 ///
 /// shortcut: one plane, no scaling or placement, the source expected in
 /// the common state.
@@ -370,7 +1097,24 @@ extern "system" fn present(
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    // What may run before the frame is shown does.
+    // shortcut: PresentX does not wait behind work the queue still holds (it
+    // shows the frame as far as it ran); the frame line names such work.
+    #[cfg(windows)]
+    if crate::host::async_submit_enabled() || crate::host::flight1_enabled() {
+        drain_submit(Why::Present);
+    } else {
+        pump_held(Why::Present);
+    }
+    #[cfg(not(windows))]
+    pump_held(Why::Present);
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(windows)]
+    account_frame(frame);
+    #[cfg(windows)]
+    crate::shadow::trim_pool();
+    #[cfg(feature = "diagnostics")]
+    crate::frame::presented();
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
@@ -399,6 +1143,8 @@ extern "system" fn present(
             tracing::info!(hits, misses, "shaders from the cache and translated so far");
         }
     }
+    #[cfg(windows)]
+    crate::hdr_probe::on_present(frame);
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         crate::capture::presented(frame);
@@ -406,6 +1152,10 @@ extern "system" fn present(
             crate::capture::dump_targets(frame);
         }
     }
+    #[cfg(windows)]
+    let mut black_frame = false;
+    #[cfg(not(windows))]
+    let black_frame = false;
     #[cfg(windows)]
     let found = plane_resources(planes, plane_parameters);
     #[cfg(windows)]
@@ -417,23 +1167,25 @@ extern "system" fn present(
         && let Some(texture) = crate::resource::host_resource(resource)
         && let Some(host) = crate::host::host()
     {
+
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        // The other plane's first resource, blended over the picture when
-        // `VICTORY_PRESENT_COMPOSITE=1` (#15: a 1080p overlay on Series S).
+        // The other plane's first resource, blended over the picture unless
+        // `VICTORY_PRESENT_COMPOSITE=0` (#15: the 4K UI on Series S).
         let other = (found.len() == 2)
             .then(|| found[1 - shown].first().copied())
             .flatten()
             .filter(|&o| o != resource && crate::composite::wanted())
             .and_then(|o| Some((o, crate::resource::host_resource(o)?)));
-        let overlay_state = other.map(|(o, _)| {
-            crate::resource::host_transition(o, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before)
+        let overlay_state = other.as_ref().map(|(o, _)| {
+            crate::resource::host_transition(*o, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before)
         });
-        let overlay = other.zip(overlay_state).map(|((_, t), s)| (t, s));
-        let shown = host.present(texture, state, overlay, frame);
-        if let Some(((o, _), s)) = other.zip(overlay_state) {
-            crate::resource::host_transition(o, s);
+        let overlay = other.as_ref().zip(overlay_state).map(|((_, t), s)| (t, s));
+        let shown = host.present(&texture, state, overlay, frame);
+        black_frame = shown.unwrap_or(false);
+        if let Some(((o, _), s)) = other.as_ref().zip(overlay_state) {
+            crate::resource::host_transition(*o, s);
         }
         crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]
@@ -443,6 +1195,11 @@ extern "system" fn present(
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
+    #[cfg(windows)]
+    let drawn = crate::draw::drawn();
+    #[cfg(not(windows))]
+    let drawn = 0;
+    crate::bench::on_present(drawn, black_frame);
     S_OK
 }
 /// Diagnostics: logs a presented frame that is black after one that was
@@ -504,10 +1261,12 @@ const PAGE: u64 = 64 << 10;
 /// pages of a pool (memory the title mapped physical pages into) at the
 /// batches' addresses. Grand Theft Auto VI streams textures into pool pages
 /// and maps them into its tiled heap this way (title+0xf2c470, ranges of
-/// one constant page or of unmapped pages). Done at once: every earlier
-/// submission has run.
+/// one constant page or of unmapped pages). Done at once.
+///
+/// shortcut: done ahead of work the queue still holds (counted in the frame
+/// line); queue it as an item like Signal if that count is not 0.
 extern "system" fn copy_page_mappings(
-    _: This,
+    this: This,
     count: u32,
     batches: *const PageBatch,
     pool: u64,
@@ -520,6 +1279,17 @@ extern "system" fn copy_page_mappings(
     if batches.is_null() && count > 0 {
         return E_INVALIDARG;
     }
+    #[cfg(windows)]
+    {
+        if crate::host::async_submit_enabled() || crate::host::flight1_enabled() {
+            drain_submit(Why::Submission);
+        }
+        if held().holds_work(this as usize) {
+            account().mappings += 1;
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = this;
     let batches = (count > 0).then(|| {
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
@@ -613,22 +1383,48 @@ mod tests {
     use super::*;
     use crate::object::slot;
 
-    /// Which plane gets shown: the one `VICTORY_PRESENT_PLANE` names when
-    /// it names one, else the plane whose first resource has the most
-    /// pixels. It only weighs the areas it is handed, so it runs on every
-    /// host.
+    /// A lock another thread holds is waited for, and the wait is counted
+    /// in microseconds; a free lock adds next to nothing.
     #[test]
-    fn the_largest_plane_is_shown_unless_one_is_named() {
-        // Series S: a 1080p overlay, then the 4K picture.
+    fn a_timed_lock_counts_its_wait() {
+        let lock = std::sync::Mutex::new(());
+        let waited = AtomicU64::new(0);
+        drop(lock_timed(&lock, &waited));
+        assert!(waited.load(Ordering::Relaxed) < 5_000, "a free lock");
+        let (taken, take) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let _held = lock.lock().unwrap();
+                taken.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            });
+            take.recv().unwrap();
+            let before = waited.load(Ordering::Relaxed);
+            drop(lock_timed(&lock, &waited));
+            let counted = waited.load(Ordering::Relaxed) - before;
+            assert!(
+                counted >= 20_000,
+                "waited {counted} us for a lock held 30 ms"
+            );
+        });
+    }
+
+    /// Which plane gets shown: the one `VICTORY_PRESENT_PLANE` names when
+    /// it names one, else the first plane with a known resource. It only
+    /// weighs the areas it is handed, so it runs on every host.
+    #[test]
+    fn the_first_plane_is_shown_unless_one_is_named() {
+        // Series S: the 1080p scene, then the 4K UI that goes over it.
         let series_s = [1920 * 1080, 3840 * 2160];
-        assert_eq!(pick_plane(None, &series_s), 1);
-        assert_eq!(pick_plane(Some(0), &series_s), 0);
-        // An override past the planes found falls back to the largest.
-        assert_eq!(pick_plane(Some(5), &series_s), 1);
-        // Series X: one plane. Ties and unknown sizes keep the first.
+        assert_eq!(pick_plane(None, &series_s), 0);
+        assert_eq!(pick_plane(Some(1), &series_s), 1);
+        // An override past the planes found falls back to the first.
+        assert_eq!(pick_plane(Some(5), &series_s), 0);
+        // A first plane whose resource is not known yet is passed over.
+        assert_eq!(pick_plane(None, &[0, 3840 * 2160]), 1);
+        // Series X: one plane. Unknown sizes keep the first.
         assert_eq!(pick_plane(None, &[3840 * 2160]), 0);
         assert_eq!(pick_plane(None, &[0, 0]), 0);
-        assert_eq!(pick_plane(None, &[100, 100]), 0);
         assert_eq!(pick_plane(None, &[]), 0);
     }
 

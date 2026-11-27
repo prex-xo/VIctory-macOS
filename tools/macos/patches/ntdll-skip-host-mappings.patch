@@ -1,0 +1,56 @@
+ntdll: on macOS, skip host mappings when looking for free address space.
+
+try_map_free_area tries a candidate address, and when something is already
+mapped there it moves on by one allocation granule (64 KiB). On macOS,
+memory the host maps outside Wine, such as Metal's, looks free to Wine, so
+the search stepped through it one granule at a time. In VIctory-macOS #50
+(M3 Max, macOS 27.2.1, D3DMetal 4.0 beta 3, the Series S profile) every
+thread the title created spent about 2.5 s there, with virtual_mutex held,
+and every page fault and memory query of the other threads waited for it:
+the intro ran at 0.1 fps. Now a failed candidate asks mach_vm_region for
+the mapping in the way and moves past it. Every address it skips overlaps
+that mapping, so no free area is missed. With it the intro runs at 20-30
+fps and the longest wait for virtual_mutex fell from 2.5-7 s to 27 ms.
+
+Like Wine, this patch is under the LGPL 2.1 or later. Applied by
+tools/macos/build-crossover-wine.sh.
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -1551,6 +1551,37 @@
+             (step < 0 && (char *)start - (char *)base < -step) ||
+             step == 0)
+             break;
++#ifdef __APPLE__
++        /* victory-macos: memory the host mapped outside Wine (Metal's, for
++         * one) looks free to Wine, which stepped through it one granule at a
++         * time: about 100,000 failed maps, 2.5 s under virtual_mutex, for
++         * each thread stack (#50). Skip past the mapping that is in the way. */
++        {
++            mach_vm_address_t addr = (mach_vm_address_t)start;
++            mach_vm_size_t rsize = 0;
++            vm_region_basic_info_data_64_t info;
++            mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
++            mach_port_t object = MACH_PORT_NULL;
++            kern_return_t kr = mach_vm_region( mach_task_self(), &addr, &rsize, VM_REGION_BASIC_INFO_64,
++                                               (vm_region_info_t)&info, &count, &object );
++            /* The object name is returned as a send right. */
++            if (object != MACH_PORT_NULL) mach_port_deallocate( mach_task_self(), object );
++            if (!kr && addr < (mach_vm_address_t)start + size)
++            {
++                size_t mask = (step > 0 ? step : -step) - 1;
++                char *next;
++                if (step > 0)
++                    next = (char *)(((addr + rsize) + mask) & ~(mach_vm_address_t)mask);
++                else
++                    next = (addr < size) ? NULL : (char *)((addr - size) & ~(mach_vm_address_t)mask);
++                if (step > 0 ? next > (char *)start : (next && next < (char *)start))
++                {
++                    start = next;
++                    continue;
++                }
++            }
++        }
++#endif
+         start = (char *)start + step;
+     }
+ 

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use crate::policy::ensure_outside_repo;
+use crate::policy::{ensure_outside_repo, resolve as resolve_path};
 
 #[derive(Debug, Default, Clone)]
 pub struct Config {
@@ -95,6 +95,7 @@ impl Config {
         let data_dir = env_path("VICTORY_DATA_DIR")
             .or(file.data_dir)
             .map_or_else(|| default_dir("data"), Ok)?;
+        ensure_data_outside_cache(&data_dir, &cache_dir)?;
         Ok(Config {
             game_dir: env_path("VICTORY_GAME_DIR").or(file.game_dir),
             cache_dir,
@@ -105,14 +106,6 @@ impl Config {
         })
     }
 
-    /// The game directory, or a helpful error if it is not configured.
-    pub fn require_game_dir(&self) -> Result<&Path> {
-        self.game_dir.as_deref().context(
-            "no game directory configured: set VICTORY_GAME_DIR or [paths].game_dir in \
-             victory.toml (see victory.example.toml)",
-        )
-    }
-
     /// Returns `<cache>/<sub>`, creating it, after checking the asset policy.
     pub fn cache_subdir(&self, sub: &str) -> Result<PathBuf> {
         subdir(&self.cache_dir, sub)
@@ -120,8 +113,44 @@ impl Config {
 
     /// Returns `<data>/<sub>`, creating it, after checking the asset policy.
     pub fn data_subdir(&self, sub: &str) -> Result<PathBuf> {
+        let dir = self.data_dir.join(sub);
+        ensure_data_outside_cache(&dir, &self.cache_dir)?;
         subdir(&self.data_dir, sub)
     }
+}
+
+/// Persistent title data must survive cache cleanup, so `data_dir` may not
+/// be the cache directory or inside it. Both paths go through the
+/// longest-existing-prefix resolver first, so symlinks and not-yet-created
+/// leaf directories are handled; `starts_with` then compares components, so
+/// a sibling like `cache-backup` is accepted.
+fn ensure_data_outside_cache(data_dir: &Path, cache_dir: &Path) -> Result<()> {
+    let resolved_data =
+        resolve_path(data_dir).with_context(|| format!("resolving {}", data_dir.display()))?;
+    let resolved_cache =
+        resolve_path(cache_dir).with_context(|| format!("resolving {}", cache_dir.display()))?;
+    // Wine can keep the caller's spelling when canonicalizing an existing path.
+    // Ask the filesystem whether the ancestor at the cache depth is the cache.
+    let ancestor: PathBuf = resolved_data
+        .components()
+        .take(resolved_cache.components().count())
+        .collect();
+    if resolved_data.starts_with(&resolved_cache)
+        || (resolved_cache.try_exists()?
+            && ancestor.try_exists()?
+            && same_file::is_same_file(&ancestor, &resolved_cache)?)
+    {
+        anyhow::bail!(
+            "data_dir {} (resolved {}) is equal to or inside cache_dir {} (resolved {}); \
+             cache cleanup may delete it, so persistent title saves would be lost — \
+             keep data_dir outside cache_dir",
+            data_dir.display(),
+            resolved_data.display(),
+            cache_dir.display(),
+            resolved_cache.display()
+        );
+    }
+    Ok(())
 }
 
 /// The config file explicitly named by the environment, if any. An empty
@@ -231,11 +260,91 @@ mod tests {
 
     #[test]
     fn data_inside_repo_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
         let inside = Path::new(env!("CARGO_MANIFEST_DIR")).join("data");
         let cfg = Config {
+            cache_dir: tmp.path().join("cache"),
             data_dir: inside,
             ..Default::default()
         };
-        assert!(cfg.data_subdir("x").is_err());
+        let err = cfg.data_subdir("x").unwrap_err();
+        assert!(err.downcast_ref::<crate::PolicyError>().is_some(), "{err}");
+    }
+
+    #[test]
+    fn persistent_data_stays_outside_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+
+        let resolve_with = |cache_dir: PathBuf, data_dir: PathBuf| {
+            Config::resolve(
+                FilePaths {
+                    cache_dir: Some(cache_dir),
+                    data_dir: Some(data_dir),
+                    ..Default::default()
+                },
+                None,
+                |_: &str| None,
+            )
+        };
+
+        // Equal roots are rejected.
+        assert!(resolve_with(cache.clone(), cache.clone()).is_err());
+
+        // A data_dir nested inside cache_dir is rejected, and the error names both paths.
+        let nested = cache.join("saves");
+        let err = resolve_with(cache.clone(), nested.clone()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(&cache.display().to_string()), "{msg}");
+        assert!(msg.contains(&nested.display().to_string()), "{msg}");
+
+        // A symlink alias pointing into the cache is rejected, even behind `missing/..`.
+        #[cfg(unix)]
+        {
+            let alias = tmp.path().join("alias");
+            std::os::unix::fs::symlink(&cache, &alias).unwrap();
+            assert!(resolve_with(cache.clone(), alias).is_err());
+            let via_parent = tmp
+                .path()
+                .join("missing")
+                .join("..")
+                .join("alias")
+                .join("saves");
+            assert!(resolve_with(cache.clone(), via_parent.clone()).is_err());
+            let cache_via_parent = tmp.path().join("missing").join("..").join("alias");
+            assert!(resolve_with(cache_via_parent, cache.join("saves")).is_err());
+        }
+
+        // On case-insensitive volumes, differently cased roots that did not exist at
+        // resolve time are still caught before `data_subdir` creates persistent storage.
+        let probe_upper = tmp.path().join("CaseProbe");
+        std::fs::create_dir(&probe_upper).unwrap();
+        if tmp.path().join("caseprobe").exists() {
+            let new_cache = tmp.path().join("NewCache");
+            let new_data = tmp.path().join("newcache");
+            let cfg = resolve_with(new_cache.clone(), new_data).unwrap();
+            cfg.cache_subdir("shaders").unwrap();
+            assert!(cfg.data_subdir("saves").is_err());
+            assert!(!new_cache.join("saves").exists());
+        } else {
+            let lower = tmp.path().join("caseprobe");
+            std::fs::create_dir(&lower).unwrap();
+            let cfg = resolve_with(probe_upper, lower.clone()).unwrap();
+            assert_eq!(cfg.data_subdir("saves").unwrap(), lower.join("saves"));
+        }
+
+        // If cache_dir lives inside data_dir, a data_subdir landing inside cache_dir is rejected.
+        let nested_cache = data.join("00000000");
+        let cfg = resolve_with(nested_cache.clone(), data.clone()).unwrap();
+        assert!(cfg.data_subdir("00000000/storage").is_err());
+        assert!(!nested_cache.join("storage").exists());
+
+        // Sibling directories are accepted, even one named like the cache.
+        assert!(resolve_with(cache.clone(), data.clone()).is_ok());
+        let sibling = tmp.path().join("cache-backup");
+        assert!(resolve_with(cache.clone(), sibling).is_ok());
     }
 }

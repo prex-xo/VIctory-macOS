@@ -20,8 +20,6 @@ impl FourCC {
     /// Native code from another compiler, in place of `DXIL`
     /// ([`crate::native::fspx_program`]).
     pub const ACCC: FourCC = FourCC(*b"ACCC");
-    pub const STAT: FourCC = FourCC(*b"STAT");
-    pub const RTS0: FourCC = FourCC(*b"RTS0");
     pub const PSV0: FourCC = FourCC(*b"PSV0");
     pub const ISG1: FourCC = FourCC(*b"ISG1");
     pub const OSG1: FourCC = FourCC(*b"OSG1");
@@ -29,8 +27,6 @@ impl FourCC {
     pub const PSG1: FourCC = FourCC(*b"PSG1");
     pub const SFI0: FourCC = FourCC(*b"SFI0");
     pub const HASH: FourCC = FourCC(*b"HASH");
-    pub const ILDB: FourCC = FourCC(*b"ILDB");
-    pub const ILDN: FourCC = FourCC(*b"ILDN");
 }
 
 impl std::fmt::Debug for FourCC {
@@ -52,15 +48,11 @@ impl std::fmt::Display for FourCC {
 #[derive(Debug, Clone, Copy)]
 pub struct Part<'a> {
     pub fourcc: FourCC,
-    /// Offset of the part header within the container.
-    pub offset: usize,
     pub data: &'a [u8],
 }
 
 #[derive(Debug, Clone)]
 pub struct Container<'a> {
-    pub digest: [u8; 16],
-    pub version: (u16, u16),
     pub parts: Vec<Part<'a>>,
 }
 
@@ -72,8 +64,6 @@ impl<'a> Container<'a> {
         if data.len() < HEADER_SIZE || &data[0..4] != b"DXBC" {
             return Err(ShaderError::NotDxbc);
         }
-        let digest = data[4..20].try_into().expect("16 bytes");
-        let version = (u16_at(data, 0x14)?, u16_at(data, 0x16)?);
         let total = u32_at(data, 0x18)? as usize;
         if total > data.len() || total < HEADER_SIZE {
             return Err(ShaderError::Malformed("container size disagrees with data"));
@@ -96,17 +86,9 @@ impl<'a> Container<'a> {
             let body = data
                 .get(offset + 8..offset + 8 + size)
                 .ok_or(ShaderError::Malformed("part data out of bounds"))?;
-            parts.push(Part {
-                fourcc,
-                offset,
-                data: body,
-            });
+            parts.push(Part { fourcc, data: body });
         }
-        Ok(Container {
-            digest,
-            version,
-            parts,
-        })
+        Ok(Container { parts })
     }
 
     pub fn part(&self, fourcc: FourCC) -> Option<&Part<'a>> {

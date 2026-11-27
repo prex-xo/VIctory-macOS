@@ -98,7 +98,10 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
         // the loader maps the copy away from its preferred base (Wine always
         // does for DYNAMIC_BASE images), and the loader then reads callbacks
         // from there. Make that entry a no-op.
-        let field_rva = tls.directory_rva + layout::TLS64_ADDRESS_OF_CALLBACKS as u32;
+        let field_rva = tls
+            .directory_rva
+            .checked_add(layout::TLS64_ADDRESS_OF_CALLBACKS as u32)
+            .ok_or(PrepareError::Patch("TLS callback field RVA overflow"))?;
         for (entry, target) in dir64_relocations(&bytes, &info) {
             if target == field_rva {
                 write_u16(&mut bytes, entry, 0)?; // IMAGE_REL_BASED_ABSOLUTE
@@ -142,14 +145,23 @@ fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
         if block < 8 || at + block > end {
             break;
         }
-        for entry in (at + 8..at + block).step_by(2) {
+        // An odd block size ends in a byte that is not a whole entry: entry
+        // reads stay within the block's declared end.
+        let block_end = at + block;
+        let mut entry = at + 8;
+        while entry + 2 <= block_end {
             let Some(e) = bytes.get(entry..entry + 2) else {
                 break;
             };
             let e = u16::from_le_bytes([e[0], e[1]]);
             if e >> 12 == DIR64 {
-                out.push((entry, page + u32::from(e & 0xFFF)));
+                // A page RVA near the 4 GiB limit can overflow with the
+                // entry's offset; like any malformed entry, skip it.
+                if let Some(target) = page.checked_add(u32::from(e & 0xFFF)) {
+                    out.push((entry, target));
+                }
             }
+            entry += 2;
         }
         at += block;
     }
@@ -176,6 +188,161 @@ fn write(bytes: &mut [u8], at: usize, v: &[u8]) -> Result<(), PrepareError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An `ImageInfo` with one section mapping `rva` to `file_offset`.
+    fn info_with_section(rva: u32, file_offset: u32, file_size: u32) -> ImageInfo {
+        ImageInfo {
+            machine: victory_pe::MACHINE_AMD64,
+            characteristics: 0,
+            timestamp: 0,
+            subsystem: 0,
+            dll_characteristics: 0,
+            image_base: 0,
+            size_of_image: 0,
+            entry_rva: 0,
+            stack_reserve: 0,
+            stack_commit: 0,
+            sections: vec![victory_pe::SectionInfo {
+                name: ".sec".into(),
+                rva,
+                virtual_size: file_size,
+                file_offset,
+                file_size,
+                characteristics: 0,
+            }],
+            imports: Vec::new(),
+            delay_imports: Vec::new(),
+            exports: Vec::new(),
+            tls: None,
+            has_relocations: true,
+            has_exception_table: false,
+            has_load_config: false,
+            codeview: None,
+        }
+    }
+
+    #[test]
+    fn dir64_relocations_skips_entries_past_the_4_gib_limit() {
+        // A header whose BASERELOC directory points at RVA 0x1000, 24 bytes,
+        // mapped to file offset 0x200 by the section above.
+        let mut bytes = vec![0u8; 0x300];
+        bytes[..2].copy_from_slice(b"MZ");
+        bytes[layout::DOS_E_LFANEW..layout::DOS_E_LFANEW + 4]
+            .copy_from_slice(&0x40u32.to_le_bytes());
+        let opt = layout::optional_header_offset(&bytes).unwrap();
+        let count = opt + layout::OPT_NUMBER_OF_RVA_AND_SIZES;
+        bytes[count..count + 4].copy_from_slice(&16u32.to_le_bytes());
+        let d = layout::data_directory_offset(&bytes, dir::BASERELOC).unwrap();
+        bytes[d..d + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+        bytes[d + 4..d + 8].copy_from_slice(&24u32.to_le_bytes());
+        let info = info_with_section(0x1000, 0x200, 0x100);
+        // Block 1: page 0x1000 with one DIR64 entry at offset 0x123 and one
+        // ABSOLUTE entry (not collected).
+        let at = 0x200;
+        bytes[at..at + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+        bytes[at + 4..at + 8].copy_from_slice(&12u32.to_le_bytes());
+        bytes[at + 8..at + 10].copy_from_slice(&0xA123u16.to_le_bytes());
+        bytes[at + 10..at + 12].copy_from_slice(&0x0123u16.to_le_bytes());
+        // Block 2: page u32::MAX - 0x10; the 0x10 offset lands exactly on
+        // u32::MAX, the 0xFFF offset overflows and is skipped (a panic in
+        // debug builds before).
+        let at = 0x20C;
+        bytes[at..at + 4].copy_from_slice(&(u32::MAX - 0x10).to_le_bytes());
+        bytes[at + 4..at + 8].copy_from_slice(&12u32.to_le_bytes());
+        bytes[at + 8..at + 10].copy_from_slice(&0xA010u16.to_le_bytes());
+        bytes[at + 10..at + 12].copy_from_slice(&0xAFFFu16.to_le_bytes());
+        assert_eq!(
+            dir64_relocations(&bytes, &info),
+            vec![(0x208, 0x1123), (0x214, u32::MAX)]
+        );
+    }
+
+    #[test]
+    fn dir64_relocations_stops_at_an_odd_blocks_end() {
+        // BASERELOC at RVA 0x1000, 21 bytes, mapped to file offset 0x200.
+        // Block 1 holds one DIR64 entry; block 2 has an odd size of 9, so its
+        // last byte is not an entry even though the two bytes at 0x214 would
+        // decode as DIR64 — the second lies past the block's declared end.
+        let mut bytes = vec![0u8; 0x300];
+        bytes[..2].copy_from_slice(b"MZ");
+        bytes[layout::DOS_E_LFANEW..layout::DOS_E_LFANEW + 4]
+            .copy_from_slice(&0x40u32.to_le_bytes());
+        let opt = layout::optional_header_offset(&bytes).unwrap();
+        let count = opt + layout::OPT_NUMBER_OF_RVA_AND_SIZES;
+        bytes[count..count + 4].copy_from_slice(&16u32.to_le_bytes());
+        let d = layout::data_directory_offset(&bytes, dir::BASERELOC).unwrap();
+        bytes[d..d + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+        bytes[d + 4..d + 8].copy_from_slice(&21u32.to_le_bytes());
+        let info = info_with_section(0x1000, 0x200, 0x100);
+        // Block 1: page 0x1000, one DIR64 entry at offset 0x123, one ABSOLUTE.
+        let at = 0x200;
+        bytes[at..at + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+        bytes[at + 4..at + 8].copy_from_slice(&12u32.to_le_bytes());
+        bytes[at + 8..at + 10].copy_from_slice(&0xA123u16.to_le_bytes());
+        bytes[at + 10..at + 12].copy_from_slice(&0x0123u16.to_le_bytes());
+        // Block 2: page 0x2000, odd size 9; the byte at 0x214 pairs with the
+        // byte at 0x215 (past the block) into what looks like DIR64 0x123.
+        let at = 0x20C;
+        bytes[at..at + 4].copy_from_slice(&0x2000u32.to_le_bytes());
+        bytes[at + 4..at + 8].copy_from_slice(&9u32.to_le_bytes());
+        bytes[at + 8] = 0x23;
+        bytes[at + 9] = 0xA1;
+        assert_eq!(dir64_relocations(&bytes, &info), vec![(0x208, 0x1123)]);
+    }
+
+    /// A minimal PE32+ image whose single section sits at RVA 0xFFFF_F000
+    /// (file offset 0x200, 0x2000 bytes) and whose TLS directory is at
+    /// `directory_rva`, with an empty callback array at RVA 0xFFFF_FF00.
+    /// Parses with `ImageInfo::parse` on any host.
+    fn synthetic_tls_image(directory_rva: u32) -> Vec<u8> {
+        let mut d = vec![0u8; 0x200];
+        d[..2].copy_from_slice(b"MZ");
+        d[layout::DOS_E_LFANEW..layout::DOS_E_LFANEW + 4].copy_from_slice(&0x40u32.to_le_bytes());
+        d[0x40..0x44].copy_from_slice(b"PE\0\0");
+        d[0x44..0x46].copy_from_slice(&victory_pe::MACHINE_AMD64.to_le_bytes());
+        d[0x46..0x48].copy_from_slice(&1u16.to_le_bytes()); // one section
+        d[0x54..0x56].copy_from_slice(&240u16.to_le_bytes()); // optional header size
+        d[0x56..0x58].copy_from_slice(&0x2022u16.to_le_bytes()); // characteristics
+        let opt = 0x58;
+        d[opt..opt + 2].copy_from_slice(&0x20Bu16.to_le_bytes()); // PE32+
+        d[opt + 24..opt + 32].copy_from_slice(&0x1_8000_0000u64.to_le_bytes()); // image base
+        d[opt + 32..opt + 36].copy_from_slice(&0x1000u32.to_le_bytes()); // section alignment
+        d[opt + 36..opt + 40].copy_from_slice(&0x200u32.to_le_bytes()); // file alignment
+        d[opt + 56..opt + 60].copy_from_slice(&0x2000u32.to_le_bytes()); // size of image
+        d[opt + 60..opt + 64].copy_from_slice(&0x200u32.to_le_bytes()); // size of headers
+        let count = opt + layout::OPT_NUMBER_OF_RVA_AND_SIZES;
+        d[count..count + 4].copy_from_slice(&16u32.to_le_bytes());
+        let tls_dir = opt + layout::OPT_DATA_DIRECTORY + 9 * layout::DATA_DIRECTORY_SIZE;
+        d[tls_dir..tls_dir + 4].copy_from_slice(&directory_rva.to_le_bytes());
+        d[tls_dir + 4..tls_dir + 8].copy_from_slice(&40u32.to_le_bytes());
+        let sec = opt + 240;
+        d[sec..sec + 4].copy_from_slice(b".tls");
+        d[sec + 8..sec + 12].copy_from_slice(&0x2000u32.to_le_bytes()); // virtual size
+        d[sec + 12..sec + 16].copy_from_slice(&0xFFFF_F000u32.to_le_bytes()); // RVA
+        d[sec + 16..sec + 20].copy_from_slice(&0x2000u32.to_le_bytes()); // raw size
+        d[sec + 20..sec + 24].copy_from_slice(&0x200u32.to_le_bytes()); // raw offset
+        d[sec + 36..sec + 40].copy_from_slice(&0x4000_0040u32.to_le_bytes()); // read, data
+        d.resize(0x2200, 0);
+        // The TLS directory's AddressOfCallBacks points at an empty array
+        // at RVA 0xFFFF_FF00 (image base 0x1_8000_0000).
+        let at = 0x200 + (directory_rva - 0xFFFF_F000) as usize;
+        let cb = at + layout::TLS64_ADDRESS_OF_CALLBACKS;
+        d[cb..cb + 8].copy_from_slice(&(0x1_8000_0000u64 + 0xFFFF_FF00).to_le_bytes());
+        let array = 0x200 + (0xFFFF_FF00u32 - 0xFFFF_F000) as usize;
+        d[array..array + 8].copy_from_slice(&0u64.to_le_bytes());
+        d
+    }
+
+    #[test]
+    fn a_tls_directory_past_the_4_gib_limit_is_an_error_not_a_panic() {
+        // directory_rva + TLS64_ADDRESS_OF_CALLBACKS overflows u32: a panic
+        // in debug builds, a wrapped RVA in release ones, before. The parse
+        // now refuses a directory outside the image, so `prepare` never
+        // gets to the addition.
+        let image = synthetic_tls_image(0xFFFF_FFF0);
+        assert!(ImageInfo::parse(&image).is_err());
+        assert!(prepare(&image).is_err());
+    }
 
     #[test]
     #[cfg_attr(not(windows), ignore = "reads its own test binary as a PE file")]

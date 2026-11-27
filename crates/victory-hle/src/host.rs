@@ -2,6 +2,8 @@
 
 use victory_pe::ImportSymbol;
 
+use crate::registry::matches_dll;
+
 /// Which DLLs may be satisfied by the host's own implementation.
 ///
 /// Console titles link mostly against Windows API sets that behave the same
@@ -65,13 +67,7 @@ impl HostPolicy {
     }
 
     pub fn allows(&self, dll: &str) -> bool {
-        let dll = dll.to_ascii_lowercase();
-        self.allow
-            .iter()
-            .any(|pattern| match pattern.strip_suffix('*') {
-                Some(prefix) => dll.starts_with(prefix),
-                None => dll == *pattern,
-            })
+        matches_dll(&self.allow, dll)
     }
 
     pub(crate) fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Option<usize> {

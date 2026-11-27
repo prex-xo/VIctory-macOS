@@ -9,10 +9,10 @@ use crate::Converter;
 
 /// Identifies one conversion result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct CacheKey(blake3::Hash);
+struct CacheKey(blake3::Hash);
 
 impl CacheKey {
-    pub fn new(converter: &dyn Converter, input: &[u8]) -> Self {
+    fn new(converter: &dyn Converter, input: &[u8]) -> Self {
         let mut h = blake3::Hasher::new();
         h.update(converter.id().as_bytes());
         h.update(&[0]);
@@ -21,7 +21,7 @@ impl CacheKey {
         CacheKey(h.finalize())
     }
 
-    pub fn to_hex(&self) -> String {
+    fn to_hex(self) -> String {
         self.0.to_hex().to_string()
     }
 }
@@ -41,7 +41,7 @@ impl Cache {
         Ok(Cache { root })
     }
 
-    pub fn path_for(&self, key: &CacheKey) -> PathBuf {
+    fn path_for(&self, key: &CacheKey) -> PathBuf {
         let hex = key.to_hex();
         self.root.join(&hex[..2]).join(&hex[2..])
     }
@@ -67,11 +67,16 @@ impl Cache {
         let (tmp, mut file) = tempfile_in(dir)?;
         let written = file.write_all(&output);
         drop(file);
-        let published = written.and_then(|()| std::fs::rename(&tmp, &path));
-        if published.is_err() {
+        if let Err(err) = written {
             let _ = std::fs::remove_file(&tmp);
+            return Err(err.into());
         }
-        published?;
+        if let Err(err) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            if !published(&path) {
+                return Err(err.into());
+            }
+        }
         Ok(path)
     }
 }
@@ -87,10 +92,13 @@ fn published(path: &Path) -> bool {
     }
 }
 
-/// Makes folder `dir` unless it is there. Not `create_dir_all` alone, which
-/// asks for the metadata of a folder that is there (`Path::is_dir`); the
-/// cache's 256 folders are there after the first few hundred entries.
-fn make_dir(dir: &Path) -> io::Result<()> {
+/// Makes folder `dir` and its parents unless it is there. Not
+/// `create_dir_all` alone, which asks for the metadata of a folder that is
+/// there (`Path::is_dir`): a call to Wine's mount manager, like the ones
+/// [`Cache::get_or_convert`] avoids. The cache's 256 folders are there after
+/// the first few hundred entries, and the GPU pipeline library makes its
+/// folder at every save, on the pipeline workers.
+pub fn make_dir(dir: &Path) -> io::Result<()> {
     match std::fs::create_dir(dir) {
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => std::fs::create_dir_all(dir),
@@ -148,6 +156,20 @@ mod tests {
         }
     }
 
+    /// How many staging (`.tmp-*`) files `dir` holds.
+    fn staging_files(dir: &Path) -> usize {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".tmp-")
+            })
+            .count()
+    }
+
     #[test]
     fn converts_once_then_hits() {
         let tmp = tempfile::tempdir().unwrap();
@@ -163,6 +185,39 @@ mod tests {
         assert_eq!(conv.runs.load(Ordering::Relaxed), 1);
     }
 
+    /// A converter may legitimately produce no bytes.
+    struct Empty {
+        runs: AtomicUsize,
+    }
+
+    impl Converter for Empty {
+        fn id(&self) -> &'static str {
+            "test.empty"
+        }
+        fn version(&self) -> u32 {
+            1
+        }
+        fn convert(&self, _input: &[u8]) -> Result<Vec<u8>> {
+            self.runs.fetch_add(1, Ordering::Relaxed);
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn empty_converter_output_is_cached_without_reconverting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("cache")).unwrap();
+        let conv = Empty {
+            runs: AtomicUsize::new(0),
+        };
+        let a = cache.get_or_convert(&conv, b"abc").unwrap();
+        let b = cache.get_or_convert(&conv, b"abc").unwrap();
+        assert_eq!(a, b);
+        assert_eq!(std::fs::read(&a).unwrap(), b"");
+        assert_eq!(conv.runs.load(Ordering::Relaxed), 1);
+        assert_eq!(staging_files(a.parent().unwrap()), 0);
+    }
+
     #[test]
     fn failed_publication_removes_the_staging_file() {
         let tmp = tempfile::tempdir().unwrap();
@@ -176,6 +231,120 @@ mod tests {
 
         assert!(cache.get_or_convert(&conv, b"abc").is_err());
         assert!(path.is_dir());
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
+        assert_eq!(staging_files(path.parent().unwrap()), 0);
+    }
+
+    #[test]
+    fn valid_entry_at_the_destination_is_used_without_converting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("cache")).unwrap();
+        let conv = Upper {
+            version: 1,
+            runs: AtomicUsize::new(0),
+        };
+        let path = cache.path_for(&CacheKey::new(&conv, b"abc"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"already published").unwrap();
+
+        let got = cache.get_or_convert(&conv, b"abc").unwrap();
+        assert_eq!(got, path);
+        assert_eq!(std::fs::read(&got).unwrap(), b"already published");
+        assert_eq!(conv.runs.load(Ordering::Relaxed), 0);
+        assert_eq!(staging_files(path.parent().unwrap()), 0);
+    }
+
+    #[test]
+    fn publication_over_a_raced_entry_leaves_no_staging_file() {
+        struct RacingUpper {
+            cache: Cache,
+        }
+
+        impl Converter for RacingUpper {
+            fn id(&self) -> &'static str {
+                "test.upper"
+            }
+            fn version(&self) -> u32 {
+                1
+            }
+            fn convert(&self, input: &[u8]) -> Result<Vec<u8>> {
+                let output = input.to_ascii_uppercase();
+                // Another writer publishes the entry while we convert.
+                let path = self.cache.path_for(&CacheKey::new(self, input));
+                std::fs::create_dir_all(path.parent().unwrap())?;
+                std::fs::write(&path, &output)?;
+                Ok(output)
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("cache")).unwrap();
+        let conv = RacingUpper {
+            cache: cache.clone(),
+        };
+        let path = cache.get_or_convert(&conv, b"abc").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"ABC");
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
+        assert_eq!(staging_files(path.parent().unwrap()), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn accepts_entry_published_concurrently_while_open() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        struct RacingUpper {
+            cache: Cache,
+            held: std::sync::Mutex<Option<std::fs::File>>,
+        }
+
+        impl Converter for RacingUpper {
+            fn id(&self) -> &'static str {
+                "test.upper"
+            }
+            fn version(&self) -> u32 {
+                1
+            }
+            fn convert(&self, input: &[u8]) -> Result<Vec<u8>> {
+                let output = input.to_ascii_uppercase();
+                let key = CacheKey::new(self, input);
+                let path = self.cache.path_for(&key);
+                let dir = path.parent().unwrap();
+                std::fs::create_dir_all(dir)?;
+                std::fs::write(&path, &output)?;
+                // FILE_SHARE_READ permits readers but prevents replacement while held.
+                *self.held.lock().unwrap() = Some(
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .share_mode(1)
+                        .open(&path)?,
+                );
+                let (probe, mut probe_file) = tempfile_in(dir)?;
+                probe_file.write_all(&output)?;
+                drop(probe_file);
+                assert!(
+                    std::fs::rename(&probe, &path).is_err(),
+                    "the open reader must prevent replacing the published entry"
+                );
+                std::fs::remove_file(probe)?;
+                Ok(output)
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("cache")).unwrap();
+        let conv = RacingUpper {
+            cache: cache.clone(),
+            held: std::sync::Mutex::new(None),
+        };
+        let path = cache.get_or_convert(&conv, b"abc").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"ABC");
         assert_eq!(
             std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
             1

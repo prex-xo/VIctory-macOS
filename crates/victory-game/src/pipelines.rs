@@ -31,6 +31,7 @@
 //! ```
 
 use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
 
 use crate::cityhash::city64;
 use crate::sgd5::Database;
@@ -87,9 +88,7 @@ impl Named {
         named.name_from_registers(&mut want, pack);
         // Rasterisers have no register image here; depth states some
         // registers do not keep.
-        named.finding = "enumeration";
-        depth_space(|b| named.try_depth(&mut want, &b));
-        raster_space(|b| named.try_raster(&mut want, &b));
+        named.enumerate(&mut want);
         named
     }
 
@@ -125,6 +124,28 @@ impl Named {
             }
         }
     }
+
+    /// The fallback enumerations: the usual values of each depth-stencil
+    /// and rasteriser field, each skipped when nothing of its kind is
+    /// wanted and stopped as soon as the last wanted hash is named.
+    /// Returns the candidates visited.
+    fn enumerate(&mut self, want: &mut Wanted) -> usize {
+        self.finding = "enumeration";
+        let mut visited = 0;
+        if !want.depth.is_empty() {
+            visited += depth_space(|b| {
+                self.try_depth(want, &b);
+                still_wanted(&want.depth)
+            });
+        }
+        if !want.raster.is_empty() {
+            visited += raster_space(|b| {
+                self.try_raster(want, &b);
+                still_wanted(&want.raster)
+            });
+        }
+        visited
+    }
 }
 
 /// Names `b` if its hash is still wanted: the hash it names.
@@ -140,13 +161,29 @@ fn try_one<const N: usize>(
         .map(|_| hash)
 }
 
+/// The enumerations' stop signal: stop once no wanted hash remains.
+fn still_wanted(want: &HashSet<u64>) -> ControlFlow<()> {
+    if want.is_empty() {
+        ControlFlow::Break(())
+    } else {
+        ControlFlow::Continue(())
+    }
+}
+
 /// Slope biases tried with each integer depth bias.
 const SLOPES: [f32; 29] = [
     0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 8.0, 10.0, 16.0, 0.25, 0.1, 0.01, 0.001, -0.5,
     -1.0, -1.5, -2.0, -4.0, 0.75, 1.25, 6.0, 7.0, 20.0, 32.0, 64.0, 100.0,
 ];
 
-fn raster_space(mut f: impl FnMut([u8; RASTER])) {
+/// Visits each candidate of the rasteriser space, stopping when `f`
+/// breaks; returns how many candidates it visited.
+fn raster_space(mut f: impl FnMut([u8; RASTER]) -> ControlFlow<()>) -> usize {
+    let mut visited = 0;
+    let mut visit = |b: [u8; RASTER]| {
+        visited += 1;
+        f(b).is_break()
+    };
     let mut biases: Vec<i8> = (-16..=16).collect();
     biases.extend([-128, 127, 100, -100, 50, -50, 64, -64, 32, -32]);
     for fill in [2, 3] {
@@ -158,7 +195,9 @@ fn raster_space(mut f: impl FnMut([u8; RASTER])) {
                     let mut b = [0u8; RASTER];
                     b[..3].copy_from_slice(&[fill, cull, ccw]);
                     b[12..].copy_from_slice(&tail);
-                    f(b);
+                    if visit(b) {
+                        return visited;
+                    }
                     for &bias in &biases {
                         for slope in SLOPES {
                             if bias == 0 && slope == 0.0 {
@@ -166,13 +205,16 @@ fn raster_space(mut f: impl FnMut([u8; RASTER])) {
                             }
                             b[3] = bias as u8;
                             b[8..12].copy_from_slice(&slope.to_le_bytes());
-                            f(b);
+                            if visit(b) {
+                                return visited;
+                            }
                         }
                     }
                 }
             }
         }
     }
+    visited
 }
 
 /// Stencil masks tried.
@@ -181,7 +223,14 @@ const MASKS: [u8; 19] = [
     0x00, 0x7F, 0xFE,
 ];
 
-fn depth_space(mut f: impl FnMut([u8; DEPTH])) {
+/// Visits each candidate of the depth-stencil space, stopping when `f`
+/// breaks; returns how many candidates it visited.
+fn depth_space(mut f: impl FnMut([u8; DEPTH]) -> ControlFlow<()>) -> usize {
+    let mut visited = 0;
+    let mut visit = |b: [u8; DEPTH]| {
+        visited += 1;
+        f(b).is_break()
+    };
     for enable in [0, 1] {
         for write in [0, 1] {
             for func in 1..=8 {
@@ -191,7 +240,9 @@ fn depth_space(mut f: impl FnMut([u8; DEPTH])) {
                         enable, write, func, 0, 0xFF, 0xFF, 1, 1, 1, 8, 1, 1, 1, 8,
                     ]);
                     b[22..].copy_from_slice(&tail);
-                    f(b);
+                    if visit(b) {
+                        return visited;
+                    }
                 }
                 // Stencil on, the same ops on both faces.
                 for read in MASKS {
@@ -204,7 +255,9 @@ fn depth_space(mut f: impl FnMut([u8; DEPTH])) {
                                 b[6..10].copy_from_slice(&face);
                                 b[10..14].copy_from_slice(&face);
                                 b[22..].copy_from_slice(&[1, 1]);
-                                f(b);
+                                if visit(b) {
+                                    return visited;
+                                }
                             }
                         }
                     }
@@ -212,6 +265,7 @@ fn depth_space(mut f: impl FnMut([u8; DEPTH])) {
             }
         }
     }
+    visited
 }
 
 /// The depth, stencil and blend registers of a pack record's register
@@ -584,12 +638,18 @@ pub fn stream<'a>(
         .get(&g.rasterizer_hash)
         .ok_or(Unnamed::Rasterizer)?;
     let blend = named.blend.get(&g.blend_hash).ok_or(Unnamed::Blend)?;
-    let (Some(formats), Some((depth_format, _, topology)), Some((_, count, quality)), Some(inputs)) = (
+    let (
+        Some(formats),
+        Some((depth_format, _, topology)),
+        Some((mask, count, quality)),
+        Some(inputs),
+    ) = (
         g.target_formats(),
         g.depth_targets_topology(),
         g.samples(),
         g.input_layout(),
-    ) else {
+    )
+    else {
         return Err(Unnamed::Metadata);
     };
     let mut s = vec![0u8; 0x2b0];
@@ -621,7 +681,7 @@ pub fn stream<'a>(
         put64(&mut s, 0x38, ps.len() as u64);
     }
     s[0x8c..0x1d4].copy_from_slice(&blend_desc(blend));
-    put(&mut s, 0x1dc, u32::MAX);
+    put(&mut s, 0x1dc, mask);
     s[0x1e4..0x210].copy_from_slice(&rasterizer_desc(raster));
     s[0x214..0x24c].copy_from_slice(&depth_stencil_desc(depth));
     // The engine makes 1 to 16 samples, a power of two; 21 records store
@@ -736,16 +796,62 @@ mod tests {
     #[test]
     fn the_depth_space_holds_the_d3d12_default() {
         let mut found = false;
-        depth_space(|b| found |= b[..6] == [1, 1, 2, 0, 0xFF, 0xFF] && b[22..] == [1, 1]);
+        depth_space(|b| {
+            found |= b[..6] == [1, 1, 2, 0, 0xFF, 0xFF] && b[22..] == [1, 1];
+            ControlFlow::Continue(())
+        });
         assert!(found);
     }
 
+    #[test]
+    fn state_enumeration_stops_when_resolved() {
+        // Nothing wanted: the fallback enumerations visit no candidate.
+        let mut named = Named::default();
+        let mut want = Wanted {
+            depth: HashSet::new(),
+            raster: HashSet::new(),
+            blend: HashSet::new(),
+        };
+        assert_eq!(named.enumerate(&mut want), 0);
+        assert!(named.depth.is_empty() && named.raster.is_empty() && named.source.is_empty());
+
+        // The first depth candidate resolves the only wanted hash: the
+        // enumeration stops right after it, keeping its bytes and source.
+        let mut first = [0u8; DEPTH];
+        first[..14].copy_from_slice(&[0, 0, 1, 0, 0xFF, 0xFF, 1, 1, 1, 8, 1, 1, 1, 8]);
+        first[22..].copy_from_slice(&[1, 1]);
+        let hash = city64(&first);
+        let mut want = Wanted {
+            depth: HashSet::from([hash]),
+            raster: HashSet::new(),
+            blend: HashSet::new(),
+        };
+        assert_eq!(named.enumerate(&mut want), 1);
+        assert_eq!(named.depth[&hash], first);
+        assert_eq!(named.source[&hash], "enumeration");
+        assert!(want.depth.is_empty());
+
+        // The first raster candidate resolves the only wanted raster hash.
+        let mut first = [0u8; RASTER];
+        first[..3].copy_from_slice(&[2, 1, 0]);
+        let hash = city64(&first);
+        let mut want = Wanted {
+            depth: HashSet::new(),
+            raster: HashSet::from([hash]),
+            blend: HashSet::new(),
+        };
+        assert_eq!(named.enumerate(&mut want), 1);
+        assert_eq!(named.raster[&hash], first);
+        assert_eq!(named.source[&hash], "enumeration");
+    }
+
     /// A record's metadata: targets 28 and 10, depth format 40, topology
-    /// 3, two samples, and a layout of POSITION and COLOR.
+    /// 3, sample mask 1 with two samples at quality 0, and a layout of
+    /// POSITION and COLOR.
     fn metadata() -> Vec<u8> {
         let mut m = vec![0; 0x4c];
         m[0x10..0x18].copy_from_slice(&[28, 0, 10, 0, 0, 0, 0, 0]);
-        m[0x1c..0x20].copy_from_slice(&u32::MAX.to_le_bytes());
+        m[0x1c..0x20].copy_from_slice(&1u32.to_le_bytes());
         m[0x24..0x27].copy_from_slice(&[40, 3, 3]);
         m[0x28] = 2;
         let mut layout = 2u32.to_le_bytes().to_vec();
@@ -800,7 +906,7 @@ mod tests {
         assert_eq!((w(0x10), q(0x18), q(0x20)), (1, vs.as_ptr() as u64, 12));
         assert_eq!((w(0x28), q(0x30), q(0x38)), (2, ps.as_ptr() as u64, 20));
         assert_eq!(b[0x8c..0x1d4], blend_desc(&blend));
-        assert_eq!(w(0x1dc), u32::MAX);
+        assert_eq!(w(0x1dc), 0x1, "the record's sample mask");
         assert_eq!(b[0x1e4..0x210], rasterizer_desc(&named.raster[&2]));
         assert_eq!(
             (w(0x210), b[0x214..0x24c].to_vec()),

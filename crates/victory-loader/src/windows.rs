@@ -84,6 +84,20 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
         // SAFETY: just mapped, and no title code has run.
         unsafe { crate::tls::redirect(loaded.base(), &loaded.info) }?;
     }
+    // The title's DLLs' 256-bit stores split too, each from its own list
+    // (`VICTORY_PATCH_WIDE_DIR/<first 16 hex digits of the image's hash>.txt`,
+    // made with `cargo xtask wide-stores`); the executable's comes from
+    // `VICTORY_PATCH_WIDE` (`apps/victory/src/run.rs`).
+    if loaded.info.is_dll()
+        && let Some(dir) = std::env::var_os("VICTORY_PATCH_WIDE_DIR").filter(|v| !v.is_empty())
+    {
+        let hex = prepared.original_hash.to_hex();
+        let list = Path::new(&dir).join(format!("{}.txt", &hex.as_str()[..16]));
+        if list.is_file() {
+            let (n, refused) = crate::wide::patch(loaded.base() as u64, &list);
+            tracing::info!(image = %loaded.path.display(), n, refused, "wide stores of a title DLL split");
+        }
+    }
     tracing::info!(
         base = format_args!("{:#x}", loaded.base()),
         preferred = format_args!("{:#x}", loaded.info.image_base),

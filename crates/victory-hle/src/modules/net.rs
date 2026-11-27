@@ -26,6 +26,7 @@ use std::sync::Mutex;
 use windows_sys::Win32::Foundation::SetLastError;
 
 use crate::modules::files::host;
+use crate::modules::xgameruntime::wide;
 use crate::{HleExport, HleModule, hle_export};
 
 const SOCKET_ERROR: i32 = -1;
@@ -86,14 +87,6 @@ fn narrow(text: *const c_char) -> Option<String> {
         unsafe { CStr::from_ptr(text) }
             .to_string_lossy()
             .into_owned()
-    })
-}
-
-fn wide(text: *const u16) -> Option<String> {
-    // SAFETY: the title passes a NUL-terminated string or null.
-    (!text.is_null()).then(|| unsafe {
-        let len = (0..).take_while(|&i| *text.add(i) != 0).count();
-        String::from_utf16_lossy(std::slice::from_raw_parts(text, len))
     })
 }
 

@@ -180,18 +180,29 @@ impl ImageInfo {
             }
         }
 
+        let size_of_image = opt.size_of_image();
+        let entry_rva = opt.address_of_entry_point();
+        // RVA 0 is a valid entry point (a DLL without DllMain); any other
+        // RVA must land inside the mapped image, or calling it would jump
+        // out of bounds.
+        if entry_rva != 0 && entry_rva >= size_of_image {
+            return Err(PeError::Malformed(format!(
+                "entry point RVA {entry_rva:#x} is outside the {size_of_image:#x}-byte image"
+            )));
+        }
+
         let dir_present = |index: usize| {
             file.data_directory(index)
                 .is_some_and(|d| d.virtual_address.get(LE) != 0 && d.size.get(LE) != 0)
         };
 
         let imports = match file.import_table()? {
-            Some(table) => parse_imports(&table, opt.size_of_image())?,
+            Some(table) => parse_imports(&table, size_of_image)?,
             None => Vec::new(),
         };
-        let delay_imports = parse_delay_imports(&file, opt.size_of_image())?;
+        let delay_imports = parse_delay_imports(&file, size_of_image)?;
         let exports = parse_exports(&file, opt.image_base())?;
-        let tls = parse_tls(&file, data, opt.image_base())?;
+        let tls = parse_tls(&file, data, opt.image_base(), size_of_image)?;
         let codeview = file.pdb_info()?.map(|cv| CodeViewInfo {
             pdb_path: String::from_utf8_lossy(cv.path()).into_owned(),
             guid: cv.guid(),
@@ -205,8 +216,8 @@ impl ImageInfo {
             subsystem: opt.subsystem().0,
             dll_characteristics: opt.dll_characteristics().0,
             image_base: opt.image_base(),
-            size_of_image: opt.size_of_image(),
-            entry_rva: opt.address_of_entry_point(),
+            size_of_image,
+            entry_rva,
             stack_reserve: opt.size_of_stack_reserve(),
             stack_commit: opt.size_of_stack_commit(),
             sections,
@@ -395,6 +406,7 @@ fn parse_tls(
     file: &PeFile64<'_>,
     data: &[u8],
     image_base: u64,
+    size_of_image: u32,
 ) -> Result<Option<TlsInfo>, PeError> {
     let Some(dd) = file.data_directory(pe::IMAGE_DIRECTORY_ENTRY_TLS) else {
         return Ok(None);
@@ -402,6 +414,14 @@ fn parse_tls(
     let directory_rva = dd.virtual_address.get(LE);
     if directory_rva == 0 {
         return Ok(None);
+    }
+    // Section raw data alone does not bound the directory (a section header
+    // may claim an RVA past `SizeOfImage`): the loader maps only
+    // `size_of_image` bytes, so the whole directory must fit inside them.
+    if u64::from(directory_rva) + layout::TLS64_SIZE as u64 > u64::from(size_of_image) {
+        return Err(PeError::Malformed(format!(
+            "TLS directory at {directory_rva:#x} runs outside the {size_of_image:#x}-byte image"
+        )));
     }
     let sections = file.section_table();
     let tls = sections
@@ -421,7 +441,13 @@ fn parse_tls(
             if va == 0 {
                 break;
             }
-            callback_rvas.push(va_to_rva(va, image_base)?);
+            let rva = va_to_rva(va, image_base)?;
+            if rva >= size_of_image {
+                return Err(PeError::Malformed(format!(
+                    "TLS callback RVA {rva:#x} is outside the {size_of_image:#x}-byte image"
+                )));
+            }
+            callback_rvas.push(rva);
         }
     }
     Ok(Some(TlsInfo {
@@ -695,5 +721,118 @@ mod tests {
                 (Some("gamma"), 2, Some(0x1204)),
             ]
         );
+    }
+
+    /// Writes `rva` into the synthetic image's `AddressOfEntryPoint`.
+    fn set_entry_rva(data: &mut [u8], rva: u32) {
+        let at = 0x58 + layout::OPT_ADDRESS_OF_ENTRY_POINT;
+        data[at..at + 4].copy_from_slice(&rva.to_le_bytes());
+    }
+
+    /// Points the synthetic image's TLS data directory at RVA 0x1000 (the
+    /// start of the section body), size `TLS64_SIZE`.
+    fn enable_tls(data: &mut [u8]) {
+        let at = 0x58 + layout::OPT_DATA_DIRECTORY + dir::TLS * layout::DATA_DIRECTORY_SIZE;
+        data[at..at + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+        data[at + 4..at + 8].copy_from_slice(&(layout::TLS64_SIZE as u32).to_le_bytes());
+    }
+
+    /// A section body (RVA 0x1000) holding a TLS directory whose callback
+    /// array at RVA 0x1100 lists `callbacks`, null-terminated.
+    fn tls_body(callbacks: &[u64]) -> Vec<u8> {
+        let mut body = vec![0u8; 0x200];
+        let image_base = 0x1_8000_0000u64;
+        let at = layout::TLS64_ADDRESS_OF_CALLBACKS;
+        body[at..at + 8].copy_from_slice(&(image_base + 0x1100).to_le_bytes());
+        for (i, va) in callbacks.iter().enumerate() {
+            let at = 0x100 + i * 8;
+            body[at..at + 8].copy_from_slice(&va.to_le_bytes());
+        }
+        body
+    }
+
+    /// The synthetic image's export directory overlaps the TLS directory;
+    /// clear it so only the field under test is parsed.
+    fn without_exports(data: &mut [u8]) {
+        let at = 0x58 + layout::OPT_DATA_DIRECTORY;
+        data[at..at + layout::DATA_DIRECTORY_SIZE].fill(0);
+    }
+
+    #[test]
+    fn rejects_entry_point_outside_the_image() {
+        let mut data = synthetic_image(&vec![0u8; 0x200]);
+        without_exports(&mut data);
+        // SizeOfImage of the synthetic image is 0x2000.
+        set_entry_rva(&mut data, 0x2000);
+        assert!(matches!(
+            ImageInfo::parse(&data),
+            Err(PeError::Malformed(_))
+        ));
+        set_entry_rva(&mut data, 0xFFFF_FFFF);
+        assert!(matches!(
+            ImageInfo::parse(&data),
+            Err(PeError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn accepts_zero_and_in_bounds_entry_points() {
+        let mut data = synthetic_image(&vec![0u8; 0x200]);
+        without_exports(&mut data);
+        // RVA 0 is valid: a DLL may have no entry point.
+        set_entry_rva(&mut data, 0);
+        assert_eq!(ImageInfo::parse(&data).unwrap().entry_rva, 0);
+        // Anything below SizeOfImage (0x2000) is in bounds.
+        set_entry_rva(&mut data, 0x1FFF);
+        assert_eq!(ImageInfo::parse(&data).unwrap().entry_rva, 0x1FFF);
+    }
+
+    #[test]
+    fn accepts_tls_callback_inside_the_image() {
+        let image_base = 0x1_8000_0000u64;
+        let mut data = synthetic_image(&tls_body(&[image_base + 0x1200]));
+        without_exports(&mut data);
+        enable_tls(&mut data);
+        set_entry_rva(&mut data, 0x1200);
+        let info = ImageInfo::parse(&data).unwrap();
+        assert_eq!(info.entry_rva, 0x1200);
+        let tls = info.tls.expect("TLS directory present");
+        assert_eq!(tls.directory_rva, 0x1000);
+        assert_eq!(tls.callback_rvas, [0x1200]);
+    }
+
+    #[test]
+    fn rejects_tls_callback_outside_the_image() {
+        let image_base = 0x1_8000_0000u64;
+        // SizeOfImage is 0x2000; 0x2000 itself is already out of bounds.
+        let mut data = synthetic_image(&tls_body(&[image_base + 0x2000]));
+        without_exports(&mut data);
+        enable_tls(&mut data);
+        assert!(matches!(
+            ImageInfo::parse(&data),
+            Err(PeError::Malformed(_))
+        ));
+        let mut data = synthetic_image(&tls_body(&[image_base + 0xFFFF_FFF0]));
+        without_exports(&mut data);
+        enable_tls(&mut data);
+        assert!(matches!(
+            ImageInfo::parse(&data),
+            Err(PeError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_tls_directory_outside_the_image() {
+        let mut data = synthetic_image(&tls_body(&[]));
+        without_exports(&mut data);
+        enable_tls(&mut data);
+        // Shrink SizeOfImage to 0x1000: the directory at 0x1000 is inside the
+        // section's raw data but no longer fits in the mapped image.
+        let at = 0x58 + 56;
+        data[at..at + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+        assert!(matches!(
+            ImageInfo::parse(&data),
+            Err(PeError::Malformed(_))
+        ));
     }
 }

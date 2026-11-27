@@ -8,7 +8,7 @@
 //! contents move between the two by copies where the use changes: within
 //! a list where it records the change (`HostList::transition`), and at
 //! submission for each list's first use, from the side the lists before it
-//! left newer. A 16-bit depth plane in the host's 24-bit one (the
+//! left newer. A 16-bit depth plane in the host's 32-bit float one (the
 //! console's 16-bit depth with stencil) is converted on the way, so a
 //! value written as 16-bit depth compares equal to the same depth
 //! rasterised.
@@ -26,7 +26,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::s;
 
-use crate::host::{HostList, host, transition};
+use crate::host::{HostList, host, transition, uav_barrier};
 use crate::object::This;
 use crate::resource::HostTexture;
 
@@ -73,7 +73,7 @@ struct Route {
     /// Its place in the scratch buffer as the twin's texture has it.
     twin: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
     /// As the depth texture has it, where that differs: a 16-bit depth
-    /// plane the host keeps in 24 bits (32 per texel), converted.
+    /// plane the host keeps as 32-bit floats, converted.
     depth: Option<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
 }
 
@@ -178,10 +178,38 @@ fn make(console: u32, depth: &ID3D12Resource) -> Option<Twin> {
             routes.push(route);
         }
     }
-    let scratch = scratch_buffer(at)?;
-    crate::host::name(&scratch, || format!("depth twin copies {at:#x}"));
+    let scratch = shared_scratch(at)?;
     tracing::debug!(console, width = dd.Width, height = dd.Height, planes = planes.len(), "a writable twin for a depth texture");
     Some(Twin { planes, newer: AtomicU8::new(DEPTH), routes, scratch })
+}
+
+/// Scratch buffers shared by the twins, one per power-of-two size: a
+/// buffer each held as much video memory as its twin's planes for good
+/// (about 325 MB for Grand Theft Auto VI's 315 twins in the menu).
+/// Sharing is safe: every copy through one ([`Twin::copy`]) starts in the
+/// common state and returns the buffer to it, so copies in one list are
+/// ordered by those transitions, and lists run one after another on the
+/// host's single queue.
+struct Scratch(Vec<(u64, ID3D12Resource)>);
+
+// SAFETY: D3D12 resources are free-threaded.
+unsafe impl Send for Scratch {}
+
+static SCRATCH: std::sync::Mutex<Scratch> = std::sync::Mutex::new(Scratch(Vec::new()));
+
+/// The shared scratch buffer of at least `size` bytes: the one of `size`'s
+/// power-of-two class, made on first use. All of them together hold at
+/// most twice the largest.
+fn shared_scratch(size: u64) -> Option<ID3D12Resource> {
+    let class = size.max(1 << 16).next_power_of_two();
+    let mut all = SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, buffer)) = all.0.iter().find(|(c, _)| *c == class) {
+        return Some(buffer.clone());
+    }
+    let buffer = scratch_buffer(class)?;
+    crate::host::name(&buffer, || format!("depth twin copies {class:#x}"));
+    all.0.push((class, buffer.clone()));
+    Some(buffer)
 }
 
 /// A default-heap buffer of `size` bytes shaders may write, in the common
@@ -438,41 +466,46 @@ impl Twin {
             l.ResourceBarrier(&[state(COPY_SOURCE as i32, 0)]);
         }
         COPIES.fetch_add(1, Relaxed);
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            // The bytes of the twin's planes the copy moves (the depth
+            // texture's side may be half as big: 16-bit depth).
+            let bytes: u64 = self
+                .routes
+                .iter()
+                .map(|r| {
+                    u64::from(r.twin.Footprint.RowPitch)
+                        * u64::from(r.twin.Footprint.Height)
+                        * u64::from(r.twin.Footprint.Depth)
+                })
+                .sum();
+            let (copies, moved) = if to_depth {
+                (C::TwinToDepth, C::TwinToDepthBytes)
+            } else {
+                (C::TwinToTwin, C::TwinToTwinBytes)
+            };
+            add(copies, 1);
+            add(moved, bytes);
+        }
         converted
     }
 }
 
-fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
-    D3D12_RESOURCE_BARRIER {
-        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-        Anonymous: D3D12_RESOURCE_BARRIER_0 {
-            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
-        },
-    }
-}
-
-/// 16-bit depth (unorm, two per dword) to the host's 24-bit depth plane (in
-/// the low 24 bits of 32) and back, in the scratch buffer: `u * (2^24 - 1)
-/// / 65535` rounded, exactly, and back to the 16-bit value whose 24-bit one
-/// is nearest. The scratch buffer is bound twice, read through `words` and
-/// written through `buf`, because Wine's HLSL compiler (vkd3d-shader) loads
-/// only from structured buffers and stores only to raw ones. The reads and
-/// the writes are in different parts of it.
+/// 16-bit depth (unorm, two per dword) to the host's 32-bit float depth
+/// plane and back, in the scratch buffer: `u` becomes `u` times
+/// `0x37800080` (the title's 1/65535; its tiled-lighting draws rasterise
+/// that very float and test it EQUAL), and a float back the nearest `u`.
+/// The scratch buffer is bound twice, read through `words` and written
+/// through `buf`, because Wine's HLSL compiler (vkd3d-shader) loads only
+/// from structured buffers and stores only to raw ones. The reads and the
+/// writes are in different parts of it.
 const SOURCE: &str = r#"
 cbuffer C : register(b0) { uint width; uint height; uint pitch16; uint at16; uint pitch32; uint at32; uint toDepth; uint unused; };
 RWStructuredBuffer<uint> words : register(u0);
 RWByteAddressBuffer buf : register(u1);
-uint d24(uint u) { return u * 256 + (u * 255 + 32767) / 65535; }
-uint u16(uint d) {
-    d &= 0xffffff;
-    uint u = min(d >> 8, 65535);
-    uint best = u;
-    int err = abs((int)d24(u) - (int)d);
-    if (u > 0 && abs((int)d24(u - 1) - (int)d) < err) { best = u - 1; err = abs((int)d24(u - 1) - (int)d); }
-    if (u < 65535 && abs((int)d24(u + 1) - (int)d) < err) { best = u + 1; }
-    return best;
-}
+uint depth(uint u) { return asuint((float)u * asfloat(0x37800080)); }
+uint u16(uint d) { return (uint)(saturate(asfloat(d)) * 65535.0 + 0.5); }
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     uint x = id.x * 2;
@@ -483,8 +516,8 @@ void main(uint3 id : SV_DispatchThreadID) {
     bool two = x + 1 < width;
     if (toDepth != 0) {
         uint pair = words[a / 4];
-        buf.Store(b, d24(pair & 0xffff));
-        if (two) buf.Store(b + 4, d24(pair >> 16));
+        buf.Store(b, depth(pair & 0xffff));
+        if (two) buf.Store(b + 4, depth(pair >> 16));
     } else {
         uint lo = u16(words[b / 4]);
         uint hi = two ? u16(words[b / 4 + 1]) : 0;
@@ -529,6 +562,7 @@ fn compile() -> windows::core::Result<Converter> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::HostGpu;
 
     /// The material-depth frame of Grand Theft Auto VI: written through
     /// unordered views, read as a shader resource in the same list, written
@@ -554,5 +588,57 @@ mod tests {
         assert_eq!(again(DEPTH, &mut last, DEPTH, false), None);
         assert_eq!(again(DEPTH, &mut last, TWIN, true), Some(false));
         assert_eq!(last, Some(TWIN));
+    }
+
+    /// A list that writes a depth texture through its twin and then reads
+    /// its depth side: its prelude owes a copy into the twin first. Every
+    /// barrier the prelude and the list issue starts from the state the
+    /// texture is in, as the debug layer checks (run light21: the prelude's
+    /// copy started from the states the list leaves).
+    #[test]
+    fn prelude_copies_start_from_the_real_states() {
+        use crate::host::tests::{issued, replay};
+        use windows::core::Interface;
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 64,
+            Height: 64,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R16_TYPELESS,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            ..Default::default()
+        };
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation; our out pointer.
+        unsafe { host.device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, None, &mut texture) }.unwrap();
+        let depth = Arc::new(HostTexture::new(texture.unwrap(), DEPTH_WRITE, Vec::new()));
+        let twin = depth.twin.get_or_init(|| make(53, &depth.texture)).as_ref().unwrap();
+        let list = host.new_list().unwrap();
+        issued();
+        assert!(route(&list, &depth, twin, UNORDERED_ACCESS));
+        const PIXEL_SHADER_RESOURCE: u32 = 0x80;
+        assert!(!route(&list, &depth, twin, PIXEL_SHADER_RESOURCE));
+        if let Some(b) = list.move_texture(&depth, PIXEL_SHADER_RESOURCE) {
+            // SAFETY: an open list and a live texture.
+            unsafe { list.list.ResourceBarrier(&[b]) };
+        }
+        list.close();
+        let recorded = issued();
+        host.execute(&[&list]);
+        // The GPU runs the prelude, then the list.
+        let mut run = issued();
+        run.extend(recorded);
+        let key = |t: &HostTexture| t.texture.as_raw() as usize;
+        let mut states = std::collections::HashMap::from([(key(&depth), DEPTH_WRITE), (key(&twin.planes[0]), 0)]);
+        replay(&run, &mut states).unwrap();
+        // What the list left is what the next prelude starts from.
+        assert_eq!(states[&key(&depth)], depth.state.load(Relaxed));
+        assert_eq!(states[&key(&twin.planes[0])], twin.planes[0].state.load(Relaxed));
     }
 }

@@ -11,6 +11,7 @@ use std::ffi::c_void;
 
 use anyhow::{Result, bail};
 use victory_pe::ImageInfo;
+use victory_pe::layout::section_flags;
 use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
 use windows_sys::Win32::System::Memory::{
     MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_READWRITE,
@@ -18,7 +19,6 @@ use windows_sys::Win32::System::Memory::{
 };
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
-const SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 const TLS64_ADDRESS_OF_INDEX: usize = 16;
 /// `mov r64, gs:[0x58]` is `65 REX 8B ModRM 25 58 00 00 00`.
 const LOAD_LEN: usize = 9;
@@ -46,7 +46,7 @@ pub(crate) unsafe fn redirect(base: usize, info: &ImageInfo) -> Result<usize> {
     for section in info
         .sections
         .iter()
-        .filter(|s| s.characteristics & SCN_MEM_EXECUTE != 0)
+        .filter(|s| s.characteristics & section_flags::MEM_EXECUTE != 0)
     {
         let start = base + section.rva as usize;
         let len = section.virtual_size as usize;

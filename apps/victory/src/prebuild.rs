@@ -13,7 +13,7 @@
 //! pipelines there.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -25,6 +25,7 @@ use victory_gpu::pipeline::{self, Prebuild};
 use victory_shader::{Container, FourCC, HwStage, native_programs};
 
 use crate::shader::{MAX_FILE, Source, sources};
+use crate::translate::lock;
 
 /// Where a native program's container is: file, source, and its stage.
 type Found = (usize, usize, HwStage);
@@ -216,7 +217,8 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
     });
     let listed = listed.into_inner();
     if let Some(file) = keys_only {
-        std::fs::write(file, lock(&lines).join("\n"))?;
+        // The listing is game-derived (rule #1): only outside the repo.
+        crate::write_prebuild_keys(Path::new(&file), &lock(&lines).join("\n"))?;
     }
     let mut todo = todo.into_inner().unwrap_or_else(|e| e.into_inner());
     todo.sort_by_key(|&(later, _)| later);
@@ -289,8 +291,4 @@ fn program_ids(bytes: &[u8]) -> Vec<([u8; 24], HwStage)> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
 }

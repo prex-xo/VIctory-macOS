@@ -64,7 +64,8 @@ pub fn ensure_outside_repo(path: &Path) -> Result<(), PolicyError> {
 
 /// Canonicalizes the longest existing prefix of `path` and re-appends the
 /// rest, so that paths which do not exist yet can still be compared.
-fn resolve(path: &Path) -> Result<PathBuf, PolicyError> {
+/// Shared with `config` to compare directories component-wise.
+pub(crate) fn resolve(path: &Path) -> Result<PathBuf, PolicyError> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -83,7 +84,14 @@ fn resolve(path: &Path) -> Result<PathBuf, PolicyError> {
             Ok(canon) => {
                 let mut out = canon;
                 for component in rest.iter().rev() {
-                    out.push(component);
+                    if component == ".." {
+                        out.pop();
+                    } else if component != "." {
+                        out.push(component);
+                    }
+                    if let Ok(resolved) = std::fs::canonicalize(&out) {
+                        out = resolved;
+                    }
                 }
                 return Ok(normalize(&out));
             }

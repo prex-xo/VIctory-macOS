@@ -235,12 +235,7 @@ fn window_limit() -> Option<(i32, i32)> {
     })
 }
 
-fn fit_with_limit(
-    area: &RECT,
-    width: i32,
-    height: i32,
-    limit: Option<(i32, i32)>,
-) -> (i32, i32) {
+fn fit_with_limit(area: &RECT, width: i32, height: i32, limit: Option<(i32, i32)>) -> (i32, i32) {
     let Some((max_width, max_height)) = limit else {
         return fit_into(area, width, height);
     };
@@ -276,7 +271,27 @@ fn stand_in(title: HWND, ex_style: u32, style: u32, x: i32, y: i32, width: i32, 
     if title.is_null() {
         return;
     }
-    let (x, y, width, height) = fit(std::ptr::null_mut(), x, y, width, height);
+    let (x, y, width, height) = if secondary_asked() {
+        let Some(area) = secondary_work_area() else {
+            tracing::error!(
+                "secondary display unavailable or ambiguous; refusing to show title window"
+            );
+            return;
+        };
+        let (w, h) = fit_with_limit(&area, width, height, window_limit());
+        if w <= 0 || h <= 0 || w > area.right - area.left || h > area.bottom - area.top {
+            tracing::error!("title window has no usable size for secondary display");
+            return;
+        }
+        (
+            area.left + (area.right - area.left - w) / 2,
+            area.top + (area.bottom - area.top - h) / 2,
+            w,
+            h,
+        )
+    } else {
+        fit(std::ptr::null_mut(), x, y, width, height)
+    };
     let mut text = vec![0u16; 512];
     // SAFETY: a window this thread just created; the buffer holds 512
     // characters. Its icon, if its class has one.
@@ -306,6 +321,90 @@ fn stand_in(title: HWND, ex_style: u32, style: u32, x: i32, y: i32, width: i32, 
     }
     // SAFETY: the title's window, on the thread that made it.
     unsafe { wm::SetPropW(title, STAND_IN, window) };
+}
+
+/// Whether `VICTORY_WINDOW_SECONDARY` asks for a display: `1` (the only
+/// non-primary one) or `x,y` (the one holding that desktop point).
+pub fn secondary_asked() -> bool {
+    std::env::var("VICTORY_WINDOW_SECONDARY")
+        .is_ok_and(|v| v == "1" || secondary_point(&v).is_some())
+}
+
+/// `x,y` as a desktop point.
+fn secondary_point(v: &str) -> Option<(i32, i32)> {
+    let (x, y) = v.split_once(',')?;
+    Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+}
+
+/// The work area of the display `VICTORY_WINDOW_SECONDARY=x,y` names, or
+/// none if no display holds that point.
+fn work_area_at(x: i32, y: i32) -> Option<RECT> {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MONITOR_DEFAULTTONULL, MONITORINFO, MonitorFromPoint,
+    };
+    // SAFETY: plain queries; the output struct is live.
+    unsafe {
+        let monitor = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONULL);
+        if monitor.is_null() {
+            return None;
+        }
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        (GetMonitorInfoW(monitor, &mut info) != 0).then_some(info.rcWork)
+    }
+}
+
+/// Select the display `VICTORY_WINDOW_SECONDARY` asks for: with `x,y` the
+/// one holding that point (for layouts with several extra displays), else
+/// exactly one non-primary monitor, or refuse an ambiguous layout.
+fn secondary_work_area() -> Option<RECT> {
+    if let Some((x, y)) = std::env::var("VICTORY_WINDOW_SECONDARY")
+        .ok()
+        .as_deref()
+        .and_then(secondary_point)
+    {
+        return work_area_at(x, y);
+    }
+    use windows_sys::Win32::Graphics::Gdi::{
+        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
+    };
+    unsafe extern "system" fn collect(
+        monitor: HMONITOR,
+        _: HDC,
+        _: *mut RECT,
+        data: LPARAM,
+    ) -> i32 {
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: the callback receives a monitor from the OS and a live output struct.
+        if unsafe { GetMonitorInfoW(monitor, &mut info) } == 0 {
+            // SAFETY: data points to the callback's live collection.
+            unsafe { &mut *(data as *mut Vec<Option<RECT>>) }.push(None);
+        } else if info.dwFlags & wm::MONITORINFOF_PRIMARY == 0 {
+            // SAFETY: data points to the callback's live collection.
+            unsafe { &mut *(data as *mut Vec<Option<RECT>>) }.push(Some(info.rcWork));
+        }
+        1
+    }
+    let mut areas: Vec<Option<RECT>> = Vec::new();
+    // SAFETY: the synchronous enumeration passes our live collection to collect.
+    let ok = unsafe {
+        EnumDisplayMonitors(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            Some(collect),
+            (&raw mut areas) as LPARAM,
+        )
+    };
+    if ok == 0 || areas.len() != 1 {
+        return None;
+    }
+    areas.pop().flatten()
 }
 
 /// The stand-in window for `stand_in`, on the calling thread.
@@ -616,6 +715,28 @@ mod tests {
     extern "system" fn noop(_: u8, _: *mut c_void) {}
 
     #[test]
+    #[ignore = "requires exactly two extended displays under Wine"]
+    fn secondary_monitor_has_a_distinct_work_area() {
+        let secondary = secondary_work_area().expect("exactly one secondary monitor");
+        let mut primary = RECT::default();
+        // SAFETY: primary is a valid output rectangle.
+        let queried = unsafe {
+            wm::SystemParametersInfoW(wm::SPI_GETWORKAREA, 0, (&raw mut primary).cast(), 0)
+        };
+        assert_ne!(queried, 0);
+        assert!(
+            secondary.right <= primary.left
+                || secondary.left >= primary.right
+                || secondary.bottom <= primary.top
+                || secondary.top >= primary.bottom
+        );
+        println!(
+            "secondary work area: {},{} to {},{}",
+            secondary.left, secondary.top, secondary.right, secondary.bottom
+        );
+    }
+
+    #[test]
     fn registrations_come_and_go() {
         let (mut a, mut b) = (0, 0);
         assert_eq!(
@@ -689,8 +810,14 @@ mod tests {
             right: 2660,
             bottom: 1490,
         };
-        assert_eq!(fit_with_limit(&area, 3840, 2160, Some((1920, 1080))), (1920, 1080));
-        assert_eq!(fit_with_limit(&area, 640, 480, Some((1920, 1080))), (640, 480));
+        assert_eq!(
+            fit_with_limit(&area, 3840, 2160, Some((1920, 1080))),
+            (1920, 1080)
+        );
+        assert_eq!(
+            fit_with_limit(&area, 640, 480, Some((1920, 1080))),
+            (640, 480)
+        );
         assert_eq!(fit_with_limit(&area, 3840, 2160, None), (2560, 1440));
     }
 
@@ -702,7 +829,10 @@ mod tests {
             right: 1920,
             bottom: 1040,
         };
-        assert_eq!(fit_with_limit(&area, 3840, 2160, Some((2560, 1440))), (1848, 1040));
+        assert_eq!(
+            fit_with_limit(&area, 3840, 2160, Some((2560, 1440))),
+            (1848, 1040)
+        );
         assert_eq!(
             fit_with_limit(&area, wm::CW_USEDEFAULT, 0, Some((1920, 1080))),
             (wm::CW_USEDEFAULT, 0)
@@ -717,7 +847,10 @@ mod tests {
             right: 2560,
             bottom: 1440,
         };
-        assert_eq!(fit_with_limit(&area, 1600, 1200, Some((1920, 1080))), (1440, 1080));
+        assert_eq!(
+            fit_with_limit(&area, 1600, 1200, Some((1920, 1080))),
+            (1440, 1080)
+        );
     }
 
     #[test]
