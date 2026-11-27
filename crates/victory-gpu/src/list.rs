@@ -226,6 +226,35 @@ fn wait(this: This, wait: crate::hold::ValueWait) {
     let _ = (this, wait);
 }
 
+/// An indirect execution's clamp cannot run in the current host list's
+/// prelude, as a command before it may have written its arguments: the
+/// title list goes on in a new host list, as after a wait but with nothing
+/// to wait for, so the clamp, and those after it until the next write, run
+/// in that list's prelude (`crate::indirect::clamp_cuts_enabled`). The
+/// queue runs the host lists in order, so what the commands before wrote
+/// is there when the prelude reads it (its batch starts with an unordered
+/// access barrier).
+///
+/// Clamped inline instead, one compute dispatch between two draws, D3DMetal
+/// ends the render pass for each and starts another after it: a frame of
+/// thousands of indirect draws became thousands of render and compute
+/// encoders. Each host list has a budget of its own (`crate::indirect`).
+/// False if no new host list could be had: the clamp runs inline.
+#[cfg(windows)]
+fn cut_for_clamp(this: This) -> bool {
+    let Some(current) = host_list(this) else { return false };
+    let Some(next) = next_segment(this) else { return false };
+    crate::indirect::note_cut();
+    // SAFETY: the title passes one of our lists.
+    let list = unsafe { &*this.cast::<List>() };
+    let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
+    state.flush_hdr_probe(current);
+    current.close();
+    state.cut(next);
+    next.mark_clamp_cut();
+    true
+}
+
 /// Moves a title list's recording on to its next host list (made, or one
 /// it held since an earlier recording, reset then): that host list.
 #[cfg(windows)]
@@ -1851,9 +1880,19 @@ extern "system" fn execute_indirect(
         } else {
             *kind
         };
+        use crate::draw::Indirect;
+        let mut outcome = Indirect::NotRun;
         with_state(this, |list, s| {
-            ran = s.execute_indirect(list, (kind, stride, max), address, counter);
+            outcome = s.execute_indirect(list, (kind, stride, max), address, counter, true);
         });
+        if outcome == Indirect::CutFirst {
+            // Clamped inline in the same host list if no new one can be had.
+            cut_for_clamp(this);
+            with_state(this, |list, s| {
+                outcome = s.execute_indirect(list, (kind, stride, max), address, counter, false);
+            });
+        }
+        ran = outcome == Indirect::Ran;
     } else {
         #[cfg(all(windows, feature = "diagnostics"))]
         crate::pipeline::note_why(format!(

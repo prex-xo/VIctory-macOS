@@ -1017,6 +1017,7 @@ impl State {
             self.host_pipeline = p.pso.as_raw() as usize;
             // The title may release the pipeline before it submits the list.
             list.bind_pipeline(&p.name, &p.pso, &p.root);
+            list.mark_pipeline(&p.name);
         }
         #[cfg(feature = "diagnostics")]
         crate::capture::binding(&p.name);
@@ -1135,7 +1136,15 @@ impl State {
             // their addresses go into the page table.
             let mut roots = Vec::new();
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                let count = dwords as usize;
+                let mut stack = [0u32; 64];
+                let mut overflow = Vec::new();
+                let values: &mut [u32] = if count <= stack.len() {
+                    &mut stack[..count]
+                } else {
+                    overflow.resize(count, 0);
+                    &mut overflow
+                };
                 for u in &t.host.user_data {
                     if u.root == RootType::Descriptor
                         && u.dword == 0
@@ -2609,6 +2618,16 @@ impl State {
     }
 }
 
+/// What [`State::execute_indirect`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Indirect {
+    Ran,
+    /// Not run on the host (dropped, logged where it was).
+    NotRun,
+    /// Nothing recorded: go on in a new host list and call again.
+    CutFirst,
+}
+
 impl State {
     /// Indirect execution of a one-argument signature of `kind` (PC
     /// numbering: 0 draw, 1 indexed draw, 2 dispatch, 10 mesh dispatch) with
@@ -2616,19 +2635,43 @@ impl State {
     /// record count at `count` if the title gives one: the GPU reads them
     /// from the buffer's host copy, where earlier dispatches may have
     /// written them. False if it cannot run on the host.
+    ///
+    /// `may_cut`: if the clamp cannot be hoisted into `list`'s prelude
+    /// (a command before it may have written the arguments) and a new host
+    /// list would let it be, nothing is recorded and [`Indirect::CutFirst`]
+    /// asks the caller to go on in one (`crate::list::cut_for_clamp`) and
+    /// call again without `may_cut`.
     pub(crate) fn execute_indirect(
         &mut self,
         list: &HostList,
         (kind, stride, max): (u32, u32, u32),
         arguments: u64,
         count: Option<u64>,
-    ) -> bool {
+        may_cut: bool,
+    ) -> Indirect {
+        match self.execute_indirect_in(list, (kind, stride, max), arguments, count, may_cut) {
+            Some(true) => Indirect::Ran,
+            Some(false) => Indirect::NotRun,
+            None => Indirect::CutFirst,
+        }
+    }
+
+    /// [`State::execute_indirect`]: whether it ran, `None` for
+    /// [`Indirect::CutFirst`].
+    fn execute_indirect_in(
+        &mut self,
+        list: &HostList,
+        (kind, stride, max): (u32, u32, u32),
+        arguments: u64,
+        count: Option<u64>,
+        may_cut: bool,
+    ) -> Option<bool> {
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             crate::pipeline::note_drop(self.pipeline as This);
             list.note_op(|| format!("DROPPED indirect kind {kind} (skipped) {}", crate::pipeline::shaders_of(self.pipeline as This)));
-            return false;
+            return Some(false);
         }
         const DRAW: u32 = 0;
         const INDEXED: u32 = 1;
@@ -2652,7 +2695,7 @@ impl State {
         // reason.
         if crate::pipeline::held_back(self.pipeline as This) {
             why("the BVH builder held back");
-            return false;
+            return Some(false);
         }
         // A ray pass with no structure to work on (`VICTORY_RAY_SKIP`,
         // `crate::ray_skip`): left out before its arguments are refreshed
@@ -2665,25 +2708,25 @@ impl State {
                     crate::pipeline::shaders_of(pipeline)
                 )
             });
-            return true;
+            return Some(true);
         }
         if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             why("no host pipeline");
-            return false;
+            return Some(false);
         }
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find(arguments, len) else {
             why("arguments outside title buffers");
-            return false;
+            return Some(false);
         };
         let counter = match count {
             Some(at) => match crate::shadow::find(at, 4) {
                 Some(s) => Some((s, at)),
                 None => {
                     why("count outside title buffers");
-                    return false;
+                    return Some(false);
                 }
             },
             None => None,
@@ -2693,23 +2736,37 @@ impl State {
             .flatten()
         else {
             why("no host signature");
-            return false;
+            return Some(false);
         };
         let args_gpu = args.gpu(arguments);
         if !crate::indirect::available() || !args_gpu.is_multiple_of(4) || !stride.is_multiple_of(4)
         {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
-            return false;
+            return Some(false);
+        }
+        // Decide hoisting before `prepare`/`bind`, which record *this* call's
+        // own GPU writes (those only constrain subsequent indirect calls),
+        // and before anything of this call is recorded, so a cut leaves
+        // nothing of it behind.
+        let blocker = if crate::indirect::batch_clamps_enabled() {
+            list.clamp_blocker(arguments, len, count)
+        } else {
+            None
+        };
+        let hoist = crate::indirect::batch_clamps_enabled() && blocker.is_none();
+        if !hoist
+            && may_cut
+            && blocker.is_some()
+            && crate::indirect::clamp_cuts_enabled()
+            && list.clamp_cut_pays()
+        {
+            return None;
         }
         args.refresh(list, arguments, len);
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
         let counted = counter.as_ref().map(|(s, at)| s.gpu(*at));
-        // Decide hoisting before `prepare`/`bind`, which record *this* call's
-        // own GPU writes (those only constrain subsequent indirect calls).
-        let hoist = crate::indirect::batch_clamps_enabled()
-            && list.can_hoist_clamp(arguments, len, count);
         let inline_clamped = if hoist {
             None
         } else {
@@ -2719,9 +2776,10 @@ impl State {
                 crate::indirect::bound(list, args_gpu, (kind, stride, max), counted)
             else {
                 why("not bounded (no clamp, or arguments not 4-byte aligned)");
-                return false;
+                return Some(false);
             };
             list.note_inline_clamp();
+            crate::indirect::note_inline(blocker);
             self.host_pipeline = 0;
             self.host_roots[1] = 0;
             Some(clamped)
@@ -2757,7 +2815,7 @@ impl State {
                     NOT_RUN.with(|w| w.replace(""))
                 )),
             }
-            return false;
+            return Some(false);
         }
         let (clamped, dst_offset, needs_done) = match inline_clamped {
             Some(clamped) => (clamped, 0, true),
@@ -2766,7 +2824,7 @@ impl State {
                     crate::indirect::enqueue(list, args_gpu, (kind, stride, max), counted)
                 else {
                     why("not bounded (no hoisted argument buffer)");
-                    return false;
+                    return Some(false);
                 };
                 (clamped, dst_offset, false)
             }
@@ -2820,7 +2878,7 @@ impl State {
             self.note_hdr_draw();
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
-        true
+        Some(true)
     }
 }
 
@@ -2890,9 +2948,9 @@ fn readable_entry(list: &HostList, u: &UsedResource, view: &View, marked: bool, 
     // Constant buffers (raw views) to their copy's end at most; others in
     // the copy their host view reads.
     let range = match *view {
-        View::Constant(address, size) => crate::shadow::find(address, 1).and_then(|s| {
+        View::Constant(address, size) => crate::shadow::find(address, 1).map(|s| {
             let len = u64::from(size).min(s.left(address));
-            crate::shadow::find(address, len).map(|s| (s, address, len))
+            (s, address, len)
         }),
         _ => crate::descriptor::host::view_copy(view),
     };

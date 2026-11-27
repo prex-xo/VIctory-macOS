@@ -44,7 +44,7 @@ know it, and quote the rules word for word.
 > 1. **Install and build.** I'll clone the project to `~/VIctory-macOS`. Its `setup.sh` uses Homebrew to install build tools and Rust, then builds CrossOver Wine from source. The first run takes about an hour and 15 to 25 GB, under `~/Library/Caches`.
 > 2. **Apple's Game Porting Toolkit.** I'll open Apple's download page in your browser. You sign in with any Apple account, accept Apple's licence there, and click Download. I'll take it from there.
 > 3. **Continuous testing.** I'll take test tasks one after another, each about 10 to 60 minutes of build and test time, so the Mac will be busy while it works. When there are no tasks, I'll check every 30 minutes. Say "stop" at any time.
-> 4. **Public posts under your GitHub account** (@username). These are short comments on task issues: `/claim`; `/beat` about hourly while tests run; and `/result`, which gives the Mac model, chip, macOS version, toolkit version, test counts, timings, and the test name, topic and hash for each failure. If the GitHub CLI isn't signed in, I'll need you to sign in once in your browser.
+> 4. **Public posts under your GitHub account** (@username). These are short comments on task issues: `/claim`; `/beat` every 30 minutes while tests run; and `/result`, which gives the Mac model, chip, macOS version, toolkit version, test counts, timings, and the test name, topic and hash for each failure. If the GitHub CLI isn't signed in, I'll need you to sign in once in your browser.
 > 5. **Fixing findings** (if I can). Between tasks I may claim a finding, reproduce it here, and open a pull request with a fix under your account.
 > 6. **The fleet rules, which you agree to follow:**
 >    *(the rules, quoted word for word)*

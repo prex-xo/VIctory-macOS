@@ -1264,6 +1264,39 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn keep_deduplicates_repeated_objects_until_reset() {
+        let Some(host) = host() else { return };
+        let Ok(list) = host.new_list() else { return };
+        let Some((a, _)) = host.mapped_buffer(256, false) else {
+            list.close();
+            return;
+        };
+        let Some((b, _)) = host.mapped_buffer(256, false) else {
+            list.close();
+            return;
+        };
+
+        list.keep(&a);
+        list.keep(&a);
+        assert_eq!(list.deferred().kept.len(), 1);
+        assert_eq!(list.deferred().kept_ptrs.len(), 1);
+
+        list.keep(&b);
+        assert_eq!(list.deferred().kept.len(), 2);
+        assert_eq!(list.deferred().kept_ptrs.len(), 2);
+
+        list.close();
+        list.reset();
+        assert!(list.deferred().kept.is_empty());
+        assert!(list.deferred().kept_ptrs.is_empty());
+
+        list.keep(&a);
+        assert_eq!(list.deferred().kept.len(), 1);
+        assert_eq!(list.deferred().kept_ptrs.len(), 1);
+        list.close();
+    }
+
+    #[test]
     fn fill_scratch_reuses_upload_until_title_copy_and_reset() {
         let Some(host) = host() else { return };
         let Ok(list) = host.new_list() else { return };
@@ -1502,6 +1535,8 @@ pub(crate) struct HostList {
     /// The draw or dispatch being recorded runs a program using title
     /// memory ([`HostList::writer_uses_memory`]).
     memory_writer: std::sync::atomic::AtomicBool,
+    /// A marker group for the bound pipeline is open ([`markers`]).
+    marked: std::sync::atomic::AtomicBool,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
@@ -1576,6 +1611,17 @@ fn timing() -> bool {
 fn split_uav_srv_prelude() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| crate::switch::on("VICTORY_GPU_SPLIT_UAV_SRV_PRELUDE"))
+}
+
+/// Whether host lists group each title pipeline's commands in a marker
+/// group named by its shaders (`VICTORY_GPU_MARKERS=1`), so that a GPU
+/// capture or trace of the host can tell them apart: D3D12 timestamps all
+/// read 0 under D3DMetal, so `VICTORY_GPU_TIMING` cannot time them on a
+/// Mac. Whether a tool shows the groups is up to the host's driver (on a
+/// Mac, D3DMetal's debug groups); off, nothing is recorded.
+pub(crate) fn markers() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_GPU_MARKERS"))
 }
 
 /// Names a host object for the device-removed report, which names the
@@ -1658,6 +1704,10 @@ const FIRST_SCRATCH_CHUNK: u64 = 64 << 10;
 const ARGUMENT_CHUNK_FIRST: u64 = 64 << 10;
 const ARGUMENT_CHUNK_MAX: u64 = 4 << 20;
 const MAX_HAZARD_RANGES: usize = 256;
+/// Clamps a list started for a clamp must hoist before another is cut for
+/// ([`HostList::clamp_cut_pays`]): with one, the cut cost what clamping
+/// inline would have.
+const CUT_PAYS: usize = 2;
 
 struct ArgumentChunk {
     buffer: ID3D12Resource,
@@ -1670,6 +1720,19 @@ struct ArgumentChunk {
 /// their argument range nor their count word could have been written earlier
 /// in the same list, and preserves sequential budget order once any inline
 /// clamp has run.
+/// Why an indirect argument clamp cannot run in its list's prelude.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClampBlock {
+    /// An earlier command of the list may write any title buffer (heap
+    /// views, title memory).
+    Unknown,
+    /// An earlier command of the list writes the arguments or the count.
+    Overlap,
+    /// An earlier clamp of the list ran inline (the budget is charged in
+    /// recorded order).
+    AfterInline,
+}
+
 #[derive(Default)]
 pub(crate) struct WriteHazard {
     /// Sorted, disjoint, non-empty half-open title address ranges `[start, end)`.
@@ -1736,19 +1799,29 @@ impl WriteHazard {
         pos < self.ranges.len() && self.ranges[pos].0 < end
     }
 
+    #[cfg(test)]
     pub(crate) fn can_hoist(&self, arguments: u64, len: u64, count: Option<u64>) -> bool {
-        if self.inline_used || self.unknown {
-            return false;
+        self.blocker(arguments, len, count).is_none()
+    }
+
+    /// What keeps a clamp of `[arguments, arguments + len)` (and the
+    /// 4-byte `count`) out of the prelude, if anything.
+    pub(crate) fn blocker(
+        &self,
+        arguments: u64,
+        len: u64,
+        count: Option<u64>,
+    ) -> Option<ClampBlock> {
+        if self.inline_used {
+            return Some(ClampBlock::AfterInline);
         }
-        if self.overlaps(arguments, len) {
-            return false;
+        if self.unknown {
+            return Some(ClampBlock::Unknown);
         }
-        if let Some(at) = count
-            && self.overlaps(at, 4)
-        {
-            return false;
+        if self.overlaps(arguments, len) || count.is_some_and(|at| self.overlaps(at, 4)) {
+            return Some(ClampBlock::Overlap);
         }
-        true
+        None
     }
 
     pub(crate) fn clear(&mut self) {
@@ -1768,6 +1841,9 @@ struct HoistedClamps {
     pending: Vec<crate::indirect::PendingClamp>,
     budget_gpu: u64,
     hazard: WriteHazard,
+    /// The list was started for a clamp that could not run in the prelude
+    /// of the one before it (`crate::list::cut_for_clamp`).
+    cut: bool,
 }
 
 impl HoistedClamps {
@@ -1832,6 +1908,8 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// Raw COM pointers already pushed into [`Self::kept`] by [`HostList::keep`].
+    kept_ptrs: std::collections::HashSet<usize, std::hash::BuildHasherDefault<PtrHasher>>,
     /// Pipelines [`HostList::bind_pipeline`] already kept and noted since reset.
     bound_pipelines: std::collections::HashSet<usize>,
     /// Unaligned root-CBV scratch copies (`(source, bytes)` → host GPU address)
@@ -1861,6 +1939,12 @@ struct Deferred {
     waits: Vec<crate::hold::ValueWait>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// Whether `copies` contains any `Step::Heap`, `Step::Texture`, or
+    /// `Step::GpuWrite` steps, letting submission prep and completion skip
+    /// scanning `copies` for lists that have none.
+    has_heaps: bool,
+    has_textures: bool,
+    has_gpu_writes: bool,
     /// Work done once the list has run, before the bottom-of-pipe writes
     /// (title memory shaders wrote at addresses they computed goes back).
     after: Vec<Box<dyn Fn() + Send>>,
@@ -2032,6 +2116,7 @@ impl HostGpu for Host {
                 budget: OnceLock::new(),
                 arguments: Mutex::new(None),
                 clamps: Mutex::default(),
+                marked: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -2328,35 +2413,27 @@ impl Host {
         crate::descriptor::sync_heaps();
         #[cfg(feature = "diagnostics")]
         drop(syncing);
-        // Textures heap-indexing shaders may read, uploaded first by a list
-        // of ours where their title memory changed.
-        let heaps: Vec<std::sync::Arc<crate::bindless::Viewed>> = runs
-            .iter()
-            .flat_map(|l| {
-                l.deferred()
-                    .copies
-                    .iter()
-                    .filter_map(|s| match s {
-                        Step::Heap(v) => Some(v.clone()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        // And textures read through tables, uploaded by the same list.
-        let textures: Vec<_> = runs
-            .iter()
-            .flat_map(|l| {
-                l.deferred()
-                    .copies
-                    .iter()
-                    .filter_map(|s| match s {
-                        Step::Texture(staging, copy) => Some((staging.clone(), copy.clone())),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+        // Textures heap-indexing shaders may read, and textures read through
+        // tables, uploaded first by a list of ours where their title memory
+        // changed.
+        let mut heaps: Vec<std::sync::Arc<crate::bindless::Viewed>> = Vec::new();
+        let mut textures: Vec<(
+            std::sync::Arc<crate::texture::Staging>,
+            std::sync::Arc<crate::resource::HostTexture>,
+        )> = Vec::new();
+        for list in runs {
+            let deferred = list.deferred();
+            if !deferred.has_heaps && !deferred.has_textures {
+                continue;
+            }
+            for step in &deferred.copies {
+                match step {
+                    Step::Heap(v) => heaps.push(v.clone()),
+                    Step::Texture(staging, copy) => textures.push((staging.clone(), copy.clone())),
+                    _ => {}
+                }
+            }
+        }
         // Every submission, not only those with textures to bring up: the
         // staging pools and the upload list (it holds what the last
         // submission staged) age on each one (`uploads`), and so do the
@@ -2572,6 +2649,9 @@ impl Host {
         let withholding = crate::memory::withholding();
         for (list, &missed) in runs.iter().zip(&missed) {
             let deferred = list.deferred();
+            if !deferred.has_gpu_writes {
+                continue;
+            }
             let missed = missed || withholding && !deferred.missed.is_empty();
             for step in &deferred.copies {
                 if let Step::GpuWrite(shadow, address, len, _, memory) = step {
@@ -3219,6 +3299,7 @@ impl HostList {
         self.textures_back();
         self.widen_close();
         self.hoisted_clamps_close();
+        self.end_marker();
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
             fail(format_args!(
@@ -3230,7 +3311,12 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
-        *self.deferred() = Deferred::default();
+        let texture_backs = {
+            let mut deferred = self.deferred();
+            let backs = std::mem::take(&mut deferred.texture_backs);
+            *deferred = Deferred::default();
+            backs
+        };
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.widened_writes.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -3251,6 +3337,7 @@ impl HostList {
         self.targets.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.trim_scratch();
         self.reset_hoisted_clamps();
+        self.marked.store(false, Ordering::Relaxed);
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -3259,6 +3346,11 @@ impl HostList {
         };
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
+        }
+        // Recycle readback buffers only once the command allocator and list
+        // have reset cleanly so no live command list still references them.
+        for back in texture_backs {
+            back.recycle();
         }
         self.changed_deferred();
     }
@@ -3441,6 +3533,15 @@ impl HostList {
             .texture_backs
             .iter()
             .map(crate::texback::Back::range)
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn texture_back_raw_ptrs_for_test(&self) -> Vec<usize> {
+        self.deferred()
+            .texture_backs
+            .iter()
+            .map(crate::texback::Back::raw_resource_ptr)
             .collect()
     }
 
@@ -3827,6 +3928,31 @@ impl HostList {
 
     /// Keeps `pso` and `root` alive until the list is reset and records `name`,
     /// deduplicated per pipeline pointer until reset.
+    /// With [`markers`] on: the commands from here to the next pipeline
+    /// bound (or the end of the list) in a marker group named `name`, the
+    /// title pipeline's shaders.
+    pub(crate) fn mark_pipeline(&self, name: &str) {
+        if !markers() {
+            return;
+        }
+        self.end_marker();
+        let text: Vec<u16> = name.encode_utf16().chain([0]).collect();
+        const UNICODE: u32 = 0;
+        // SAFETY: an open list; the text is copied when recorded.
+        unsafe {
+            self.list
+                .BeginEvent(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
+        };
+        self.marked.store(true, Ordering::Relaxed);
+    }
+
+    fn end_marker(&self) {
+        if self.marked.swap(false, Ordering::Relaxed) {
+            // SAFETY: an open list with the group `mark_pipeline` began.
+            unsafe { self.list.EndEvent() };
+        }
+    }
+
     pub(crate) fn bind_pipeline(&self, name: &str, pso: &ID3D12PipelineState, root: &ID3D12RootSignature) {
         {
             let mut deferred = self.deferred();
@@ -3929,9 +4055,13 @@ impl HostList {
         marked: bool,
     ) {
         let memory = self.memory_writer.load(Ordering::Relaxed);
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len, marked, memory));
+        {
+            let mut deferred = self.deferred();
+            deferred.has_gpu_writes = true;
+            deferred
+                .copies
+                .push(Step::GpuWrite(shadow.clone(), address, len, marked, memory));
+        }
         self.clamps
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -3962,12 +4092,43 @@ impl HostList {
     /// Whether an indirect execution reading `[arguments, arguments + len)`
     /// (and optional 4-byte `count`) has no earlier conflicting GPU write or
     /// inline clamp in this list and may be clamped in `prelude`.
+    #[cfg(test)]
     pub(crate) fn can_hoist_clamp(&self, arguments: u64, len: u64, count: Option<u64>) -> bool {
+        self.clamp_blocker(arguments, len, count).is_none()
+    }
+
+    /// What keeps the clamp of an indirect execution reading
+    /// `[arguments, arguments + len)` (and the 4-byte `count`) out of
+    /// `prelude`: `None` if it may be hoisted there.
+    pub(crate) fn clamp_blocker(
+        &self,
+        arguments: u64,
+        len: u64,
+        count: Option<u64>,
+    ) -> Option<ClampBlock> {
         self.clamps
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .hazard
-            .can_hoist(arguments, len, count)
+            .blocker(arguments, len, count)
+    }
+
+    /// The list was started for a clamp the list before it could not
+    /// hoist (`crate::list::cut_for_clamp`).
+    pub(crate) fn mark_clamp_cut(&self) {
+        self.clamps.lock().unwrap_or_else(|e| e.into_inner()).cut = true;
+    }
+
+    /// Whether a clamp this list cannot hoist is worth a new list of its
+    /// own: always, unless this list was itself started for a clamp and
+    /// took fewer than [`CUT_PAYS`] into its prelude before the next write
+    /// blocked one. Such a cut bought nothing over clamping inline (one
+    /// compute pass and one restarted render pass either way), and a title
+    /// that writes before every execution would cut before every one, so
+    /// the rest of the list clamps inline as before.
+    pub(crate) fn clamp_cut_pays(&self) -> bool {
+        let clamps = self.clamps.lock().unwrap_or_else(|e| e.into_inner());
+        !clamps.cut || clamps.pending.len() >= CUT_PAYS
     }
 
     /// Allocates a 16-byte-aligned slice of `bytes` in this list's hoisted
@@ -4063,6 +4224,7 @@ impl HostList {
             clamps.pending.clear();
             clamps.budget_gpu = 0;
             clamps.hazard.clear();
+            clamps.cut = false;
             let kept = (clamps.touched + 1).min(clamps.chunks.len());
             let spent_chunks = clamps.chunks.split_off(kept);
             let spent_oversized = std::mem::take(&mut clamps.oversized);
@@ -4086,6 +4248,7 @@ impl HostList {
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(viewed) as usize, usize::MAX, 0);
         if deferred.refreshed.insert(key) {
+            deferred.has_heaps = true;
             deferred.copies.push(Step::Heap(viewed.clone()));
         }
     }
@@ -4344,8 +4507,16 @@ impl HostList {
 
     /// Keeps `object` alive until the list is reset.
     pub(crate) fn keep(&self, object: &impl Interface) {
-        if let Ok(object) = object.cast::<windows::core::IUnknown>() {
-            self.deferred().kept.push(object);
+        let raw = object.as_raw() as usize;
+        let mut deferred = self.deferred();
+        if !deferred.kept_ptrs.insert(raw) {
+            return;
+        }
+        match object.cast::<windows::core::IUnknown>() {
+            Ok(object) => deferred.kept.push(object),
+            Err(_) => {
+                deferred.kept_ptrs.remove(&raw);
+            }
         }
     }
 
@@ -4378,7 +4549,9 @@ impl HostList {
         staging: std::sync::Arc<crate::texture::Staging>,
         copy: std::sync::Arc<crate::resource::HostTexture>,
     ) {
-        self.deferred().copies.push(Step::Texture(staging, copy));
+        let mut deferred = self.deferred();
+        deferred.has_textures = true;
+        deferred.copies.push(Step::Texture(staging, copy));
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
@@ -4475,11 +4648,15 @@ impl HostList {
                 // Brought up to date before the submission's lists were made.
                 Step::Texture(..) => continue,
                 Step::Heap(viewed) => {
-                    crate::bindless::refresh(viewed, |s, a, l| batch.add(s, a, l));
+                    if batch.need_heap(viewed) {
+                        crate::bindless::refresh(viewed, |s, a, l| batch.add(s, a, l));
+                    }
                     continue;
                 }
                 &Step::Memory(heap) => {
-                    crate::memory::prepare(heap, |s, a, l| batch.add(s, a, l));
+                    if batch.need_memory(heap) {
+                        crate::memory::prepare(heap, |s, a, l| batch.add(s, a, l));
+                    }
                     continue;
                 }
             };
@@ -4531,6 +4708,8 @@ struct BatchBuffers {
     current: PtrMap<(std::sync::Arc<crate::shadow::Shadow>, crate::ranges::Ranges)>,
     extents: victory_formats::extents::Extents,
     pending_extents: victory_formats::extents::Extents,
+    heaps_seen: Vec<(usize, u64)>,
+    memories_seen: Vec<(usize, u64)>,
 }
 
 static BATCH_POOL: Mutex<Vec<BatchBuffers>> = Mutex::new(Vec::new());
@@ -4556,6 +4735,12 @@ struct Batch {
     /// As `extents`, for the copies whose refreshes are still pending: a
     /// title copy flushes only the ones its bytes can be in.
     pending_extents: victory_formats::extents::Extents,
+    /// Bindless heaps (`(viewed_ptr, hull_generation)`) already refreshed
+    /// since the last title write or copy.
+    heaps_seen: Vec<(usize, u64)>,
+    /// Title-memory page tables (`(heap_key, shadow_generation)`) already
+    /// prepared since the last title write or copy.
+    memories_seen: Vec<(usize, u64)>,
 }
 
 /// How far apart a copy's pending ranges may be and still be done as one,
@@ -4571,7 +4756,13 @@ impl Drop for Batch {
         self.current.clear();
         self.extents.clear();
         self.pending_extents.clear();
-        if self.current.capacity() == 0 && self.pending.capacity() == 0 {
+        self.heaps_seen.clear();
+        self.memories_seen.clear();
+        if self.current.capacity() == 0
+            && self.pending.capacity() == 0
+            && self.heaps_seen.capacity() == 0
+            && self.memories_seen.capacity() == 0
+        {
             return;
         }
         let mut pool = BATCH_POOL.lock().unwrap_or_else(|e| e.into_inner());
@@ -4582,6 +4773,8 @@ impl Drop for Batch {
                 current: std::mem::take(&mut self.current),
                 extents: std::mem::take(&mut self.extents),
                 pending_extents: std::mem::take(&mut self.pending_extents),
+                heaps_seen: std::mem::take(&mut self.heaps_seen),
+                memories_seen: std::mem::take(&mut self.memories_seen),
             });
         }
     }
@@ -4600,7 +4793,35 @@ impl Batch {
             summary: Default::default(),
             extents: buffers.extents,
             pending_extents: buffers.pending_extents,
+            heaps_seen: buffers.heaps_seen,
+            memories_seen: buffers.memories_seen,
         }
+    }
+
+    fn need_heap(&mut self, viewed: &crate::bindless::Viewed) -> bool {
+        let key = (std::ptr::from_ref(viewed) as usize, viewed.hull_generation());
+        if self.heaps_seen.contains(&key) {
+            return false;
+        }
+        if let Some(entry) = self.heaps_seen.iter_mut().find(|(p, _)| *p == key.0) {
+            entry.1 = key.1;
+        } else {
+            self.heaps_seen.push(key);
+        }
+        true
+    }
+
+    fn need_memory(&mut self, heap: usize) -> bool {
+        let key = (heap, crate::shadow::generation());
+        if self.memories_seen.contains(&key) {
+            return false;
+        }
+        if let Some(entry) = self.memories_seen.iter_mut().find(|(h, _)| *h == heap) {
+            entry.1 = key.1;
+        } else {
+            self.memories_seen.push(key);
+        }
+        true
     }
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         // Nothing to copy: a world submission asks for every copy its heaps'
@@ -4647,6 +4868,8 @@ impl Batch {
         self.flush();
         self.current.clear();
         self.extents.clear();
+        self.heaps_seen.clear();
+        self.memories_seen.clear();
     }
 
     /// As [`Batch::title_written`], before a copy into the title memory
@@ -4666,6 +4889,11 @@ impl Batch {
         if from >= to {
             return;
         }
+        // A non-aliased copy still marks its destination shadow dirty, so
+        // subsequent `Step::Heap` and `Step::Memory` steps must re-scan to
+        // pick up the post-copy bytes.
+        self.heaps_seen.clear();
+        self.memories_seen.clear();
         // Flush only pending refreshes whose ranges overlap the destination
         // window; disjoint copies stay queued so they coalesce across lists.
         // The index reaches the copies whose memory can hold the window's
@@ -5606,6 +5834,9 @@ impl Meter {
                 crate::indirect::take_records().map(|n| n as f64 / report_frames);
             let [hoisted, inline] =
                 crate::indirect::take_clamps().map(|n| n as f64 / report_frames);
+            let [anywhere, theirs, after_inline, unbatched] =
+                crate::indirect::take_inline_why().map(|n| n as f64 / report_frames);
+            let clamp_cuts = crate::indirect::take_cuts() as f64 / report_frames;
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
@@ -5613,7 +5844,10 @@ impl Meter {
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame; indirect \
                  max records {records:.0}/frame ({counted:.0} under a count; clamps \
-                 {hoisted:.0} hoisted, {inline:.0} inline)",
+                 {hoisted:.0} hoisted, {inline:.0} inline: {anywhere:.0} after a write \
+                 anywhere, {theirs:.0} after a write of theirs, {after_inline:.0} after an \
+                 inline one, {unbatched:.0} unbatched; {clamp_cuts:.1} host lists started \
+                 for clamps)",
                 making = crate::pipeline::making()
             );
             crate::ray_skip::log(report_frames);
@@ -7029,6 +7263,111 @@ mod withholding {
             drop(copy);
             crate::watch::tests::free(p);
         }
+    }
+
+    /// `Batch` deduplicates repeat `Step::Heap` and `Step::Memory` walks across
+    /// lists in a submission while nothing changed, and re-runs them after
+    /// `title_written`, a non-aliased `Step::Copy` (`title_copied`), or a
+    /// hull/shadow generation change.
+    #[test]
+    fn batch_deduplicates_heap_and_memory_steps_until_title_write_or_copy() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let p_src = crate::watch::tests::pool(1);
+        let p_dst = crate::watch::tests::pool(1);
+        let page = crate::watch::PAGE;
+
+        // Unit check on Batch::need_heap / need_memory / title_written / title_copied / Drop pool.
+        let viewed = std::sync::Arc::new(crate::bindless::Viewed::default());
+        let mut batch = super::Batch::default();
+        assert!(batch.need_heap(&viewed));
+        assert!(!batch.need_heap(&viewed), "repeat heap in same batch skipped");
+        assert!(batch.need_memory(0x1000));
+        assert!(!batch.need_memory(0x1000), "repeat memory heap skipped");
+        batch.title_written();
+        assert!(batch.need_heap(&viewed), "re-checked after title_written");
+        assert!(batch.need_memory(0x1000), "re-checked after title_written");
+        assert!(!batch.need_heap(&viewed));
+        assert!(!batch.need_memory(0x1000));
+        // Non-aliased title_copied must also clear heaps_seen and memories_seen.
+        assert!(!crate::watch::aliased(p_dst, 64));
+        batch.title_copied(p_dst, 64);
+        assert!(batch.need_heap(&viewed), "re-checked after non-aliased title_copied");
+        assert!(batch.need_memory(0x1000), "re-checked after non-aliased title_copied");
+        // Recycled batch buffers must start with empty seen lists.
+        drop(batch);
+        let mut recycled = super::Batch::take();
+        assert!(recycled.need_heap(&viewed));
+        assert!(recycled.need_memory(0x1000));
+        drop(recycled);
+
+        // End-to-end check: list 0 has Step::Heap then non-aliased Step::Copy into p_dst;
+        // list 1 has Step::Heap and must re-check the heap and pick up the post-Copy bytes.
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 4, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(
+            crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap),
+            0
+        );
+        let title_heap = crate::descriptor::heap(heap);
+        let buf_desc: [u32; 14] = [1, 0, 0, 0, page as u32, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+        let res_iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let mut buf_obj = null;
+        assert_eq!(
+            crate::resource::create_at_address(
+                null,
+                p_dst as u64,
+                buf_desc.as_ptr().cast(),
+                0,
+                std::ptr::null(),
+                &res_iid,
+                &mut buf_obj
+            ),
+            0
+        );
+        let srv: [u32; 10] = [39, 1, 0x1688, 0, 0, 0, 16, 0, 1, 0];
+        crate::descriptor::create_srv(null, buf_obj, &srv, title_heap.start);
+        let heap_host = title_heap.host().expect("host view heap");
+        let _ = heap_host.mirror(0, title_heap.start, false);
+        let dst_copy = crate::shadow::find(p_dst as u64, page as u64).expect("host copy of p_dst");
+
+        // SAFETY: our pool allocations.
+        unsafe {
+            (p_src as *mut u32).write_volatile(0xCAFE_BABE);
+            (p_dst as *mut u32).write_volatile(0x1111_2222);
+        }
+        let l0 = host.new_list().unwrap();
+        let l1 = host.new_list().unwrap();
+        l0.defer_heap(&heap_host.viewed);
+        l0.defer_copy(p_dst as *mut u8, p_src as *const u8, 16);
+        l1.defer_heap(&heap_host.viewed);
+        l0.close();
+        l1.close();
+        host.execute(&[&l0, &l1]);
+        assert_eq!(
+            dst_copy.read_host(p_dst as u64, 1)[0],
+            0xCAFE_BABE,
+            "second list's Step::Heap refreshes bytes written by first list's non-aliased Step::Copy"
+        );
+
+        drop(dst_copy);
+        crate::object::release_ref(buf_obj);
+        crate::object::release_ref(heap);
+        crate::watch::tests::free(p_src);
+        crate::watch::tests::free(p_dst);
     }
 }
 

@@ -133,8 +133,26 @@ pub fn read_frame(data: &[u8], start: usize) -> Option<Frame> {
     }
     let mut out = Vec::with_capacity(bits.div_ceil(8));
     let mut cursor = Cursor { data, pos: start };
-    for _ in 0..bits / 8 {
-        out.push(cursor.byte()?);
+    while out.len() < bits / 8 {
+        let in_packet = cursor.pos % PACKET_BITS;
+        if in_packet != 0 && in_packet <= PACKET_BITS - 8 {
+            let count = (bits / 8 - out.len()).min((PACKET_BITS - in_packet) / 8);
+            let at = cursor.pos / 8;
+            let shift = cursor.pos % 8;
+            if shift == 0 {
+                out.extend_from_slice(cursor.data.get(at..at + count)?);
+            } else {
+                let source = cursor.data.get(at..at + count + 1)?;
+                out.extend(
+                    source
+                        .windows(2)
+                        .map(|pair| (pair[0] << shift) | (pair[1] >> (8 - shift))),
+                );
+            }
+            cursor.pos += count * 8;
+        } else {
+            out.push(cursor.byte()?);
+        }
     }
     let tail = (bits % 8) as u32;
     if tail != 0 {
@@ -201,8 +219,12 @@ struct Bits<'a> {
 
 impl Bits<'_> {
     fn peek32(&self) -> u32 {
-        let mut v = 0u64;
         let byte = self.pos / 8;
+        if let Some(bytes) = self.data.get(byte..).and_then(|b| b.get(..8)) {
+            let word = u64::from_be_bytes(bytes.try_into().expect("eight bytes"));
+            return (word >> (32 - self.pos % 8)) as u32;
+        }
+        let mut v = 0u64;
         for i in 0..5 {
             v = v << 8 | *self.data.get(byte + i).unwrap_or(&0) as u64;
         }
@@ -240,6 +262,7 @@ impl Bits<'_> {
 struct Vlc {
     /// Left-aligned code, length, symbol; sorted by code.
     codes: Vec<(u32, u8, i32)>,
+    short: [u16; 256],
 }
 
 impl Vlc {
@@ -250,12 +273,24 @@ impl Vlc {
             codes.push((code as u32, len, symbol));
             code += 1 << (32 - len);
         }
-        Vlc { codes }
+        let mut short = [u16::MAX; 256];
+        for (index, &(code, len, _)) in codes.iter().enumerate() {
+            if len <= 8 {
+                let first = (code >> 24) as usize;
+                short[first..first + (1 << (8 - len))].fill(index as u16);
+            }
+        }
+        Vlc { codes, short }
     }
 
     fn read(&self, bits: &mut Bits) -> i32 {
         let v = bits.peek32();
-        let i = self.codes.partition_point(|c| c.0 <= v) - 1;
+        let short = self.short[(v >> 24) as usize];
+        let i = if short != u16::MAX {
+            usize::from(short)
+        } else {
+            self.codes.partition_point(|c| c.0 <= v) - 1
+        };
         let (_, len, symbol) = self.codes[i];
         bits.pos += len as usize;
         symbol
@@ -1188,12 +1223,15 @@ fn windows() -> &'static [Vec<f32>; 3] {
 /// the previous block's tail, the second half the current block's head.
 fn window_overlap(block: &mut [f32], window: &[f32]) {
     let len = block.len() / 2;
-    for k in 0..len {
-        let (i, j) = (k, 2 * len - 1 - k);
-        let (s0, s1) = (block[i], block[2 * len - 1 - k]);
-        let (wi, wj) = (window[i], window[j]);
-        block[i] = s0 * wj - s1 * wi;
-        block[j] = s0 * wi + s1 * wj;
+    let (left, right) = block[..2 * len].split_at_mut(len);
+    let lanes = left
+        .iter_mut()
+        .zip(right.iter_mut().rev())
+        .zip(window[..len].iter().zip(window[len..2 * len].iter().rev()));
+    for ((a, b), (&wi, &wj)) in lanes {
+        let (s0, s1) = (*a, *b);
+        *a = s0 * wj - s1 * wi;
+        *b = s0 * wi + s1 * wj;
     }
 }
 
@@ -1274,6 +1312,78 @@ mod tests {
                     .sum::<f64>() as f32)
             })
             .collect()
+    }
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn perf_vlc() {
+        use std::{hint::black_box, time::Instant};
+        let tables = codes();
+        for (name, vlc) in [
+            ("scale", &tables.scale),
+            ("coef", &tables.coef[0]),
+            ("coef_long", &tables.coef[0]),
+        ] {
+            let long: Vec<u32> = vlc.codes.iter().filter(|c| c.1 > 8).map(|c| c.0).collect();
+            let mut samples = Vec::new();
+            for round in 0..35 {
+                let start = Instant::now();
+                let mut sum = 0i32;
+                for i in 0..32768usize {
+                    let code = if name == "coef_long" {
+                        long[i % long.len()]
+                    } else {
+                        (i as u32).wrapping_mul(2654435761)
+                    };
+                    let value = code.to_be_bytes();
+                    let mut bits = Bits {
+                        data: black_box(&value),
+                        pos: 0,
+                        end: 32,
+                    };
+                    sum = sum.wrapping_add(black_box(vlc.read(&mut bits)));
+                }
+                black_box(sum);
+                if round >= 4 {
+                    samples.push(start.elapsed().as_nanos());
+                }
+            }
+            println!("vlc_{name}_32768_ns {samples:?}");
+        }
+    }
+
+    #[test]
+    fn vlc_matches_code_search_at_all_prefixes_and_boundaries() {
+        let tables = codes();
+        for vlc in [
+            &tables.scale,
+            &tables.scale_rl,
+            &tables.coef[0],
+            &tables.coef[1],
+            &tables.vec4,
+            &tables.vec2,
+            &tables.vec1,
+        ] {
+            let check = |v: u32| {
+                let data = v.to_be_bytes();
+                let mut bits = Bits {
+                    data: &data,
+                    pos: 0,
+                    end: 32,
+                };
+                let i = vlc.codes.partition_point(|c| c.0 <= v) - 1;
+                let (_, len, expected) = vlc.codes[i];
+                assert_eq!(vlc.read(&mut bits), expected);
+                assert_eq!(bits.pos, usize::from(len));
+            };
+            for v in 0..65536u32 {
+                check(v << 16);
+            }
+            for &(code, len, _) in &vlc.codes {
+                check(code);
+                check(code | (u32::MAX.checked_shr(u32::from(len)).unwrap_or(0)));
+            }
+        }
     }
 
     #[test]
@@ -1430,6 +1540,47 @@ mod tests {
         }
     }
 
+    #[test]
+    #[ignore = "benchmark"]
+    fn perf_overlap() {
+        use std::{hint::black_box, time::Instant};
+        for n in [128, 512] {
+            let window = sine_window(n);
+            let mut samples = Vec::new();
+            let mut block: Vec<f32> = (0..n).map(|i| (i as f32 * 0.07).sin()).collect();
+            for round in 0..35 {
+                let start = Instant::now();
+                for _ in 0..8192 {
+                    window_overlap(black_box(&mut block), black_box(&window));
+                }
+                if round >= 4 {
+                    samples.push(start.elapsed().as_nanos());
+                }
+            }
+            println!("overlap_{n}_8192_ns {samples:?}");
+        }
+    }
+
+    #[test]
+    fn overlap_matches_scalar_operations_bit_for_bit() {
+        for n in [0, 128, 256, 512] {
+            let window = sine_window(n);
+            let original: Vec<f32> = (0..n).map(|i| (i as f32 * 0.07).sin()).collect();
+            let mut actual = original.clone();
+            let mut expected = original.clone();
+            for k in 0..n / 2 {
+                let j = n - 1 - k;
+                expected[k] = original[k] * window[j] - original[j] * window[k];
+                expected[j] = original[k] * window[k] + original[j] * window[j];
+            }
+            window_overlap(&mut actual, &window);
+            assert_eq!(
+                actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+        }
+    }
+
     /// Windowed MDCT blocks of a signal, put back together the way the
     /// decoder does (half IMDCT, then window and overlap), give the signal.
     #[test]
@@ -1473,6 +1624,51 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "benchmark"]
+    fn perf_peek32() {
+        use std::{hint::black_box, time::Instant};
+        let data: Vec<u8> = (0..8192).map(|i| (i * 73 + 19) as u8).collect();
+        let mut samples = Vec::new();
+        for round in 0..35 {
+            let start = Instant::now();
+            let mut sum = 0u32;
+            for pos in 0..32768 {
+                let bits = Bits {
+                    data: black_box(&data),
+                    pos: black_box(pos),
+                    end: data.len() * 8,
+                };
+                sum = sum.wrapping_add(black_box(bits.peek32()));
+            }
+            black_box(sum);
+            if round >= 4 {
+                samples.push(start.elapsed().as_nanos());
+            }
+        }
+        println!("peek_32768_ns {samples:?}");
+    }
+
+    #[test]
+    fn peek_matches_individual_bits_with_zero_padding() {
+        let data: Vec<u8> = (0..257).map(|i| (i * 73 + 19) as u8).collect();
+        for len in 0..=data.len() {
+            for pos in (len.saturating_sub(9) * 8)..len * 8 + 40 {
+                let bits = Bits {
+                    data: &data[..len],
+                    pos,
+                    end: len * 8,
+                };
+                let expected = (0..32).fold(0, |v, i| {
+                    let p = pos + i;
+                    (v << 1)
+                        | u32::from((bits.data.get(p / 8).copied().unwrap_or(0) >> (7 - p % 8)) & 1)
+                });
+                assert_eq!(bits.peek32(), expected, "len={len} pos={pos}");
+            }
+        }
+    }
+
+    #[test]
     fn packet_rejects_out_of_range_indices_and_partial_headers() {
         assert!(packet(&[0; 4], usize::MAX / PACKET_BYTES + 1).is_none());
         assert!(packet(&[0; 3], 0).is_none());
@@ -1493,6 +1689,90 @@ mod tests {
                     assert_eq!(bytes.pos, bits.pos);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn frame_gather_matches_bitwise_cursor() {
+        fn reference(data: &[u8], start: usize) -> Option<Frame> {
+            let bits = Cursor { data, pos: start }.bits(LENGTH_BITS)? as usize;
+            if bits <= LENGTH_BITS as usize || bits == 0x7fff {
+                return None;
+            }
+            let mut cursor = Cursor { data, pos: start };
+            let mut out = Vec::new();
+            for _ in 0..bits / 8 {
+                out.push(cursor.bits(8)? as u8);
+            }
+            let tail = (bits % 8) as u32;
+            if tail != 0 {
+                out.push((cursor.bits(tail)? << (8 - tail)) as u8);
+            }
+            Some(Frame {
+                data: out,
+                bits,
+                start,
+                next: next_frame(data, start, cursor.pos),
+            })
+        }
+        for skip in 0..=2 {
+            for start in [32, 33, 35, PACKET_BITS - 8, PACKET_BITS - 3] {
+                for length in [16, 17, 128, 16001, 24000, 32766] {
+                    let mut data: Vec<u8> =
+                        (0..4 * PACKET_BYTES).map(|i| (i * 37 + 11) as u8).collect();
+                    for packet in 0..4 {
+                        let at = packet * PACKET_BYTES;
+                        data[at..at + 4].copy_from_slice(&((1u32 << 26) | skip).to_be_bytes());
+                    }
+                    // Write the length using the same packet navigation as the reader.
+                    let mut cursor = Cursor {
+                        data: &data,
+                        pos: start,
+                    };
+                    let mut positions = Vec::new();
+                    for _ in 0..15 {
+                        cursor.bit().unwrap();
+                        positions.push(cursor.pos - 1);
+                    }
+                    for (i, pos) in positions.into_iter().enumerate() {
+                        let mask = 1 << (7 - pos % 8);
+                        data[pos / 8] = (data[pos / 8] & !mask)
+                            | (((length >> (14 - i)) as u8 & 1) << (7 - pos % 8));
+                    }
+                    for end in [data.len(), data.len() - 1, PACKET_BYTES, 7] {
+                        let map = |f: Frame| (f.data, f.bits, f.start, f.next);
+                        assert_eq!(
+                            read_frame(&data[..end], start).map(map),
+                            reference(&data[..end], start).map(map),
+                            "skip={skip} start={start} length={length} end={end}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn perf_frame_gather() {
+        use std::{hint::black_box, time::Instant};
+        for shift in [0, 3] {
+            let mut data = vec![0u8; 4 * PACKET_BYTES];
+            // One frame spans a packet edge, skipping one other-stream packet.
+            put_bits(&mut data, 0, 32, (1 << 26) | 1);
+            let start = HEADER_BITS + shift;
+            put_bits(&mut data, start, 15, 24000);
+            let mut samples = Vec::new();
+            for round in 0..35 {
+                let begin = Instant::now();
+                for _ in 0..1024 {
+                    black_box(read_frame(black_box(&data), black_box(start)).unwrap());
+                }
+                if round >= 4 {
+                    samples.push(begin.elapsed().as_nanos());
+                }
+            }
+            println!("frame_shift_{shift}_1024_ns {samples:?}");
         }
     }
 

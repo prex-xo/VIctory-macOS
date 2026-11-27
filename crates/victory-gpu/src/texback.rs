@@ -226,10 +226,153 @@ impl Target {
     }
 }
 
+/// Maximum number of idle readback buffers retained in the pool.
+#[cfg(any(windows, test))]
+const MAX_IDLE_BUFFERS: usize = 64;
+/// Maximum total bytes of idle readback buffers retained in the pool (16 MiB).
+#[cfg(any(windows, test))]
+const MAX_IDLE_BYTES: u64 = 16 << 20;
+/// Readback buffer size alignment (64 KiB, matching D3D12 default placement alignment).
+#[cfg(any(windows, test))]
+const READBACK_ALIGNMENT: u64 = 64 << 10;
+#[cfg(windows)]
+const _: () = assert!(READBACK_ALIGNMENT == D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT as u64);
+
+/// Rounds a readback allocation request up to [`READBACK_ALIGNMENT`].
+#[cfg(any(windows, test))]
+fn align_readback_bytes(bytes: u64) -> Option<u64> {
+    bytes.max(1).checked_next_multiple_of(READBACK_ALIGNMENT)
+}
+
+#[cfg(any(windows, test))]
+struct IdleEntry<T> {
+    resource: T,
+    bytes: u64,
+}
+
+/// Bounded best-fit pool of idle readback buffers.
+#[cfg(any(windows, test))]
+struct IdlePool<T> {
+    entries: Vec<IdleEntry<T>>,
+    total_bytes: u64,
+}
+
+#[cfg(any(windows, test))]
+impl<T> IdlePool<T> {
+    const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            total_bytes: 0,
+        }
+    }
+
+    /// Takes the smallest idle buffer in `[aligned, 2 * aligned]` so small
+    /// readbacks never hijack idle multi-megabyte buffers.
+    fn take(&mut self, aligned: u64) -> Option<(T, u64)> {
+        let max_bytes = aligned.saturating_mul(2);
+        let best = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.bytes >= aligned && entry.bytes <= max_bytes)
+            .min_by_key(|(_, entry)| entry.bytes)
+            .map(|(idx, _)| idx)?;
+        let entry = self.entries.swap_remove(best);
+        self.total_bytes = self.total_bytes.saturating_sub(entry.bytes);
+        Some((entry.resource, entry.bytes))
+    }
+
+    /// Stores `resource` if within count and byte caps; otherwise returns it
+    /// to the caller for deferred retirement outside the pool lock.
+    fn put(&mut self, resource: T, bytes: u64) -> Option<T> {
+        if self.entries.len() < MAX_IDLE_BUFFERS
+            && self
+                .total_bytes
+                .checked_add(bytes)
+                .is_some_and(|next| next <= MAX_IDLE_BYTES)
+        {
+            self.total_bytes += bytes;
+            self.entries.push(IdleEntry { resource, bytes });
+            None
+        } else {
+            Some(resource)
+        }
+    }
+
+    /// Drains all idle entries and resets tracked pool bytes to zero.
+    fn drain(&mut self) -> Vec<T> {
+        self.total_bytes = 0;
+        self.entries.drain(..).map(|entry| entry.resource).collect()
+    }
+
+    #[cfg(test)]
+    fn stats(&self) -> (usize, u64) {
+        (self.entries.len(), self.total_bytes)
+    }
+}
+
+#[cfg(windows)]
+static IDLE: Mutex<IdlePool<ID3D12Resource>> = Mutex::new(IdlePool::new());
+
+/// Pooled `D3D12_HEAP_TYPE_READBACK` buffer paired with its aligned capacity.
+#[cfg(windows)]
+struct Readback {
+    resource: ID3D12Resource,
+    bytes: u64,
+}
+
+#[cfg(windows)]
+impl Readback {
+    /// Acquires a pooled readback buffer using bounded best-fit, or allocates
+    /// a fresh 64 KiB-aligned readback buffer on a pool miss.
+    fn acquire(host: &crate::host::Host, bytes: u64) -> Option<Self> {
+        let aligned = align_readback_bytes(bytes)?;
+        if let Some((resource, capacity)) = IDLE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take(aligned)
+        {
+            return Some(Self {
+                resource,
+                bytes: capacity,
+            });
+        }
+        let resource = host.read_back_buffer(aligned)?;
+        Some(Self {
+            resource,
+            bytes: aligned,
+        })
+    }
+
+    /// Returns this buffer to the idle pool if within caps, else retires it
+    /// through [`crate::host::retire`] so D3DMetal `bury_lag` is respected.
+    fn recycle(self) {
+        let overflow = IDLE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .put(self.resource, self.bytes);
+        if let Some(resource) = overflow {
+            crate::host::retire(resource);
+        }
+    }
+
+    fn resource(&self) -> &ID3D12Resource {
+        &self.resource
+    }
+}
+
+/// Drains idle pooled readback buffers and retires them through
+/// [`crate::host::retire_all`] so D3DMetal `bury_lag` is respected.
+#[cfg(windows)]
+pub(crate) fn trim_idle() {
+    let evicted = IDLE.lock().unwrap_or_else(|e| e.into_inner()).drain();
+    crate::host::retire_all(evicted);
+}
+
 /// Recorded host readback buffer and console layout metadata for one texture.
 #[cfg(windows)]
 pub(crate) struct Back {
-    buffer: ID3D12Resource,
+    buffer: Readback,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     mips: u32,
@@ -250,11 +393,23 @@ impl Back {
     pub(crate) fn is_valid(&self) -> bool {
         self.ticket.valid.load(Ordering::Acquire)
     }
+
+    /// Returns the readback buffer to the idle pool (or retires it on cap
+    /// overflow). Call only after the command list has finished executing and
+    /// its allocator and list have been reset.
+    pub(crate) fn recycle(self) {
+        self.buffer.recycle();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn raw_resource_ptr(&self) -> usize {
+        windows::core::Interface::as_raw(self.buffer.resource()) as usize
+    }
 }
 
 /// Records `CopyTextureRegion` calls from `target.copy` (already transitioned
-/// to `D3D12_RESOURCE_STATE_COPY_SOURCE`) into a newly allocated host readback
-/// buffer.
+/// to `D3D12_RESOURCE_STATE_COPY_SOURCE`) into a pooled or newly allocated
+/// host readback buffer.
 #[cfg(windows)]
 pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option<Back> {
     if !target.ticket.valid.load(Ordering::Acquire) {
@@ -292,11 +447,11 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
             .checked_mul(u64::from(f.Depth))?;
         total = total.max(footprint.Offset.checked_add(pitched)?);
     }
-    let buffer = host.read_back_buffer(total)?;
+    let buffer = Readback::acquire(host, total)?;
     for (i, footprint) in footprints.iter().enumerate() {
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: borrowed COM pointer; `buffer` outlives the call.
-            pResource: unsafe { std::mem::transmute_copy(&buffer) },
+            pResource: unsafe { std::mem::transmute_copy(buffer.resource()) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                 PlacedFootprint: *footprint,
@@ -354,7 +509,7 @@ pub(crate) fn land(back: &Back) {
     let mut data = std::ptr::null_mut();
     // SAFETY: our readback buffer written by the completed GPU submission.
     unsafe {
-        if back.buffer.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
+        if back.buffer.resource().Map(0, None, Some(&mut data)).is_err() || data.is_null() {
             return;
         }
     }
@@ -376,12 +531,12 @@ pub(crate) fn land(back: &Back) {
                 tracing::warn!(?e, mip, slice, "texture readback could not be retiled")
             });
             // SAFETY: mapped above.
-            unsafe { back.buffer.Unmap(0, None) };
+            unsafe { back.buffer.resource().Unmap(0, None) };
             return;
         }
     }
     // SAFETY: mapped above.
-    unsafe { back.buffer.Unmap(0, None) };
+    unsafe { back.buffer.resource().Unmap(0, None) };
     // `copy_mapped(..., true)` guards the destination range with
     // `watch::writing` so write-watched pages stay coherent without faulting.
     crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
@@ -687,5 +842,192 @@ mod tests {
         assert!(list.texture_back_ranges().is_empty());
         list.reset();
         release_resource(res);
+    }
+
+    #[test]
+    fn idle_pool_bounded_best_fit_caps_and_drain() {
+        assert_eq!(align_readback_bytes(0), Some(64 << 10));
+        assert_eq!(align_readback_bytes(1), Some(64 << 10));
+        assert_eq!(align_readback_bytes(64 << 10), Some(64 << 10));
+        assert_eq!(align_readback_bytes((64 << 10) + 1), Some(128 << 10));
+        assert_eq!(align_readback_bytes(u64::MAX), None);
+
+        let mut pool = IdlePool::<u32>::new();
+        assert_eq!(pool.put(1, 4 << 20), None);
+        assert_eq!(pool.stats(), (1, 4 << 20));
+
+        // A 64 KiB request must NOT hijack an idle 4 MiB buffer.
+        assert_eq!(pool.take(64 << 10), None);
+        assert_eq!(pool.stats(), (1, 4 << 20));
+
+        // Bounded best-fit picks the smallest entry in [aligned, 2 * aligned].
+        assert_eq!(pool.put(2, 128 << 10), None);
+        assert_eq!(pool.put(3, 64 << 10), None);
+        assert_eq!(pool.put(4, 256 << 10), None);
+        assert_eq!(pool.take(64 << 10), Some((3, 64 << 10)));
+        assert_eq!(pool.take(64 << 10), Some((2, 128 << 10)));
+        // 256 KiB exceeds 2 * 64 KiB, so a third 64 KiB request misses.
+        assert_eq!(pool.take(64 << 10), None);
+        // 192 KiB matches 256 KiB (256 KiB <= 2 * 192 KiB).
+        assert_eq!(pool.take(192 << 10), Some((4, 256 << 10)));
+        // 3 MiB matches the 4 MiB buffer (4 MiB <= 2 * 3 MiB).
+        assert_eq!(pool.take(3 << 20), Some((1, 4 << 20)));
+        assert_eq!(pool.stats(), (0, 0));
+
+        // Count cap (`MAX_IDLE_BUFFERS = 64`): 65th entry overflows.
+        for i in 0..MAX_IDLE_BUFFERS as u32 {
+            assert_eq!(pool.put(i, 64 << 10), None);
+        }
+        assert_eq!(pool.put(999, 64 << 10), Some(999));
+        let drained = pool.drain();
+        assert_eq!(drained.len(), MAX_IDLE_BUFFERS);
+        assert_eq!(pool.stats(), (0, 0));
+
+        // Byte cap (`MAX_IDLE_BYTES = 16 MiB`): 5th 4 MiB entry overflows.
+        for i in 0..4u32 {
+            assert_eq!(pool.put(i, 4 << 20), None);
+        }
+        assert_eq!(pool.put(100, 64 << 10), Some(100));
+        assert_eq!(pool.drain().len(), 4);
+        assert_eq!(pool.stats(), (0, 0));
+    }
+
+    #[cfg(windows)]
+    fn idle_stats() -> (usize, u64) {
+        IDLE.lock().unwrap_or_else(|e| e.into_inner()).stats()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn readback_buffer_is_reused_after_list_reset_across_distinct_fills() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let _guard = KindGuard::set(vec![(64, 64, 41)]);
+        trim_idle();
+        assert_eq!(idle_stats(), (0, 0));
+
+        let mut backing = vec![0xCCu8; 64 * 1024];
+        let res = make_placed_2d_r32f(64, 64, backing.as_mut_ptr());
+        let (layout, _, size) = crate::resource::title_texture(res).expect("title texture layout");
+
+        let fill_a: Vec<f32> = (0..64 * 64).map(|i| (i as f32) * 0.25 + 1.5).collect();
+        let fill_b: Vec<f32> = (0..64 * 64).map(|i| 10_000.0 - (i as f32) * 0.75).collect();
+
+        let list = host.new_list().expect("new list");
+
+        // Pass 1: allocates a 64 KiB readback buffer and lands fill A.
+        record_gpu_fill_r32f(host, &list, res, &fill_a);
+        list.texture_written(res);
+        list.close();
+        let ptrs_a = list.texture_back_raw_ptrs_for_test();
+        assert_eq!(ptrs_a.len(), 1);
+        assert_eq!(idle_stats(), (0, 0));
+
+        host.execute(&[&list]);
+        let mut detiled = vec![0u8; 64 * 64 * 4];
+        layout
+            .detile(&backing[..size], 0, 0, &mut detiled, 64 * 4, 64 * 64 * 4)
+            .expect("detile pass 1");
+        let got_a: Vec<f32> = detiled
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| f32::from_le_bytes(c))
+            .collect();
+        assert_eq!(got_a, fill_a);
+        // Buffer stays owned by the list until `reset()` completes.
+        assert_eq!(idle_stats(), (0, 0));
+
+        list.reset();
+        assert_eq!(idle_stats(), (1, READBACK_ALIGNMENT));
+
+        // Pass 2: reuses the exact same pooled readback buffer and lands fill B.
+        record_gpu_fill_r32f(host, &list, res, &fill_b);
+        list.texture_written(res);
+        list.close();
+        let ptrs_b = list.texture_back_raw_ptrs_for_test();
+        assert_eq!(ptrs_b, ptrs_a, "expected pooled readback buffer reuse");
+        assert_eq!(idle_stats(), (0, 0));
+
+        host.execute(&[&list]);
+        detiled.fill(0);
+        layout
+            .detile(&backing[..size], 0, 0, &mut detiled, 64 * 4, 64 * 64 * 4)
+            .expect("detile pass 2");
+        let got_b: Vec<f32> = detiled
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| f32::from_le_bytes(c))
+            .collect();
+        assert_eq!(got_b, fill_b);
+
+        list.reset();
+        assert_eq!(idle_stats(), (1, READBACK_ALIGNMENT));
+        trim_idle();
+        assert_eq!(idle_stats(), (0, 0));
+        release_resource(res);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bounded_best_fit_does_not_hand_4mib_idle_buffer_to_64kib_request() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let _guard = KindGuard::set(Vec::new());
+        trim_idle();
+        assert_eq!(idle_stats(), (0, 0));
+
+        let big = Readback::acquire(host, 4 << 20).expect("4 MiB readback");
+        let big_ptr = windows::core::Interface::as_raw(big.resource()) as usize;
+        assert_eq!(big.bytes, 4 << 20);
+        big.recycle();
+        assert_eq!(idle_stats(), (1, 4 << 20));
+
+        let small = Readback::acquire(host, 64 << 10).expect("64 KiB readback");
+        let small_ptr = windows::core::Interface::as_raw(small.resource()) as usize;
+        assert_ne!(small_ptr, big_ptr, "64 KiB request must not hijack 4 MiB buffer");
+        assert_eq!(small.bytes, 64 << 10);
+        assert_eq!(idle_stats(), (1, 4 << 20));
+
+        // A 3 MiB request is within 2x of 4 MiB, so it reuses the idle 4 MiB buffer.
+        let reused_big = Readback::acquire(host, 3 << 20).expect("3 MiB readback");
+        let reused_ptr = windows::core::Interface::as_raw(reused_big.resource()) as usize;
+        assert_eq!(reused_ptr, big_ptr);
+        assert_eq!(reused_big.bytes, 4 << 20);
+        assert_eq!(idle_stats(), (0, 0));
+
+        small.recycle();
+        reused_big.recycle();
+        trim_idle();
+        assert_eq!(idle_stats(), (0, 0));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn trim_idle_empties_readback_pool_cleanly() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let _guard = KindGuard::set(Vec::new());
+        trim_idle();
+        assert_eq!(idle_stats(), (0, 0));
+
+        let a = Readback::acquire(host, 32 << 10).expect("64 KiB aligned readback");
+        let b = Readback::acquire(host, 100 << 10).expect("128 KiB aligned readback");
+        assert_eq!(a.bytes, 64 << 10);
+        assert_eq!(b.bytes, 128 << 10);
+        a.recycle();
+        b.recycle();
+        assert_eq!(idle_stats(), (2, 192 << 10));
+
+        trim_idle();
+        assert_eq!(idle_stats(), (0, 0));
+
+        // Idempotent when already empty.
+        trim_idle();
+        assert_eq!(idle_stats(), (0, 0));
     }
 }

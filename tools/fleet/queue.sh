@@ -141,10 +141,11 @@ findings_with() { # SIG -> issue numbers, oldest first
 }
 
 # Files one sighting of a signature. Opens the finding the first time, and
-# reopens it as regressed if it was closed. Duplicates from two results
-# landing at once collapse onto the oldest issue.
-upsert_finding() { # SIG TEST TOPIC SIGHTING
-    local sig=$1 test=$2 topic=$3 sighting=$4 n created state assignee
+# reopens it as regressed if it was closed after the run's task was opened:
+# an older task tested a commit from before the close. Duplicates from two
+# results landing at once collapse onto the oldest issue.
+upsert_finding() { # SIG TEST TOPIC SIGHTING TASK_CREATED
+    local sig=$1 test=$2 topic=$3 sighting=$4 task_created=$5 n created state closed_at assignee
     n=$(findings_with "$sig" | head -n 1)
     if [ -z "$n" ]; then
         created=$(api "repos/$REPO/issues" -f title="Finding ($topic): $test" \
@@ -159,7 +160,10 @@ upsert_finding() { # SIG TEST TOPIC SIGHTING
         n=${n:-$created}
     else
         state=$(jq -r --argjson n "$n" '.[] | select(.number == $n) | .state' <<< "$FINDINGS")
-        if [ "$state" = closed ]; then
+        closed_at=$(jq -r --argjson n "$n" '.[] | select(.number == $n) | .closed_at // ""' <<< "$FINDINGS")
+        if [ "$state" = closed ] && [[ $task_created < $closed_at ]]; then
+            sighting="$sighting Not reopened: this run's task was opened before the finding was closed."
+        elif [ "$state" = closed ]; then
             assignee=$(jq -r --argjson n "$n" '.[] | select(.number == $n) | .assignees[0].login // ""' <<< "$FINDINGS")
             api -X PATCH "repos/$REPO/issues/$n" -f state=open -f state_reason=reopened > /dev/null
             reopen_lease "$n" "$assignee"
@@ -171,19 +175,19 @@ upsert_finding() { # SIG TEST TOPIC SIGHTING
     reply "$n" "$sighting"
 }
 
-record_findings() { # RESULT TASK_ISSUE
-    local json=$1 task=$2 where sig test topic
+record_findings() { # RESULT TASK_ISSUE TASK_CREATED
+    local json=$1 task=$2 task_created=$3 where sig test topic
     where=$(jq -r '"`\(.upstream_commit[0:12])` · \(.chip) · macOS \(.macos)"' <<< "$json")
     load_findings
     while read -r sig test topic; do
-        [ -n "$sig" ] && upsert_finding "$sig" "$test" "$topic" "Seen in #$task: $where."
+        [ -n "$sig" ] && upsert_finding "$sig" "$test" "$topic" "Seen in #$task: $where." "$task_created"
     done < <(jq -r '.failures[] | "\(.sig) \(.test) \(.topic)"' <<< "$json")
 }
 
 # Compares a result with the latest accepted result for an older commit on
 # the same chip family, and files test binaries that got much slower.
-record_slowdowns() { # RESULT TASK_ISSUE CHIP COMMIT
-    local json=$1 task=$2 chip=$3 commit=$4 prev="" candidate key old new
+record_slowdowns() { # RESULT TASK_ISSUE CHIP COMMIT TASK_CREATED
+    local json=$1 task=$2 chip=$3 commit=$4 task_created=$5 prev="" candidate key old new
     while read -r candidate; do
         [ -n "$candidate" ] || continue
         [ "$(jq -r .number <<< "$candidate")" = "$task" ] && continue
@@ -197,7 +201,7 @@ record_slowdowns() { # RESULT TASK_ISSUE CHIP COMMIT
     while IFS="$(printf '\t')" read -r key old new; do
         [ -n "$key" ] || continue
         upsert_finding "$(signature "perf"$'\n'"$key")" "$key" performance \
-            "Slower in #$task: $key took $new s at \`${commit:0:12}\` on $chip, against $old s at \`$(jq -r '.upstream_commit[0:12]' <<< "$prev")\`."
+            "Slower in #$task: $key took $new s at \`${commit:0:12}\` on $chip, against $old s at \`$(jq -r '.upstream_commit[0:12]' <<< "$prev")\`." "$task_created"
     done < <(slowdowns "$prev" "$json")
 }
 
@@ -399,8 +403,8 @@ Post results with \`tools/fleet/fleet.sh submit $n\` only. See [docs/fleet.md]($
             react "$cid" +1
             reply "$n" "$summary"
             close_issue "$n" completed
-            record_findings "$json" "$n"
-            record_slowdowns "$json" "$n" "$chip" "$commit"
+            record_findings "$json" "$n" "$(jq -r .created_at <<< "$issue")"
+            record_slowdowns "$json" "$n" "$chip" "$commit" "$(jq -r .created_at <<< "$issue")"
             record_flaky "$json" "$n" "$chip" "$commit"
             record_verification "$json" "$n" "$(jq -r '.verifies // empty' <<< "$meta")"
             ;;
@@ -530,7 +534,7 @@ auto_round() {
     if jq -e --arg h "$head" 'any(.[]; (.body // "") | contains("\ncommit: \($h)\n"))' > /dev/null <<< "$tasks"; then
         echo "main ($head) already has tasks"
     else
-        newest=$(jq -r 'map(.created_at) | max // empty' <<< "$tasks")
+        newest=$(newest_round_at "$tasks")
         age=$((hours * 3600))
         [ -n "$newest" ] && age=$(($(date -u +%s) - $(date -u -d "$newest" +%s)))
         if [ "$age" -lt $((hours * 3600)) ]; then

@@ -804,6 +804,15 @@ impl Layout {
         if self.desc.swizzle == Swizzle::LINEAR {
             for z in 0..depth {
                 let base = (u64::from(first + z) * self.slice_size + m.offset) as usize;
+                if row_pitch == bytes && m.pitch as usize * n == bytes {
+                    let y = row_range.start as usize;
+                    copy.span(
+                        base + y * bytes,
+                        z as usize * depth_pitch + y * bytes,
+                        row_range.len() * bytes,
+                    );
+                    continue;
+                }
                 for y in row_range.start as usize..row_range.end as usize {
                     copy.span(
                         base + y * m.pitch as usize * n,
@@ -1284,6 +1293,90 @@ mod tests {
                 let op = if detile { "detile" } else { "tile" };
                 println!("{name} {op}: {rate:.1} MB/s");
             }
+        }
+    }
+
+    #[test]
+    fn linear_copy_preserves_padding_and_unselected_rows() {
+        for width in [64, 65] {
+            for padding in [0, 16] {
+                let layout = Layout::new(&Desc {
+                    dimension: Dimension::Tex3d,
+                    depth: 3,
+                    ..desc(width, 7, 1, 4, Swizzle::LINEAR)
+                })
+                .unwrap();
+                let pitch = width as usize * 4 + padding;
+                let plane = pitch * 7 + 32;
+                let source: Vec<u8> = (0..layout.size as usize).map(|i| (i * 37) as u8).collect();
+                let mut expected = vec![0xa5; plane * 3];
+                for z in 0..3 {
+                    for y in 2..5 {
+                        for x in 0..width {
+                            let at = layout.offset(0, x, y, z).unwrap() as usize;
+                            let to = z as usize * plane + y as usize * pitch + x as usize * 4;
+                            expected[to..to + 4].copy_from_slice(&source[at..at + 4]);
+                        }
+                    }
+                }
+                let mut actual = vec![0xa5; plane * 3];
+                layout
+                    .detile_rows(&source, 0, 0, &mut actual, pitch, plane, 2..5)
+                    .unwrap();
+                assert_eq!(actual, expected);
+                // Full transfer and reverse transfer also take the contiguous path.
+                layout
+                    .detile(&source, 0, 0, &mut actual, pitch, plane)
+                    .unwrap();
+                let mut tiled = vec![0xa5; source.len()];
+                layout
+                    .tile(&mut tiled, 0, 0, &actual, pitch, plane)
+                    .unwrap();
+                for z in 0..3 {
+                    for y in 0..7 {
+                        for x in 0..width {
+                            let at = layout.offset(0, x, y, z).unwrap() as usize;
+                            assert_eq!(&tiled[at..at + 4], &source[at..at + 4]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Synthetic CPU copy timing; excludes allocation and GPU work.
+    #[test]
+    #[ignore = "benchmark"]
+    fn contiguous_linear_copy_throughput() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        for width in [64, 1024] {
+            let layout = Layout::new(&desc(width, 1024, 1, 4, Swizzle::LINEAR)).unwrap();
+            let pitch = width as usize * 4;
+            let source: Vec<u8> = (0..layout.size as usize).map(|i| (i * 37) as u8).collect();
+            let mut out = vec![0; pitch * 1024];
+            let mut samples = Vec::new();
+            for round in 0..35 {
+                let start = Instant::now();
+                for _ in 0..128 {
+                    layout
+                        .detile(
+                            black_box(&source),
+                            0,
+                            0,
+                            black_box(&mut out),
+                            pitch,
+                            pitch * 1024,
+                        )
+                        .unwrap();
+                }
+                let ns = start.elapsed().as_nanos() / 128;
+                assert_eq!(out, source);
+                if round >= 4 {
+                    samples.push(ns);
+                }
+            }
+            println!("linear_width_{width}_ns {samples:?}");
         }
     }
 

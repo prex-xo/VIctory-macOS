@@ -203,6 +203,59 @@ fn parse(line: &str) -> Option<(u32, usize, Vec<Piece>, Route)> {
         .then_some((rva, total, pieces, route))
 }
 
+/// What `tls.rs` writes over a 9-byte `mov r64, gs:[0x58]`: `call rel32`
+/// then a 4-byte NOP.
+const TLS_CALL_LEN: usize = 9;
+const TLS_CALL_FILL: [u8; 4] = [0x0f, 0x1f, 0x40, 0x00];
+
+/// Where one image's trampolines lie, so that a fault or a return address
+/// in one can be named by the site it stands for.
+struct Pool {
+    start: u64,
+    size: u64,
+    used: u64,
+    image: u64,
+    /// (offset in the pool, site RVA), by offset.
+    sites: Vec<(u32, u32)>,
+}
+
+/// What an address in a trampoline pool stands for.
+#[derive(Debug, PartialEq, Eq)]
+pub enum InPool {
+    /// `into` bytes into the trampoline of the site at `image + rva`.
+    Site { image: u64, rva: u32, into: u64 },
+    /// Reserved for trampolines but holding none: nothing should run there.
+    Unused { image: u64 },
+}
+
+impl Pool {
+    fn find(&self, address: u64) -> Option<InPool> {
+        let off = address.checked_sub(self.start)?;
+        if off >= self.size {
+            return None;
+        }
+        let image = self.image;
+        let i = self.sites.partition_point(|&(o, _)| u64::from(o) <= off);
+        match i.checked_sub(1).map(|i| self.sites[i]) {
+            Some((o, rva)) if off < self.used => Some(InPool::Site {
+                image,
+                rva,
+                into: off - u64::from(o),
+            }),
+            _ => Some(InPool::Unused { image }),
+        }
+    }
+}
+
+static POOLS: std::sync::Mutex<Vec<Pool>> = std::sync::Mutex::new(Vec::new());
+
+/// The wide store trampoline `address` lies in, if any. For crash reports:
+/// gives up rather than wait if the pools are being written.
+pub fn find(address: u64) -> Option<InPool> {
+    let pools = POOLS.try_lock().ok()?;
+    pools.iter().find_map(|p| p.find(address))
+}
+
 /// The trampoline for one site, its first byte at `at`; `code` the image's bytes at the site.
 fn trampoline(
     base: u64,
@@ -229,7 +282,27 @@ fn trampoline(
                 if b.iter().all(|&x| x == 0xcc) {
                     return None;
                 }
-                c.extend_from_slice(b);
+                // The list names one instruction per copy, never a branch
+                // (`cargo xtask wide-stores` keeps calls and jumps out), but
+                // `code` is the image as mapped: the static TLS redirect
+                // (`tls.rs`) has by now turned `mov r64, gs:[0x58]` into
+                // `call thunk; nop4`. Copied as it is, the call would land
+                // as far from its thunk as the trampoline is from the site
+                // (Series 1.0.2.1, site +0x1a5ec31: a call into nothing).
+                match b[0] {
+                    0xe8 if n == TLS_CALL_LEN && b[5..] == TLS_CALL_FILL => {
+                        let old = i32::from_le_bytes(b[1..5].try_into().ok()?);
+                        let to = (site + (off + 5) as u64) as i64 + i64::from(old);
+                        let next = at as i64 + c.len() as i64 + 5;
+                        c.push(0xe8);
+                        c.extend_from_slice(&i32::try_from(to - next).ok()?.to_le_bytes());
+                        c.extend_from_slice(&b[5..]);
+                    }
+                    // Another branch written over the listed instruction:
+                    // what it reaches and what follows it are not known here.
+                    0xe8 | 0xe9 | 0xeb => return None,
+                    _ => c.extend_from_slice(b),
+                }
                 off += n;
             }
             Piece::Cond(n, cc, target) => {
@@ -320,6 +393,7 @@ pub fn patch(base: u64, list: &std::path::Path) -> (usize, usize) {
     let (mut used, mut patched, mut refused) = (0usize, 0usize, 0usize);
     // Pages of the image made writable once each.
     let mut opened: std::collections::BTreeMap<u64, u32> = std::collections::BTreeMap::new();
+    let mut placed: Vec<(u32, u32)> = Vec::with_capacity(sites.len());
     for (rva, total, pieces, route) in &sites {
         let site = base + u64::from(*rva);
         // SAFETY: the site lies in the mapped image (its list was made from it).
@@ -408,9 +482,20 @@ pub fn patch(base: u64, list: &std::path::Path) -> (usize, usize) {
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), *to as *mut u8, bytes.len());
             }
         }
+        placed.push((used as u32, *rva));
         used = (used + t.len() + 15) & !15;
         patched += 1;
     }
+    POOLS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(Pool {
+            start: pool as u64,
+            size: SIZE as u64,
+            used: used as u64,
+            image: base,
+            sites: placed,
+        });
     // SAFETY: the image pages opened above get their protection back; the pool is ours.
     unsafe {
         for (page, old) in opened {
@@ -425,6 +510,7 @@ pub fn patch(base: u64, list: &std::path::Path) -> (usize, usize) {
         patched,
         refused,
         bytes = used,
+        pool = format_args!("{:#x}", pool as u64),
         "wide stores split into 128-bit halves (VICTORY_PATCH_WIDE)"
     );
     (patched, refused)
@@ -483,6 +569,85 @@ mod tests {
             &c[10..],
             &[0xc4, 0x63, 0x7d, 0x19, 0x8c, 0xc8, 0x50, 0, 0, 0, 1]
         );
+    }
+
+    #[test]
+    fn reaims_a_tls_load_the_redirect_made_a_call() {
+        // Series 1.0.2.1 +0x1a5ec31, listed `s4 c9`: vmovups [rdi], ymm0 ;
+        // mov rax, gs:[0x58], the load made `call thunk; nop4` by tls.rs
+        // (thunks 64 KiB below the image) before the stores were split.
+        let base = 0x6fff_ed55_0000u64;
+        let (rva, thunk) = (0x1a5_ec31u32, base - 0x1_0000);
+        let site = base + u64::from(rva);
+        let mut code = vec![0xc5, 0xfc, 0x11, 0x07, 0xe8];
+        let rel = i32::try_from(thunk as i64 - (site + 9) as i64).unwrap();
+        code.extend(rel.to_le_bytes());
+        code.extend(TLS_CALL_FILL);
+        let at = base - (64 << 20) + 0xeec10;
+        let pieces = [Piece::Store(4), Piece::Copy(9)];
+        let t = trampoline(base, rva, 13, &pieces, &code, at).unwrap();
+        // The split store, then the call, then the NOP, then the way back.
+        assert_eq!(t.len(), 19 + 9 + 5);
+        assert_eq!(t[19], 0xe8);
+        let call = i32::from_le_bytes(t[20..24].try_into().unwrap());
+        assert_eq!((at + 24) as i64 + i64::from(call), thunk as i64);
+        assert_eq!(t[24..28], TLS_CALL_FILL);
+        let back = i32::from_le_bytes(t[29..33].try_into().unwrap());
+        assert_eq!((at + 33) as i64 + i64::from(back), (site + 13) as i64);
+        // Before the fix the call was copied as it is: it returned to
+        // pool+0xeec28 from 0x6fffe7bcffee, both seen in the crash report.
+        assert_eq!(at + 24, 0x6fff_e963_ec28);
+        assert_eq!((at + 24) as i64 + i64::from(rel), 0x6fff_e7bc_ffee);
+    }
+
+    #[test]
+    fn refuses_a_copy_that_became_another_branch() {
+        // A copy piece the list made from one plain instruction, found as
+        // a jump or a call of another shape when the image is patched.
+        for b in [
+            vec![0xc5, 0xfc, 0x11, 0x07, 0xe9, 1, 0, 0, 0],
+            vec![
+                0xc5, 0xfc, 0x11, 0x07, 0xe8, 1, 0, 0, 0, 0x90, 0x90, 0x90, 0x90,
+            ],
+            vec![0xc5, 0xfc, 0x11, 0x07, 0xeb, 3, 0x90, 0x90, 0x90],
+        ] {
+            let pieces = [Piece::Store(4), Piece::Copy(b.len() - 4)];
+            assert!(
+                trampoline(0x1_4000_0000, 0x1000, b.len(), &pieces, &b, 0x1_3000_0000).is_none()
+            );
+        }
+        // Control: a plain 5-byte copy (mov eax, 1).
+        let b = [0xc5, 0xfc, 0x11, 0x07, 0xb8, 1, 0, 0, 0];
+        let pieces = [Piece::Store(4), Piece::Copy(5)];
+        assert!(trampoline(0x1_4000_0000, 0x1000, 9, &pieces, &b, 0x1_3000_0000).is_some());
+    }
+
+    #[test]
+    fn names_the_site_of_an_address_in_a_pool() {
+        let pool = Pool {
+            start: 0x1000_0000,
+            size: 0x1000,
+            used: 0x40,
+            image: 0x1_4000_0000,
+            sites: vec![(0, 0x2d35), (0x20, 0x1a5_ec31)],
+        };
+        let site = |rva, into| {
+            Some(InPool::Site {
+                image: 0x1_4000_0000,
+                rva,
+                into,
+            })
+        };
+        assert_eq!(pool.find(0x1000_0000), site(0x2d35, 0));
+        assert_eq!(pool.find(0x1000_001f), site(0x2d35, 0x1f));
+        assert_eq!(pool.find(0x1000_0038), site(0x1a5_ec31, 0x18));
+        let unused = Some(InPool::Unused {
+            image: 0x1_4000_0000,
+        });
+        assert_eq!(pool.find(0x1000_0040), unused);
+        assert_eq!(pool.find(0x1000_0fff), unused);
+        assert_eq!(pool.find(0x1000_1000), None);
+        assert_eq!(pool.find(0x0fff_ffff), None);
     }
 
     #[test]

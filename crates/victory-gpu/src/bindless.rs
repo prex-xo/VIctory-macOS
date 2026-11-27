@@ -10,7 +10,7 @@
 //! `crate::watch`).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::{Acquire, Relaxed, Release}};
 use std::sync::{Arc, Mutex};
 
 use crate::backend::HostGpu;
@@ -43,6 +43,9 @@ pub(crate) struct Viewed {
     inner: Mutex<Inner>,
     /// Generation-cached widening snapshot when `VICTORY_CENSUS_FAST=1`.
     fast: Option<SnapshotCache<Shadow>>,
+    /// Monotonic generation bumped whenever `inner.hulls` changes, so
+    /// submission batching can skip repeat `refresh` walks of an unchanged heap.
+    hull_generation: AtomicU64,
 }
 
 impl Default for Viewed {
@@ -58,7 +61,13 @@ impl Viewed {
         Viewed {
             inner: Mutex::new(Inner::new(fast)),
             fast: fast.then(SnapshotCache::default),
+            hull_generation: AtomicU64::new(0),
         }
+    }
+
+    /// Monotonic generation bumped whenever `inner.hulls` changes.
+    pub(crate) fn hull_generation(&self) -> u64 {
+        self.hull_generation.load(Acquire)
     }
 }
 
@@ -67,6 +76,15 @@ type Range = (usize, u64, u64, bool);
 /// A merged range: copy, start, bytes, unordered access, the copy's bit in
 /// the change tracker (`crate::watch::clean_bit`).
 type Hull = (Arc<Shadow>, u64, u64, bool, Option<u32>);
+
+/// One non-empty 64-tracker word of `watch::DIRTY` referenced by `Inner::hulls`,
+/// holding the bitmask of active tracker bits and the sorted `(bit_offset, hull_idx)`
+/// entries indexing directly into `Inner::hulls`.
+struct ActiveWord {
+    word: u32,
+    mask: u64,
+    entries: Vec<(u8, u32)>,
+}
 
 struct Inner {
     slots: HashMap<u32, Seen>,
@@ -77,8 +95,16 @@ struct Inner {
     /// `ranges` merged per copy and kind ([`Viewed::ranges`]), kept current
     /// as ranges come and go (each list running heap shaders asks for all
     /// of them; rebuilt whole after every change, they cost 13-27 ms a frame,
-    /// run perf4).
-    hulls: HashMap<(usize, bool), Hull>,
+    /// run perf4). Stored densely so `refresh` indexes directly without hashing.
+    hulls: Vec<Hull>,
+    /// Maps `(copy_ptr, uav)` to its dense index in `hulls`.
+    hull_pos: HashMap<(usize, bool), u32>,
+    /// Sorted by `word`; lets `refresh` test 64 copies per atomic word load
+    /// and index `hulls` directly with zero hash lookups.
+    active_words: Vec<ActiveWord>,
+    /// Indices into `hulls` whose `Shadow` has no `watch::DIRTY` bit
+    /// (`bit == None`: untracked buffers and zero-copy aliased shadows).
+    untracked_hulls: Vec<u32>,
     /// Per copy and kind (unordered access): the copy, and how many ranges
     /// start and end at each offset, so that the hulls are made from the
     /// copies, not from every range (the title rewrites slots between most
@@ -101,7 +127,10 @@ impl Inner {
             slots: HashMap::new(),
             ranges: BTreeMap::new(),
             textures: BTreeMap::new(),
-            hulls: HashMap::new(),
+            hulls: Vec::new(),
+            hull_pos: HashMap::new(),
+            active_words: Vec::new(),
+            untracked_hulls: Vec::new(),
             ends: HashMap::new(),
             unordered: fast.then(UnorderedIndex::new),
         }
@@ -121,11 +150,99 @@ fn tally(counts: &mut BTreeMap<u64, u32>, at: u64, add: bool) {
 }
 
 impl Inner {
+    fn insert_hull_index(&mut self, hull_idx: u32, bit: Option<u32>) {
+        match bit {
+            Some(bit) => {
+                let word = bit / 64;
+                let off = (bit % 64) as u8;
+                let mask = 1u64 << off;
+                match self.active_words.binary_search_by_key(&word, |w| w.word) {
+                    Ok(i) => {
+                        let aw = &mut self.active_words[i];
+                        aw.mask |= mask;
+                        let pos = aw.entries.partition_point(|&(o, _)| o < off);
+                        aw.entries.insert(pos, (off, hull_idx));
+                    }
+                    Err(i) => {
+                        self.active_words.insert(
+                            i,
+                            ActiveWord {
+                                word,
+                                mask,
+                                entries: vec![(off, hull_idx)],
+                            },
+                        );
+                    }
+                }
+            }
+            None => self.untracked_hulls.push(hull_idx),
+        }
+    }
+
+    fn remove_hull_index(&mut self, hull_idx: u32, bit: Option<u32>) {
+        match bit {
+            Some(bit) => {
+                let word = bit / 64;
+                let off = (bit % 64) as u8;
+                if let Ok(i) = self.active_words.binary_search_by_key(&word, |w| w.word) {
+                    let aw = &mut self.active_words[i];
+                    if let Some(pos) = aw
+                        .entries
+                        .iter()
+                        .position(|&(o, idx)| o == off && idx == hull_idx)
+                    {
+                        aw.entries.remove(pos);
+                    }
+                    if !aw.entries.iter().any(|&(o, _)| o == off) {
+                        aw.mask &= !(1u64 << off);
+                    }
+                    if aw.entries.is_empty() {
+                        self.active_words.remove(i);
+                    }
+                }
+            }
+            None => {
+                if let Some(pos) = self.untracked_hulls.iter().position(|&idx| idx == hull_idx) {
+                    self.untracked_hulls.swap_remove(pos);
+                }
+            }
+        }
+    }
+
+    fn move_hull_index(&mut self, bit: Option<u32>, old_idx: u32, new_idx: u32) {
+        match bit {
+            Some(bit) => {
+                let word = bit / 64;
+                let off = (bit % 64) as u8;
+                if let Ok(i) = self.active_words.binary_search_by_key(&word, |w| w.word) {
+                    let aw = &mut self.active_words[i];
+                    let start = aw.entries.partition_point(|&(o, _)| o < off);
+                    for entry in &mut aw.entries[start..] {
+                        if entry.0 != off {
+                            break;
+                        }
+                        if entry.1 == old_idx {
+                            entry.1 = new_idx;
+                            break;
+                        }
+                    }
+                }
+            }
+            None => {
+                if let Some(slot) = self.untracked_hulls.iter_mut().find(|&&mut idx| idx == old_idx)
+                {
+                    *slot = new_idx;
+                }
+            }
+        }
+    }
+
     /// Updates range, hull, texture, and (when enabled) UAV-index counts for
-    /// one slot transition. Returns whether the active UAV range set changed.
-    fn count(&mut self, index: u32, seen: &Seen, add: bool) -> bool {
+    /// one slot transition. Returns `(unordered_changed, hulls_changed)`.
+    fn count(&mut self, index: u32, seen: &Seen, add: bool) -> (bool, bool) {
         let step = |n: &mut u32| if add { *n += 1 } else { *n = n.saturating_sub(1) };
         let mut unordered_changed = false;
+        let mut hulls_changed = false;
         match seen {
             Seen::Buffer(shadow, address, len, uav) => {
                 let key = (Arc::as_ptr(shadow) as usize, *address, address + len, *uav);
@@ -149,25 +266,48 @@ impl Inner {
                 }
                 // A range came or went: its copy's hull may change.
                 if (was == 0) != (now == 0) {
+                    let hull_key = (key.0, key.3);
                     let ends = self
                         .ends
-                        .entry((key.0, key.3))
+                        .entry(hull_key)
                         .or_insert_with(|| (shadow.clone(), BTreeMap::new(), BTreeMap::new()));
                     tally(&mut ends.1, key.1, now > 0);
                     tally(&mut ends.2, key.2, now > 0);
                     let hull = match (ends.1.keys().next(), ends.2.keys().next_back()) {
-                        (Some(&from), Some(&to)) => Some((shadow.clone(), from, to - from, key.3, shadow.dirty_bit())),
+                        (Some(&from), Some(&to)) => {
+                            Some((shadow.clone(), from, to - from, key.3, shadow.dirty_bit()))
+                        }
                         _ => None,
                     };
                     match hull {
                         Some(hull) => {
-                            self.hulls.insert((key.0, key.3), hull);
+                            if let Some(&idx) = self.hull_pos.get(&hull_key) {
+                                self.hulls[idx as usize] = hull;
+                            } else {
+                                let bit = hull.4;
+                                let idx = self.hulls.len() as u32;
+                                self.hulls.push(hull);
+                                self.hull_pos.insert(hull_key, idx);
+                                self.insert_hull_index(idx, bit);
+                            }
                         }
                         None => {
-                            self.ends.remove(&(key.0, key.3));
-                            self.hulls.remove(&(key.0, key.3));
+                            self.ends.remove(&hull_key);
+                            if let Some(idx) = self.hull_pos.remove(&hull_key) {
+                                let last_idx = (self.hulls.len() - 1) as u32;
+                                let removed = self.hulls.swap_remove(idx as usize);
+                                self.remove_hull_index(idx, removed.4);
+                                if idx != last_idx {
+                                    let moved = &self.hulls[idx as usize];
+                                    let moved_key = (Arc::as_ptr(&moved.0) as usize, moved.3);
+                                    let moved_bit = moved.4;
+                                    self.hull_pos.insert(moved_key, idx);
+                                    self.move_hull_index(moved_bit, last_idx, idx);
+                                }
+                            }
                         }
                     }
+                    hulls_changed = true;
                 }
             }
             Seen::Texture(r) => {
@@ -183,7 +323,7 @@ impl Inner {
             }
             Seen::Left(_) => {}
         }
-        unordered_changed
+        (unordered_changed, hulls_changed)
     }
 
     /// The title released the texture `resource`: the slots viewing it go.
@@ -207,13 +347,20 @@ impl Viewed {
     pub(crate) fn set(&self, index: u32, view: Option<&View>, made: bool) {
         let seen = view.and_then(|v| if made { seen(v) } else { Some(Seen::Left(left_kind(v))) });
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let mut unordered_changed = false;
+        let (mut unordered_changed, mut hulls_changed) = (false, false);
         if let Some(old) = inner.slots.remove(&index) {
-            unordered_changed |= inner.count(index, &old, false);
+            let (u, h) = inner.count(index, &old, false);
+            unordered_changed |= u;
+            hulls_changed |= h;
         }
         if let Some(seen) = seen {
-            unordered_changed |= inner.count(index, &seen, true);
+            let (u, h) = inner.count(index, &seen, true);
+            unordered_changed |= u;
+            hulls_changed |= h;
             inner.slots.insert(index, seen);
+        }
+        if hulls_changed {
+            self.hull_generation.fetch_add(1, Release);
         }
         if unordered_changed
             && let Some(fast) = &self.fast
@@ -252,15 +399,22 @@ impl Viewed {
             entries.push((index, entry));
         }
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let mut unordered_changed = false;
+        let (mut unordered_changed, mut hulls_changed) = (false, false);
         for (index, entry) in entries {
             if let Some(old) = inner.slots.remove(&index) {
-                unordered_changed |= inner.count(index, &old, false);
+                let (u, h) = inner.count(index, &old, false);
+                unordered_changed |= u;
+                hulls_changed |= h;
             }
             if let Some(entry) = entry {
-                unordered_changed |= inner.count(index, &entry, true);
+                let (u, h) = inner.count(index, &entry, true);
+                unordered_changed |= u;
+                hulls_changed |= h;
                 inner.slots.insert(index, entry);
             }
+        }
+        if hulls_changed {
+            self.hull_generation.fetch_add(1, Release);
         }
         if unordered_changed
             && let Some(fast) = &self.fast
@@ -274,17 +428,26 @@ impl Viewed {
     #[cfg(test)]
     pub(crate) fn add_unordered(&self, shadow: &Arc<Shadow>, address: u64, len: u64) {
         let seen = Seen::Buffer(shadow.clone(), address, len, true);
-        self.inner
+        let (unordered_changed, hulls_changed) = self
+            .inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .count(u32::MAX, &seen, true); // no slot: only textures name theirs
+        if hulls_changed {
+            self.hull_generation.fetch_add(1, Release);
+        }
+        if unordered_changed
+            && let Some(fast) = &self.fast
+        {
+            fast.invalidate();
+        }
     }
 
     /// The buffer ranges views reach, merged per host copy and kind
     /// (shader resource, unordered access): copy, start, bytes.
     #[cfg(any(test, feature = "diagnostics"))]
     fn ranges(&self) -> Vec<Hull> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).hulls.values().cloned().collect()
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).hulls.clone()
     }
 
     /// Snapshot of distinct title texture resources currently viewed by this
@@ -580,16 +743,55 @@ impl Drop for Uploads {
 /// Copies the title has not written since they took it are passed by: a
 /// world submission's heaps reach ~9,000 copies, a few of them written.
 pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
-    let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
-    for (shadow, address, len, uav, bit) in inner.hulls.values() {
-        if !shadow.clean() && !crate::watch::clean_bit(*bit) {
-            let (address, len) = if *uav && shadow.marked() {
-                shadow.page_range(*address, *len)
-            } else {
-                (*address, *len)
-            };
-            add(shadow, address as usize, len as usize);
+    let emit = |(shadow, address, len, uav, _): &Hull,
+                add: &mut dyn FnMut(&Arc<Shadow>, usize, usize)| {
+        // Aliased zero-copy shadows have `dirty_bit() == None` and live in
+        // `untracked_hulls`, yet report `clean() == true` unless widened:
+        // skip `page_range` and `Batch::add` for clean shadows.
+        if shadow.clean() {
+            return;
         }
+        let (address, len) = if *uav && shadow.marked() {
+            shadow.page_range(*address, *len)
+        } else {
+            (*address, *len)
+        };
+        add(shadow, address as usize, len as usize);
+    };
+    let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+    for aw in &inner.active_words {
+        let mut dirty = crate::watch::dirty_word(aw.word as usize) & aw.mask;
+        if dirty == 0 {
+            continue;
+        }
+        if dirty == aw.mask {
+            for &(_, idx) in &aw.entries {
+                emit(&inner.hulls[idx as usize], &mut add);
+            }
+            continue;
+        }
+        if dirty.count_ones() <= 4 {
+            while dirty != 0 {
+                let off = dirty.trailing_zeros() as u8;
+                dirty &= dirty - 1;
+                let start = aw.entries.partition_point(|&(o, _)| o < off);
+                for &(o, idx) in &aw.entries[start..] {
+                    if o != off {
+                        break;
+                    }
+                    emit(&inner.hulls[idx as usize], &mut add);
+                }
+            }
+        } else {
+            for &(off, idx) in &aw.entries {
+                if dirty & (1u64 << off) != 0 {
+                    emit(&inner.hulls[idx as usize], &mut add);
+                }
+            }
+        }
+    }
+    for &idx in &inner.untracked_hulls {
+        emit(&inner.hulls[idx as usize], &mut add);
     }
 }
 
@@ -890,6 +1092,181 @@ void main(uint3 id : SV_DispatchThreadID) {
         set(2, None);
         assert!(hull().is_empty());
         crate::shadow::unregister(at as usize, at);
+    }
+
+    /// `refresh` scans `watch::DIRTY` words for tracked hulls (covering SRV and
+    /// UAV hulls sharing one copy bit), emits dirty untracked hulls while
+    /// skipping clean aliased shadows (`dirty_bit() == None`), cleans up its
+    /// word index on removal, and bumps `hull_generation` in `set`,
+    /// `set_batch`, and `add_unordered`.
+    #[test]
+    fn refresh_word_scan_covers_dirty_srv_uav_untracked_aliased_and_generations() {
+        use crate::backend::HostMemory;
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let p1 = crate::watch::tests::pool(1);
+        let p2 = crate::watch::tests::pool(1);
+        let untracked_mem = vec![0u8; 0x1000];
+        let u_at = untracked_mem.as_ptr() as u64;
+        crate::shadow::register(p1, p1 as u64, PAGE_BYTES as u64);
+        crate::shadow::register(p2, p2 as u64, PAGE_BYTES as u64);
+        crate::shadow::register(u_at as usize, u_at, 0x1000);
+        let (Some(c1), Some(c2), Some(cu)) = (
+            crate::shadow::find(p1 as u64, PAGE_BYTES as u64),
+            crate::shadow::find(p2 as u64, PAGE_BYTES as u64),
+            crate::shadow::find(u_at, 0x1000),
+        ) else {
+            crate::shadow::unregister(p1, p1 as u64);
+            crate::shadow::unregister(p2, p2 as u64);
+            crate::shadow::unregister(u_at as usize, u_at);
+            crate::watch::tests::free(p1);
+            crate::watch::tests::free(p2);
+            return;
+        };
+        assert!(c1.dirty_bit().is_some() && c2.dirty_bit().is_some());
+        assert!(cu.dirty_bit().is_none(), "plain heap buffer is untracked");
+        // Make c2 clean before adding it.
+        c2.update(p2, PAGE_BYTES);
+        assert!(c2.clean());
+
+        // Clean aliased shadow: `dirty_bit() == None` (lives in `untracked_hulls`)
+        // yet `clean() == true`, so `refresh` must skip it.
+        let (alias_buf, alias_data) = host.shared_buffer(0x1000).unwrap();
+        // SAFETY: live D3D12 buffer.
+        let alias_gpu = unsafe { alias_buf.GetGPUVirtualAddress() };
+        let alias_base = 0x7000_0000_0000u64;
+        let ca = Arc::new(Shadow::new_aliased(
+            alias_buf, alias_data, alias_gpu, alias_base, 0x1000,
+        ));
+        assert!(ca.dirty_bit().is_none());
+        assert!(ca.clean(), "fresh aliased shadow without widened SRVs is clean");
+
+        let viewed = Viewed::default();
+        let set_buf = |slot: u32, entry: Option<(&Arc<Shadow>, u64, u64, bool)>| {
+            let mut inner = viewed.inner.lock().unwrap();
+            let mut hulls_changed = false;
+            if let Some(old) = inner.slots.remove(&slot) {
+                hulls_changed |= inner.count(slot, &old, false).1;
+            }
+            if let Some((copy, addr, len, uav)) = entry {
+                let seen = Seen::Buffer(copy.clone(), addr, len, uav);
+                hulls_changed |= inner.count(slot, &seen, true).1;
+                inner.slots.insert(slot, seen);
+            }
+            if hulls_changed {
+                viewed.hull_generation.fetch_add(1, Release);
+            }
+        };
+        let collect_dirty = || {
+            let mut out = Vec::new();
+            refresh(&viewed, |s, a, l| out.push((Arc::as_ptr(s) as usize, a, l)));
+            out.sort_unstable();
+            out
+        };
+
+        let g0 = viewed.hull_generation();
+        set_buf(0, Some((&c1, p1 as u64 + 64, 128, false)));
+        let g1 = viewed.hull_generation();
+        assert!(g1 > g0, "first hull insert bumps generation");
+        // Duplicate exact range keeps generation steady.
+        set_buf(1, Some((&c1, p1 as u64 + 64, 128, false)));
+        assert_eq!(viewed.hull_generation(), g1, "duplicate range keeps generation");
+        // UAV hull on the same copy shares c1's dirty bit.
+        set_buf(2, Some((&c1, p1 as u64 + 256, 128, true)));
+        set_buf(3, Some((&c2, p2 as u64, 128, false)));
+        set_buf(4, Some((&cu, u_at, 128, false)));
+        set_buf(5, Some((&ca, alias_base, 128, false)));
+        let g2 = viewed.hull_generation();
+        assert!(g2 > g1);
+
+        let p1_ptr = Arc::as_ptr(&c1) as usize;
+        let cu_ptr = Arc::as_ptr(&cu) as usize;
+        let mut expected = vec![
+            (p1_ptr, p1 + 64, 128),
+            (p1_ptr, p1, PAGE_BYTES), // UAV marked copy expands to page_range
+            (cu_ptr, u_at as usize, 128),
+        ];
+        expected.sort_unstable();
+        assert_eq!(
+            collect_dirty(),
+            expected,
+            "dirty SRV+UAV and untracked emitted; clean c2 and clean aliased ca skipped"
+        );
+
+        // Taking c1 makes it clean: only untracked non-aliased copy remains.
+        c1.update(p1, PAGE_BYTES);
+        assert!(c1.clean());
+        assert_eq!(collect_dirty(), [(cu_ptr, u_at as usize, 128)]);
+
+        // Writing to c1 faults it dirty again: both SRV and UAV hulls reappear.
+        // SAFETY: committed pool page of ours.
+        unsafe { (p1 as *mut u32).write_volatile(0x1234_5678) };
+        assert!(!c1.clean());
+        assert_eq!(collect_dirty(), expected);
+
+        // Remove both SRV slots of c1; UAV slot still keeps c1's bit indexed.
+        set_buf(0, None);
+        set_buf(1, None);
+        let mut expected_uav = vec![(p1_ptr, p1, PAGE_BYTES), (cu_ptr, u_at as usize, 128)];
+        expected_uav.sort_unstable();
+        assert_eq!(collect_dirty(), expected_uav);
+
+        // Remove all slots: word index and untracked list clean up completely.
+        for slot in [2, 3, 4, 5] {
+            set_buf(slot, None);
+        }
+        assert!(collect_dirty().is_empty());
+        {
+            let inner = viewed.inner.lock().unwrap();
+            assert!(inner.hulls.is_empty());
+            assert!(inner.hull_pos.is_empty());
+            assert!(inner.active_words.is_empty());
+            assert!(inner.untracked_hulls.is_empty());
+        }
+
+        // Verify `Viewed::set`, `Viewed::set_batch`, and `Viewed::add_unordered`
+        // all bump `hull_generation`.
+        let buf_res = resource(1, 0x1000, 1, 0, 1);
+        let (buf_ptr, buf_size) = crate::resource::buffer_bytes(buf_res).unwrap();
+        assert!(crate::shadow::find(buf_ptr as u64, buf_size).is_some());
+        let srv_view = View::Shader(
+            buf_res as usize,
+            Some([39, 1, 0x1688, 0, 0, 0, 64, 0, 1, 0]),
+        );
+        let uav_view = View::Unordered(
+            buf_res as usize,
+            0,
+            Some([39, 1, 0, 0, 64, 0, 0, 0, 1, 0]),
+        );
+        let v_gen = Viewed::new(true);
+        let before_set = v_gen.hull_generation();
+        v_gen.set(0, Some(&srv_view), true);
+        let after_set = v_gen.hull_generation();
+        assert!(after_set > before_set, "Viewed::set must bump hull_generation");
+        v_gen.set_batch(&[(1, Some(&uav_view), true)]);
+        let after_batch = v_gen.hull_generation();
+        assert!(after_batch > after_set, "Viewed::set_batch must bump hull_generation");
+        v_gen.set_batch(&[(2, Some(&uav_view), true)]);
+        assert_eq!(
+            v_gen.hull_generation(),
+            after_batch,
+            "duplicate range in set_batch keeps hull_generation"
+        );
+        v_gen.add_unordered(&c1, p1 as u64, 64);
+        assert!(
+            v_gen.hull_generation() > after_batch,
+            "Viewed::add_unordered must bump hull_generation"
+        );
+
+        drop((v_gen, viewed));
+        crate::object::release_ref(buf_res);
+        crate::shadow::unregister(p1, p1 as u64);
+        crate::shadow::unregister(p2, p2 as u64);
+        crate::shadow::unregister(u_at as usize, u_at);
+        drop((c1, c2, cu, ca));
+        crate::watch::tests::free(p1);
+        crate::watch::tests::free(p2);
     }
 
     /// A released texture takes the slots viewing it, and only those; a

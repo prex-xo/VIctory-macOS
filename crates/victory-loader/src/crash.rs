@@ -1100,9 +1100,32 @@ fn frame_register_inside(
     register == 0 || (low..high).contains(&value)
 }
 
-/// `module+rva`, or the bare address.
+/// `module+rva`, the wide store trampoline it is in, or the bare address.
 pub fn locate(address: usize) -> String {
-    module_of(address).unwrap_or_else(|| format!("{address:#x}"))
+    module_of(address)
+        .or_else(|| in_wide_pool(address))
+        .unwrap_or_else(|| format!("{address:#x}"))
+}
+
+/// `address` in a wide store trampoline (`VICTORY_PATCH_WIDE`), named by
+/// the site it stands for: trampolines lie outside every module.
+fn in_wide_pool(address: usize) -> Option<String> {
+    use crate::wide::InPool;
+    let image = |base: u64| {
+        module_of(base as usize)
+            .map(|m| m.trim_end_matches("+0x0").to_owned())
+            .unwrap_or_else(|| format!("{base:#x}"))
+    };
+    Some(match crate::wide::find(address as u64)? {
+        InPool::Site { image: base, rva, into } => format!(
+            "{address:#x} (wide store trampoline for {}+{rva:#x}, +{into:#x} into it)",
+            image(base)
+        ),
+        InPool::Unused { image: base } => format!(
+            "{address:#x} (unused part of the wide store trampolines of {})",
+            image(base)
+        ),
+    })
 }
 
 fn module_of(address: usize) -> Option<String> {

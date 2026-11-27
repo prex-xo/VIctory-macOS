@@ -1921,6 +1921,9 @@ pub(crate) fn evict_unused() {
     // back only part of it: the idle ones go too.
     crate::shadow::release_idle(frame, ram);
     crate::shadow::release_stale(frame);
+    if over > 0 || ram > 0 {
+        crate::texback::trim_idle();
+    }
 }
 
 /// Where the card's memory is the computer's own (unified: Apple silicon

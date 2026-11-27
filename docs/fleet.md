@@ -55,7 +55,7 @@ server.
 chip label such as `fleet:m3`. A `<!-- fleet-task -->` block in the body pins
 the commit and the chip family.
 
-- **Automatic rounds.** The `fleet-rounds` workflow opens a round, one task per chip family, when main changes, at most once every `auto_round_hours` (24). It also runs daily. Open, unclaimed tasks for older commits are closed as superseded.
+- **Automatic rounds.** The `fleet-rounds` workflow opens a round, one task per chip family, when main changes, at most once every `auto_round_hours` (24), counted from the last round's own tasks: fix verifications and coverage gaps don't postpone it. It also runs daily. Open, unclaimed tasks for older commits are closed as superseded.
 - Maintainers can also open rounds by hand.
 - The queue and the worker ignore any task that wasn't opened by a maintainer listed in `tools/fleet/fleet.json` or by the repository's own workflows.
 
@@ -117,7 +117,7 @@ The queue borrows from Slurm and from volunteer-computing systems such as BOINC.
 | **Replicas** | Each round has `replicas` (2) independent runs per chip family. Nobody may run the same commit on the same chip twice, so the two runs come from different Macs. |
 | **Flaky tests** | When two runs of one commit on one chip disagree about a failure signature, its finding is labelled `fleet:flaky`. |
 | **Coverage gaps** | `gap_delay_hours` (6) after a round, the queue opens a task for each chip family and macOS version in `macos_targets` that has no result yet. It only does this for chips whose round tasks have been taken. |
-| **Dependencies** | Closing a finding as completed, usually by merging its fix, opens priority-9 verification tasks at the latest main for the chips that saw it. A clean result posts "Verified" on the finding. If the failure is seen again, the finding reopens as regressed. |
+| **Dependencies** | Closing a finding as completed, usually by merging its fix, opens priority-9 verification tasks at the latest main for the chips that saw it. A clean result posts "Verified" on the finding. If the failure is seen again in a task opened after the close, the finding reopens as regressed. |
 | **Draining** | A worker whose last three results all failed setup, or whose leases expired three times in a week, can't claim tasks for 24 hours after the latest one. Its own `work` loop also stops after three failures in a row. |
 | **Backfill** | When it's idle, the `work` loop pre-builds the latest main at the lowest CPU priority, so the next task starts warm. |
 | **Data locality** | Every task's worktree shares one build folder (`~/Library/Caches/victory-fleet/target`). Wine is built once per Mac, and VIctory builds incrementally. |
@@ -134,8 +134,10 @@ work. The queue opens one automatically:
 - **For each slowdown,** when a test binary takes at least 50% and 5 seconds longer than in the previous result for an older commit on the same chip family. These use the topic `performance`.
 
 Later sightings are added to the same issue as comments, giving the commit,
-chip and macOS version. If a closed finding is seen again, it is reopened and
-labelled `fleet:regressed`. Findings carry `fleet:finding` and a topic label
+chip and macOS version. If a closed finding is seen again in a task opened
+after it was closed, it is reopened and labelled `fleet:regressed`; a task
+opened before the close tested an older commit, so its sighting is only
+noted. Findings carry `fleet:finding` and a topic label
 such as `fleet:topic:gpu`.
 
 To work on one:

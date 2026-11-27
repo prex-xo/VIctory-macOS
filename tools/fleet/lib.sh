@@ -404,6 +404,17 @@ parse_finding() { # BODY -> "SIG TEST TOPIC"
     printf '%s %s %s\n' "$sig" "$test" "$topic"
 }
 
+# When the newest round opened: the latest creation time among ordinary round
+# tasks. Fix verifications open whenever a finding closes and coverage gaps
+# hours after their round, so counting either would postpone the next round
+# (27 November: three verifications held a due round back ten hours while
+# main was 166 commits ahead of the last one). Prints nothing with no round.
+newest_round_at() { # TASKS_JSON -> ISO time
+    jq -r 'map(select((.body // "") as $b
+        | ($b | contains("\nverifies: ") | not) and ($b | contains("\nmacos: ") | not)) | .created_at)
+        | max // empty' <<< "$1"
+}
+
 # Seconds a result took end to end (setup and both suites).
 result_seconds() { jq -r '[.timings[] // 0] | add | floor' <<< "$1"; }
 

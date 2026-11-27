@@ -5,6 +5,13 @@
 //! once the title presents its first frame with at least `WORLD_DRAW_THRESHOLD`
 //! draws so input replay (`victory_hle`) and benchmark capture share one
 //! loading-screen-immune timeline.
+//!
+//! The warm-up (`VICTORY_BENCH_WARMUP`) counts frames of the world only (at
+//! least `WORLD_DRAW_THRESHOLD` draws), and starts again after a loading
+//! phase (`LOADING_RUN` frames in a row below it): Grand Theft Auto VI shows
+//! one brief frame of the world, then loads for another 10-15 s, which used
+//! to spend the whole warm-up so the report measured the loading screen.
+//! Once measuring has begun, every presented frame is measured.
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -14,6 +21,10 @@ use std::time::Instant;
 /// Minimum draws in a single presented frame to latch into the 3D world.
 pub const WORLD_DRAW_THRESHOLD: u64 = 500;
 const DEFAULT_WARMUP_FRAMES: u64 = 30;
+/// Frames below `WORLD_DRAW_THRESHOLD` in a row that make a loading phase
+/// during the warm-up: about a second of a loading screen at 30 fps. Frames
+/// of the world (2-30 fps) do not stay under the threshold that long.
+const LOADING_RUN: u64 = 30;
 const ROOT_MARKER: &str = ".victory-root";
 const MIB: f64 = 1024.0 * 1024.0;
 
@@ -369,6 +380,12 @@ struct BenchRecorder {
     world_frame: u64,
     prev_drawn: u64,
     warmup_frames: u64,
+    /// Frames of the world the warm-up has counted since it last started.
+    warmup_world: u64,
+    /// Frames below `WORLD_DRAW_THRESHOLD` in a row during the warm-up.
+    low_run: u64,
+    /// The warm-up is over: every frame is measured from now on.
+    measuring: bool,
     frame_ms: Vec<f64>,
     draws: Vec<u64>,
     zero_draw_world_frames: u64,
@@ -387,6 +404,9 @@ impl BenchRecorder {
             world_frame: 0,
             prev_drawn: 0,
             warmup_frames: 0,
+            warmup_world: 0,
+            low_run: 0,
+            measuring: false,
             frame_ms: Vec::new(),
             draws: Vec::new(),
             zero_draw_world_frames: 0,
@@ -425,7 +445,20 @@ impl BenchRecorder {
             self.world_frame += 1;
         }
 
-        if self.world_frame <= self.warmup_target {
+        // The warm-up ends once it has counted `warmup_target` frames of the
+        // world; frames below the threshold do not count, and a loading
+        // phase starts it again.
+        self.measuring |= self.warmup_world >= self.warmup_target;
+        if !self.measuring {
+            if frame_draws >= WORLD_DRAW_THRESHOLD {
+                self.low_run = 0;
+                self.warmup_world += 1;
+            } else {
+                self.low_run += 1;
+                if self.low_run >= LOADING_RUN {
+                    self.warmup_world = 0;
+                }
+            }
             self.warmup_frames += 1;
             return (self.world_frame, self.draws.len() as u64);
         }
@@ -673,12 +706,12 @@ mod tests {
 
         // First frame with >= 500 draws latches to world_frame == 1 (warmup 1/3).
         assert_eq!(rec.observe(1100, Some(50.0), false, mem, false), (1, 0));
-        assert_eq!(rec.observe(1500, Some(40.0), false, mem, false), (2, 0));
-        assert_eq!(rec.observe(1800, Some(30.0), false, mem, false), (3, 0));
+        assert_eq!(rec.observe(1700, Some(40.0), false, mem, false), (2, 0));
+        assert_eq!(rec.observe(2300, Some(30.0), false, mem, false), (3, 0));
 
         // Post-warmup world frames are measured even if draws drop on a subsequent frame.
-        assert_eq!(rec.observe(2800, Some(10.0), false, mem, false), (4, 1));
-        assert_eq!(rec.observe(2800, Some(20.0), true, mem, false), (5, 2));
+        assert_eq!(rec.observe(3300, Some(10.0), false, mem, false), (4, 1));
+        assert_eq!(rec.observe(3300, Some(20.0), true, mem, false), (5, 2));
 
         let rep = rec.report(None);
         assert_eq!(rep.warmup_frames, 3);
@@ -702,6 +735,62 @@ mod tests {
         assert_eq!(rep0.world_frames, 2);
         assert!((rep0.frame_ms.avg - 12.0).abs() < 1e-6);
         assert!((rep0.frame_ms.median - 12.0).abs() < 1e-6);
+    }
+
+    /// Feeds `frames` presents of `draws` draws each and returns the last
+    /// `(world_frame, measured)`.
+    fn feed(rec: &mut BenchRecorder, drawn: &mut u64, draws: u64, frames: u64) -> (u64, u64) {
+        let mem = MemorySample::default();
+        let mut last = (0, 0);
+        for _ in 0..frames {
+            *drawn += draws;
+            last = rec.observe(*drawn, Some(33.0), false, mem, false);
+        }
+        last
+    }
+
+    /// As seen in the game: one world frame of ~2,000 draws, then 10-15 s
+    /// more of a loading screen (2-11 draws at ~25 fps), then the world. The
+    /// warm-up must not be spent on the loading screen.
+    #[test]
+    fn warmup_starts_again_after_a_loading_phase_behind_the_first_world_frame() {
+        let mut rec = BenchRecorder::new(150);
+        let mut drawn = 0;
+        assert_eq!(feed(&mut rec, &mut drawn, 6, 900), (0, 0)); // menus
+        assert_eq!(feed(&mut rec, &mut drawn, 2016, 1), (1, 0));
+        assert_eq!(feed(&mut rec, &mut drawn, 11, 340), (341, 0));
+        // The world: 150 frames of warm-up, then measured.
+        assert_eq!(feed(&mut rec, &mut drawn, 4800, 150), (491, 0));
+        assert_eq!(feed(&mut rec, &mut drawn, 4800, 3), (494, 3));
+        let rep = rec.report(None);
+        assert_eq!(rep.warmup_frames, 491);
+        assert_eq!(rep.world_frames, 3);
+        assert_eq!((rep.draws.min, rep.draws.max), (4800, 4800));
+        assert_eq!(rep.zero_draw_world_frames, 0);
+    }
+
+    /// Shorter dips below the threshold (a cut, a black frame) neither count
+    /// toward the warm-up nor start it again.
+    #[test]
+    fn brief_dips_neither_count_toward_warmup_nor_restart_it() {
+        let mut rec = BenchRecorder::new(4);
+        let mut drawn = 0;
+        assert_eq!(feed(&mut rec, &mut drawn, 3000, 2), (2, 0));
+        assert_eq!(
+            feed(&mut rec, &mut drawn, 0, LOADING_RUN - 1),
+            (2 + LOADING_RUN - 1, 0)
+        );
+        assert_eq!(feed(&mut rec, &mut drawn, 3000, 2), (LOADING_RUN + 3, 0));
+        // Four frames of the world counted: the next is measured, and once
+        // measuring, frames with no draws are measured and counted too.
+        assert_eq!(feed(&mut rec, &mut drawn, 3000, 1), (LOADING_RUN + 4, 1));
+        assert_eq!(
+            feed(&mut rec, &mut drawn, 0, LOADING_RUN),
+            (2 * LOADING_RUN + 4, LOADING_RUN + 1)
+        );
+        let rep = rec.report(None);
+        assert_eq!(rep.warmup_frames, LOADING_RUN + 3);
+        assert_eq!(rep.zero_draw_world_frames, LOADING_RUN);
     }
 
     #[test]

@@ -395,6 +395,14 @@ eq "task with fields passes moderation" "" "$(moderate "$fb")"
 ok "macOS constraint met" validate_result "$good" "$SHA" m3 15
 eq "macOS constraint missed" "this task needs macOS 26" "$(validate_result "$good" "$SHA" m3 26 || true)"
 eq "result seconds" 233 "$(result_seconds "$good")"
+# The 24-hour spacing of rounds counts from the last round's own tasks: a
+# later fix verification or coverage gap must not postpone the next round.
+round_tasks=$(jq -cn --arg r "$body" --arg v "$(task_body "$SHA" m3 "$REPO" "" 9 "" 57)" --arg g "$(task_body "$SHA" m3 "$REPO" 26 5)" '
+    [{created_at: "2026-11-26T15:09:34Z", body: $r}, {created_at: "2026-11-26T21:41:00Z", body: $g},
+     {created_at: "2026-11-27T01:04:10Z", body: $v}]')
+eq "newest round ignores verifications and gaps" 2026-11-26T15:09:34Z "$(newest_round_at "$round_tasks")"
+eq "newest round with only verifications" "" "$(newest_round_at "$(jq -c '.[2:]' <<< "$round_tasks")")"
+eq "newest round with no tasks" "" "$(newest_round_at '[]')"
 eq "time limit default with few samples" 6 "$(printf '3600\n3600\n' | time_limit_hours 6)"
 eq "time limit from the 90th percentile" 6 "$(printf '3600\n3600\n7200\n' | time_limit_hours 6)"
 eq "time limit at least 2 hours" 2 "$(printf '60\n60\n60\n' | time_limit_hours 6)"
@@ -421,6 +429,29 @@ FINDING_BODY=$(printf '<!-- fleet-finding\nsig: 0123456789ab\ntest: wine/victory
 export FINDING_BODY
 eq "record_verification posts Verified on a complete clean report" "42:Verified in #99: not seen at \`0123456789ab\` on Apple M3 Pro, macOS 15.4.1." "$(verify_reply "$clean")"
 eq "record_verification stays silent on a trimmed report" "" "$(verify_reply "$trimmed")"
+# A result from a task opened before the finding was closed tested a commit
+# from before the close, so it must not reopen the finding (#321).
+upsert_closed() { # TASK_CREATED
+    GITHUB_REPOSITORY=example/VIctory-macOS bash -c '
+        set -euo pipefail
+        eval "$(sed "/^case \"\${1:-}\"/,\$d" "$0")"
+        api() { echo "api $*" >&2; }
+        reply() { printf "%s:%s\n" "$1" "$2"; }
+        add_label() { echo "label $1:$2" >&2; }
+        load_findings() { FINDINGS=$(jq -nc --arg b "$FINDING_BODY" "[{number: 42, state: \"closed\", closed_at: \"2026-11-26T15:40:29Z\", assignees: [], body: \$b}]"); }
+        load_findings
+        upsert_finding 0123456789ab wine/victory_gpu::tests::depth16 gpu "Seen in #99." "$1"
+    ' "$FLEET_DIR/queue.sh" "$1" 2>&1
+}
+eq "a result from a task opened before the close does not reopen the finding" \
+    "42:Seen in #99. Not reopened: this run's task was opened before the finding was closed." \
+    "$(upsert_closed 2026-11-26T15:09:29Z)"
+eq "a result from a task opened after the close reopens the finding" \
+    "api -X PATCH repos/example/VIctory-macOS/issues/42 -f state=open -f state_reason=reopened
+label 42:fleet:open
+label 42:fleet:regressed
+42:Seen again after this was closed, so it has been reopened as a regression. Seen in #99." \
+    "$(upsert_closed 2026-11-26T15:40:43Z)"
 unset FINDING_BODY
 eq "flaky: a trimmed report is not disagreement" "" "$(flaky_sigs "$good" "$trimmed")"
 eq "flaky: both reports trimmed is not disagreement" "" "$(flaky_sigs "$trimmed" "$trimmed")"

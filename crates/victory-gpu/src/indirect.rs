@@ -68,6 +68,45 @@ pub(crate) fn batch_clamps_enabled() -> bool {
     })
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static TEST_CLAMP_CUTS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_clamp_cuts<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_CLAMP_CUTS.with(|c| c.set(self.0));
+        }
+    }
+    let previous = TEST_CLAMP_CUTS.with(|c| c.replace(Some(enabled)));
+    let _restore = Restore(previous);
+    f()
+}
+
+/// Whether a clamp a title list's host list cannot hoist (a shader of the
+/// list may have written its arguments) starts a new host list for the rest
+/// of the title list, whose prelude then takes it and the clamps after it,
+/// until the next write (`crate::list::cut_for_clamp`).
+/// `VICTORY_CLAMP_CUTS=0` clamps them inline, as before.
+///
+/// Measured (Metal System Trace, M5 Pro, D3DMetal, 2026-11-27): inline, a
+/// world frame's main command buffer held ~3,160 encoders, compute and
+/// render in strict turn, one 3 µs clamp dispatch and one restarted render
+/// pass per draw: D3DMetal ends the render pass for every dispatch, and
+/// every clamp after the list's first unhoistable one ran inline (4,582
+/// inline, 362 hoisted a frame in that run's log).
+pub(crate) fn clamp_cuts_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = TEST_CLAMP_CUTS.with(|c| c.get()) {
+        return enabled;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on_by_default("VICTORY_CLAMP_CUTS"))
+}
+
 /// Whether the argument clamp compute pipeline is available on this host.
 pub(crate) fn available() -> bool {
     clamp().is_some()
@@ -688,6 +727,39 @@ pub(crate) fn take_clamps() -> [u64; 2] {
 }
 static CLAMPS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
+/// Notes an inline clamp and what kept it out of the prelude (`None`:
+/// batching is off, `VICTORY_BATCH_CLAMPS=0`).
+pub(crate) fn note_inline(why: Option<crate::host::ClampBlock>) {
+    use crate::host::ClampBlock;
+    let at = match why {
+        Some(ClampBlock::Unknown) => 0,
+        Some(ClampBlock::Overlap) => 1,
+        Some(ClampBlock::AfterInline) => 2,
+        None => 3,
+    };
+    INLINE_WHY[at].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Inline clamps since the last call by what kept them out of the
+/// prelude: `[a write anywhere, a write of their arguments, an inline clamp
+/// before them, batching off]`.
+pub(crate) fn take_inline_why() -> [u64; 4] {
+    INLINE_WHY.each_ref().map(|n| n.swap(0, Ordering::Relaxed))
+}
+static INLINE_WHY: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// A title list went on in a new host list for a clamp
+/// ([`clamp_cuts_enabled`]).
+pub(crate) fn note_cut() {
+    CUTS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Host lists started for clamps since the last call.
+pub(crate) fn take_cuts() -> u64 {
+    CUTS.swap(0, Ordering::Relaxed)
+}
+static CUTS: AtomicU64 = AtomicU64::new(0);
+
 /// After the execution: the list's argument buffer back to common.
 pub(crate) fn done(list: &HostList, arguments: &ID3D12Resource) {
     // SAFETY: an open list and a live buffer.
@@ -1243,6 +1315,44 @@ void main(uint3 g : SV_GroupID) {
         });
     }
 
+    /// What keeps a clamp out of the prelude is named, most binding first:
+    /// an inline clamp before it, then a write anywhere, then a write of
+    /// its own arguments or count. `VICTORY_CLAMP_CUTS` is on unless `0`.
+    #[test]
+    fn write_hazard_names_what_blocks_a_clamp() {
+        use crate::host::ClampBlock;
+        let mut h = crate::host::WriteHazard::default();
+        assert_eq!(h.blocker(0x1000, 16, None), None);
+        h.note_write(0x1000, 16);
+        assert_eq!(h.blocker(0x1000, 16, None), Some(ClampBlock::Overlap));
+        assert_eq!(
+            h.blocker(0x3000, 16, Some(0x1004)),
+            Some(ClampBlock::Overlap)
+        );
+        assert_eq!(h.blocker(0x3000, 16, None), None);
+        h.note_unknown();
+        assert_eq!(h.blocker(0x3000, 16, None), Some(ClampBlock::Unknown));
+        h.note_inline();
+        assert_eq!(h.blocker(0x3000, 16, None), Some(ClampBlock::AfterInline));
+        h.clear();
+        assert_eq!(h.blocker(0x1000, 16, None), None);
+
+        super::with_clamp_cuts(false, || {
+            assert!(!super::clamp_cuts_enabled());
+            super::with_clamp_cuts(true, || assert!(super::clamp_cuts_enabled()));
+            assert!(!super::clamp_cuts_enabled());
+        });
+        assert!(crate::switch::on_by_default("VICTORY_CLAMP_CUTS_UNSET_FOR_TEST"));
+
+        let _ = super::take_inline_why();
+        super::note_inline(Some(ClampBlock::Unknown));
+        super::note_inline(Some(ClampBlock::AfterInline));
+        super::note_inline(None);
+        let why = super::take_inline_why();
+        // Other tests may clamp at the same time: at least these.
+        assert!(why[0] >= 1 && why[2] >= 1 && why[3] >= 1, "{why:?}");
+    }
+
     #[test]
     fn write_hazard_tracks_overlaps_coalescing_and_order() {
         let mut h = crate::host::WriteHazard::default();
@@ -1707,6 +1817,129 @@ void main() {
             }
         }
         crate::shadow::unregister(addr_a as usize, addr_a);
+        assert_eq!(host.log_messages(), None);
+    }
+
+    /// The ordering a clamp cut (`crate::list::cut_for_clamp`) relies on: a
+    /// host list writes an argument record on the GPU, so it cannot hoist
+    /// that record's clamp; the next host list, started for it, hoists it
+    /// (twice) into its prelude, and submitted together the prelude reads
+    /// what the list before it wrote, not the stale record. A cut list that
+    /// hoisted only one clamp does not pay for another cut.
+    #[test]
+    fn a_clamp_cut_prelude_sees_the_write_of_the_list_before() {
+        use super::*;
+        use crate::compute::Param;
+        use crate::host::ClampBlock;
+        const MARK: &str = r#"
+RWByteAddressBuffer marks : register(u0);
+cbuffer Offset : register(b0) { uint base; };
+[numthreads(1, 1, 1)]
+void main(uint3 g : SV_GroupID) {
+    marks.Store((base + g.x) * 4, 1);
+}
+"#;
+        const WRITE_ARGS: &str = r#"
+RWByteAddressBuffer outArgs : register(u0);
+cbuffer Val : register(b0) { uint gx; uint gy; uint gz; };
+[numthreads(1, 1, 1)]
+void main() {
+    outArgs.Store3(0, uint3(gx, gy, gz));
+}
+"#;
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let (mark_root, mark_pso) = crate::compute::pipeline(
+            MARK,
+            s!("cut_mark"),
+            0,
+            &[Param::Uav { register: 0 }, Param::Constants { register: 0, count: 1 }],
+        )
+        .unwrap();
+        let (write_root, write_pso) = crate::compute::pipeline(
+            WRITE_ARGS,
+            s!("cut_write_args"),
+            0,
+            &[Param::Uav { register: 0 }, Param::Constants { register: 0, count: 3 }],
+        )
+        .unwrap();
+        let argument = D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+            ..Default::default()
+        };
+        let desc = D3D12_COMMAND_SIGNATURE_DESC {
+            ByteStride: 12,
+            NumArgumentDescs: 1,
+            pArgumentDescs: &argument,
+            NodeMask: 0,
+        };
+        // SAFETY: plain command signature creation.
+        let signature = unsafe {
+            let mut sig: Option<ID3D12CommandSignature> = None;
+            host.device
+                .CreateCommandSignature(&desc, None::<&ID3D12RootSignature>, &mut sig)
+                .unwrap();
+            sig.unwrap()
+        };
+        let (marks_buf, marks_ptr) = host.shared_buffer(64 * 4).unwrap();
+        let backing = vec![0u8; 4096];
+        let addr = backing.as_ptr() as u64;
+        crate::shadow::register(addr as usize, addr, 4096);
+        let shadow = crate::shadow::find(addr, 12).expect("registered shadow");
+        let writer = host.new_list().unwrap();
+        let cut = host.new_list().unwrap();
+        // SAFETY: mapped buffers, open lists, live pipelines and signature.
+        unsafe {
+            std::ptr::write_bytes(marks_ptr, 0, 64 * 4);
+            // A stale record of one group in the buffer's host copy.
+            let mut ptr = std::ptr::null_mut();
+            shadow.buffer.Map(0, None, Some(&mut ptr)).unwrap();
+            ptr.cast::<[u32; 3]>().write_volatile([1, 1, 1]);
+            shadow.buffer.Unmap(0, None);
+
+            // The first list writes [6, 1, 1] over it.
+            shadow.gpu_writes(&writer, addr, 12, false);
+            let vals = [6u32, 1, 1];
+            let l = &writer.list;
+            l.SetComputeRootSignature(&write_root);
+            l.SetPipelineState(&write_pso);
+            l.SetComputeRootUnorderedAccessView(0, shadow.gpu(addr));
+            l.SetComputeRoot32BitConstants(1, 3, vals.as_ptr().cast(), 0);
+            l.Dispatch(1, 1, 1);
+            assert_eq!(writer.clamp_blocker(addr, 12, None), Some(ClampBlock::Overlap));
+            assert!(writer.clamp_cut_pays(), "a list not started for a clamp may cut");
+            writer.close();
+
+            // The next list, started for the clamp, hoists it and one more.
+            cut.mark_clamp_cut();
+            assert_eq!(cut.clamp_blocker(addr, 12, None), None);
+            let l = &cut.list;
+            l.SetComputeRootSignature(&mark_root);
+            l.SetPipelineState(&mark_pso);
+            l.SetComputeRootUnorderedAccessView(0, marks_buf.GetGPUVirtualAddress());
+            for (k, base) in [0u32, 16].into_iter().enumerate() {
+                let (clamped, off) = enqueue(&cut, shadow.gpu(addr), (2, 12, 1), None).unwrap();
+                assert_eq!(cut.clamp_cut_pays(), k == 1, "pays once it hoisted two");
+                l.SetComputeRoot32BitConstants(1, 1, (&raw const base).cast(), 0);
+                l.ExecuteIndirect(&signature, 1, &clamped, off, None, 0);
+            }
+            cut.close();
+            host.execute(&[&writer, &cut]);
+            for base in [0u32, 16] {
+                for k in 0..8u32 {
+                    assert_eq!(
+                        marks_ptr.cast::<u32>().add((base + k) as usize).read_volatile(),
+                        u32::from(k < 6),
+                        "the cut list's prelude read the written [6, 1, 1]: base {base} group {k}"
+                    );
+                }
+            }
+        }
+        cut.reset();
+        assert!(cut.clamp_cut_pays(), "a reset list is no longer a cut one");
+        writer.reset();
+        crate::shadow::unregister(addr as usize, addr);
         assert_eq!(host.log_messages(), None);
     }
 
