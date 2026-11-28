@@ -100,6 +100,23 @@ impl Cursor<'_> {
     }
 
     fn bits(&mut self, n: u32) -> Option<u32> {
+        if n == 0 {
+            return Some(0);
+        }
+        let within = self.pos % PACKET_BITS;
+        if n <= 32 && within != 0 && n as usize <= PACKET_BITS - within {
+            let byte = self.pos / 8;
+            let shift = self.pos % 8;
+            let count = (shift + n as usize).div_ceil(8);
+            if let Some(bytes) = self.data.get(byte..).and_then(|s| s.get(..count)) {
+                let value = bytes.iter().fold(0u64, |v, &b| (v << 8) | u64::from(b));
+                let value = value >> (count * 8 - shift - n as usize);
+                self.pos += n as usize;
+                return Some((value & ((1u64 << n) - 1)) as u32);
+            }
+        }
+        // Packet boundaries can skip other streams; preserve the bit walk
+        // there, including how far a truncated read advances the cursor.
         (0..n).try_fold(0, |v, _| Some(v << 1 | self.bit()?))
     }
 
@@ -120,6 +137,35 @@ impl Cursor<'_> {
         };
         self.pos += 8;
         Some(byte)
+    }
+}
+
+#[cfg(test)]
+mod packet_field_regression {
+    use super::*;
+    #[test]
+    fn packed_fields_match_bits_and_cursor_at_edges() {
+        let data: Vec<_> = (0..6144).map(|i| (i * 37) as u8).collect();
+        for len in [0, 1, 2, 3, 4, 5, 7, 8, 2047, 2048, 2049, 6144] {
+            for pos in (0..64)
+                .chain(PACKET_BITS - 40..PACKET_BITS + 40)
+                .chain(len * 8..len * 8 + 8)
+            {
+                for n in 0..=32 {
+                    let mut a = Cursor {
+                        data: &data[..len],
+                        pos,
+                    };
+                    let mut b = Cursor {
+                        data: &data[..len],
+                        pos,
+                    };
+                    let reference = (0..n).try_fold(0, |v, _| Some(v << 1 | b.bit()?));
+                    assert_eq!(a.bits(n), reference);
+                    assert_eq!(a.pos, b.pos);
+                }
+            }
+        }
     }
 }
 

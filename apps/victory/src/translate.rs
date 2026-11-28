@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use victory_shader::emit::host::{self, Host};
 use victory_shader::emit::{self, validator::Validator};
 use victory_shader::structure::{self, Atom, LaneExit};
@@ -333,17 +333,26 @@ pub fn run(
 /// same code, so a run finds it translated or refused. With `pipelines`,
 /// then the shader pack's pipelines go into the pipeline library
 /// (`prebuild`).
-pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result<()> {
+pub fn warm(
+    paths: Vec<PathBuf>,
+    jobs: Option<usize>,
+    pipelines: bool,
+    pipeline_selection: Option<PathBuf>,
+) -> Result<()> {
     let paths = crate::default_paths(paths)?;
-    let shaders = victory_core::Config::load()?.cache_subdir("shaders")?;
-    let Some(dir) = victory_gpu::shader_cache::use_shader_cache(shaders.clone()) else {
-        anyhow::bail!("no shader cache in {}", shaders.display());
-    };
     let threads = thread_count(jobs);
-    // The pre-build's key listing (diagnostics) translates nothing.
-    if pipelines && std::env::var_os("VICTORY_PREBUILD_KEYS").is_some() {
-        return crate::prebuild::run(&paths, threads);
+    let keys_only = std::env::var_os("VICTORY_PREBUILD_KEYS").is_some();
+    if let Some(file) = pipeline_selection {
+        anyhow::ensure!(!keys_only, "unset VICTORY_PREBUILD_KEYS to pre-build a selection");
+        // The selected pipelines translate their own shaders as needed.
+        let keys = crate::prebuild::read_selection(&file)?;
+        return crate::prebuild::run(&paths, threads, Some(&keys));
     }
+    // The pre-build's key listing translates nothing.
+    if pipelines && keys_only {
+        return crate::prebuild::run(&paths, threads, None);
+    }
+    let dir = open_shader_cache()?;
     let started = std::time::Instant::now();
     let seen = Mutex::new(HashSet::new());
     // Containers already cached, translated now, refused now.
@@ -435,9 +444,16 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
         started.elapsed().as_secs_f64()
     );
     if pipelines {
-        crate::prebuild::run(&paths, threads)?;
+        crate::prebuild::run(&paths, threads, None)?;
     }
     Ok(())
+}
+
+/// Opens the same translated-shader cache as a run.
+pub(crate) fn open_shader_cache() -> Result<PathBuf> {
+    let shaders = victory_core::Config::load()?.cache_subdir("shaders")?;
+    victory_gpu::shader_cache::use_shader_cache(shaders.clone())
+        .with_context(|| format!("no shader cache in {}", shaders.display()))
 }
 
 /// Shows on stderr how far `workers` are through `file`'s `jobs` (`next`
@@ -497,6 +513,24 @@ fn translate(
     let Some(bytes) = source.bytes() else {
         return t.fail("corrupt record".into(), example);
     };
+    // The hash a run's log names the shader by (`hash=` in "shader
+    // translated", "shader does not translate"), as `VICTORY_SHADER_SAVE`
+    // names its files.
+    let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
+    // `VICTORY_TRANSLATE_ONLY=<hash prefix>,...`: those containers alone.
+    static ONLY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let only = ONLY.get_or_init(|| {
+        std::env::var("VICTORY_TRANSLATE_ONLY")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    if !only.is_empty() && !only.iter().any(|o| hash.starts_with(o.as_str())) {
+        return;
+    }
+    let example = || format!("{}{} #{hash}", path.display(), source.label());
     t.containers += 1;
     let Ok(container) = Container::parse(&bytes) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
@@ -516,6 +550,37 @@ fn translate(
         Ok(p) => p,
         Err(e) => return t.fail(e.to_string(), example),
     };
+    // `VICTORY_FAIL_DUMP=<dir>`: the first 3 containers of each failure
+    // reason, as the title has them (`.cdxil`), to work on a translator gap
+    // offline (`VICTORY_REF_PS`, `VICTORY_TRANSLATE_ONLY`).
+    let dump = std::env::var_os("VICTORY_FAIL_DUMP");
+    let before: Option<BTreeMap<String, usize>> =
+        dump.as_ref().map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
+    translate_programs(&container, programs, &example, t, checks);
+    if let (Some(dir), Some(before)) = (dump, before) {
+        for (reason, (n, _)) in &t.failed {
+            let was = before.get(reason).copied().unwrap_or(0);
+            if *n > was && was < 3 {
+                let stem: String = reason
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                    .take(60)
+                    .collect();
+                let dir = Path::new(&dir);
+                let _ = std::fs::create_dir_all(dir);
+                let _ = std::fs::write(dir.join(format!("{stem}_{was}.{hash}.cdxil")), &bytes[..]);
+            }
+        }
+    }
+}
+
+fn translate_programs(
+    container: &Container,
+    programs: Vec<NativeProgram>,
+    example: &dyn Fn() -> String,
+    t: &mut Tally,
+    checks: &mut Checks,
+) {
     for p in programs {
         t.programs += 1;
         match victory_shader::range::build(&p.patched_code(), p.wave64, p.vgprs) {
@@ -580,7 +645,7 @@ fn translate(
                     *counter(t, p.stage, 0) += 1;
                     let marks =
                         emit_options(checks.wave32, victory_gpu::shader_cache::narrow_waves());
-                    match emit::emit_with(&container, &p, &program, &s, &i, &r, marks) {
+                    match emit::emit_with(container, &p, &program, &s, &i, &r, marks) {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
                             check(shader, t, checks, label);

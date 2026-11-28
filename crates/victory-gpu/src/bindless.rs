@@ -273,22 +273,28 @@ impl Inner {
                         .or_insert_with(|| (shadow.clone(), BTreeMap::new(), BTreeMap::new()));
                     tally(&mut ends.1, key.1, now > 0);
                     tally(&mut ends.2, key.2, now > 0);
-                    let hull = match (ends.1.keys().next(), ends.2.keys().next_back()) {
-                        (Some(&from), Some(&to)) => {
-                            Some((shadow.clone(), from, to - from, key.3, shadow.dirty_bit()))
-                        }
+                    let hull = match (ends.1.first_key_value(), ends.2.last_key_value()) {
+                        (Some((&from, _)), Some((&to, _))) => Some((from, to - from)),
                         _ => None,
                     };
                     match hull {
-                        Some(hull) => {
+                        Some((from, len)) => {
                             if let Some(&idx) = self.hull_pos.get(&hull_key) {
-                                self.hulls[idx as usize] = hull;
+                                let hull = &mut self.hulls[idx as usize];
+                                // The refresh pass uses the hull, not its
+                                // individual ranges. Interior changes still
+                                // update the UAV index above.
+                                if (hull.1, hull.2) != (from, len) {
+                                    (hull.1, hull.2) = (from, len);
+                                    hulls_changed = true;
+                                }
                             } else {
-                                let bit = hull.4;
+                                let bit = shadow.dirty_bit();
                                 let idx = self.hulls.len() as u32;
-                                self.hulls.push(hull);
+                                self.hulls.push((shadow.clone(), from, len, key.3, bit));
                                 self.hull_pos.insert(hull_key, idx);
                                 self.insert_hull_index(idx, bit);
+                                hulls_changed = true;
                             }
                         }
                         None => {
@@ -304,10 +310,10 @@ impl Inner {
                                     self.hull_pos.insert(moved_key, idx);
                                     self.move_hull_index(moved_bit, last_idx, idx);
                                 }
+                                hulls_changed = true;
                             }
                         }
                     }
-                    hulls_changed = true;
                 }
             }
             Seen::Texture(r) => {
@@ -811,6 +817,18 @@ pub(crate) fn refresh_slot(
     }
 }
 
+/// Each copy the heap views for unordered access, with the range of it
+/// its views reach (address, bytes): what the heap's shaders may write with
+/// no list declaring it.
+pub(crate) fn written_ranges(viewed: &Viewed, mut each: impl FnMut(&Arc<Shadow>, usize, usize)) {
+    let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+    for (shadow, address, len, uav, _) in &inner.hulls {
+        if *uav {
+            each(shadow, *address as usize, *len as usize);
+        }
+    }
+}
+
 /// Heap UAV ranges that may need to refresh a widened SRV after a later
 /// buffer barrier, added to `out` (the caller's buffer, kept from barrier to
 /// barrier: the world's heaps have tens of thousands). Computed heap indices
@@ -1137,7 +1155,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         let alias_gpu = unsafe { alias_buf.GetGPUVirtualAddress() };
         let alias_base = 0x7000_0000_0000u64;
         let ca = Arc::new(Shadow::new_aliased(
-            alias_buf, alias_data, alias_gpu, alias_base, 0x1000,
+            alias_buf, alias_data, alias_gpu, alias_base, 0x1000, 0,
         ));
         assert!(ca.dirty_bit().is_none());
         assert!(ca.clean(), "fresh aliased shadow without widened SRVs is clean");
@@ -1388,6 +1406,33 @@ void main(uint3 id : SV_DispatchThreadID) {
             let cached = check_eq("after SRV-only add");
             assert!(Arc::ptr_eq(&first, &cached));
         }
+
+        // A UAV range inside the first buffer's existing hull still
+        // changes the snapshot of individual writes.
+        let inner_a = uav_view(bufs[0], 8, 8);
+        let inner_b = uav_view(bufs[0], 24, 8);
+        let hull_generation = fast.hull_generation();
+        for viewed in [&standard, &fast] {
+            viewed.set(4, Some(&inner_a), true);
+        }
+        assert_eq!(fast.hull_generation(), hull_generation);
+        let inner_snapshot = check_eq("after adding an interior UAV");
+        for viewed in [&standard, &fast] {
+            viewed.set_batch(&[(4, Some(&inner_b), true)]);
+        }
+        assert_eq!(fast.hull_generation(), hull_generation);
+        let moved_snapshot = check_eq("after moving an interior UAV");
+        if crate::under_wine() {
+            assert_ne!(
+                normalize_writes(&inner_snapshot),
+                normalize_writes(&moved_snapshot)
+            );
+        }
+        for viewed in [&standard, &fast] {
+            viewed.set(4, None, false);
+        }
+        assert_eq!(fast.hull_generation(), hull_generation);
+        check_eq("after removing an interior UAV");
 
         // 2. Replaced slots: UAV -> UAV, UAV -> SRV, SRV -> UAV, made=false.
         for viewed in [&standard, &fast] {

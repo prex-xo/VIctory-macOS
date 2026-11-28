@@ -59,6 +59,8 @@ pub mod frame;
 #[cfg(windows)]
 mod heap_worker;
 #[cfg(any(windows, test))]
+mod heap_fit;
+#[cfg(any(windows, test))]
 mod hdr_probe;
 mod hold;
 #[cfg(windows)]
@@ -96,6 +98,8 @@ mod sampler;
 pub mod shader_cache;
 #[cfg(windows)]
 mod shadow;
+#[cfg(windows)]
+mod tiled;
 pub mod signature;
 mod switch;
 #[cfg(windows)]
@@ -104,6 +108,11 @@ mod tdr;
 mod texback;
 #[cfg(windows)]
 mod texture;
+// Plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod timing_cuts;
+#[cfg(windows)]
+mod census;
 #[cfg(windows)]
 mod twin;
 #[cfg(windows)]
@@ -113,15 +122,22 @@ mod widened;
 // Whether the host opens heaps over process memory (ignored by default).
 #[cfg(all(windows, test))]
 mod inplace_probe;
+// Which `footprint` rows hold D3DMetal's memory (ignored by default).
+#[cfg(all(windows, test))]
+mod footprint_probe;
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use copystat::CountingAlloc;
 #[cfg(windows)]
-pub use alias::{alias_region, enabled as alias_buffers, unalias_region};
-#[cfg(all(windows, feature = "diagnostics"))]
-pub use alias::{PhysicalHeap, physical_heap};
+pub use alias::{Unaliased, alias_region, enabled as alias_buffers, note_unaliased, unalias_region};
+#[cfg(windows)]
+pub use alias::{PhysicalHeap, Tile, physical_heap, physical_tiles};
+#[cfg(windows)]
+pub use tiled::{on_physical_tiles, physical_retiled};
 #[cfg(windows)]
 pub use host::{MeshSupport, host_mesh_support, on_failure};
+#[cfg(windows)]
+pub use shadow::on_physical_runs;
 #[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, fault_tracking, rosetta, stores_need_patching, title_memory_aliased,

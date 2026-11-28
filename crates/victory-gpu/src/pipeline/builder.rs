@@ -12,6 +12,17 @@
 //! pipeline it has created has its host pipeline; otherwise none of them
 //! run (the structures keep what they held).
 //!
+//! With every pipeline made it still runs only when asked to
+//! (`VICTORY_BVH_BUILDER=1`): its lists address title memory that no host
+//! copy holds (`crate::memory`: such memory reads 0 and takes no writes),
+//! in every frame it runs in. A run on an M5 Pro with all 53 pipelines made
+//! missed 14,469 pages and 94 regions of 256 MiB in the builder's first
+//! frame and 200 to 2,700 pages in each later one; none of the pages its
+//! lists wrote went back into title memory (all withheld, as computed from
+//! zeros), in any frame of four runs. What it leaves in the host copies is
+//! what the frame's trace passes read. In those runs the cell's picture was
+//! dark, and macOS ended submissions for holding the GPU in four of five.
+//!
 //! Its pipelines are known by where they come from: created by its code (a
 //! return address in its image on the stack) or from bytecode in its image.
 
@@ -93,6 +104,29 @@ pub(crate) fn note(p: &Arc<Pending>) {
 /// The frame [`runs`] last decided for, and its decision.
 static DECIDED: Mutex<(u64, bool)> = Mutex::new((u64::MAX, true));
 
+/// Whether the builder is asked to run (`VICTORY_BVH_BUILDER=1`); read
+/// once.
+fn asked() -> bool {
+    static ASKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ASKED.get_or_init(|| asked_value(std::env::var_os("VICTORY_BVH_BUILDER").as_deref()))
+}
+
+fn asked_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+/// Why the builder is held back, if it is: `made` (every pipeline has its
+/// host pipeline) and `asked` ([`asked`]).
+fn held(made: bool, asked: bool) -> Option<&'static str> {
+    if !made {
+        Some("not all its pipelines are made")
+    } else if !asked {
+        Some("its lists address title memory with no host copy (VICTORY_BVH_BUILDER=1 runs it)")
+    } else {
+        None
+    }
+}
+
 /// Whether the builder's dispatches run in the current frame: decided once
 /// per frame, so that a frame never runs part of the builder.
 pub(crate) fn runs() -> bool {
@@ -111,7 +145,8 @@ pub(crate) fn runs() -> bool {
             .map(|p| make::state(&p))
             .collect()
     };
-    let open = all_made(&states);
+    let why = held(all_made(&states), asked());
+    let open = why.is_none();
     if open != decided.1 || !SAID.swap(true, Ordering::Relaxed) {
         let (made, refused) = (
             states.iter().filter(|s| **s == Some(true)).count(),
@@ -123,10 +158,9 @@ pub(crate) fn runs() -> bool {
             made,
             refused,
             "BVH builder {}",
-            if open {
-                "runs"
-            } else {
-                "held back: not all its pipelines are made"
+            match why {
+                None => "runs".to_owned(),
+                Some(why) => format!("held back: {why}"),
             }
         );
     }
@@ -162,6 +196,22 @@ mod tests {
         assert!(all_made(&[Some(true), Some(true)]));
         assert!(!all_made(&[Some(true), Some(false)]), "one refused");
         assert!(!all_made(&[Some(true), None]), "one still being made");
+    }
+
+    /// With every pipeline made the builder still runs only when asked to:
+    /// `VICTORY_BVH_BUILDER=1`, nothing else.
+    #[test]
+    fn the_builder_runs_only_when_asked_to() {
+        let os = std::ffi::OsStr::new;
+        assert!(!asked_value(None));
+        assert!(asked_value(Some(os("1"))));
+        for other in ["", "0", "on", "true", " 1"] {
+            assert!(!asked_value(Some(os(other))), "{other:?}");
+        }
+        assert_eq!(held(true, true), None);
+        assert!(held(true, false).unwrap().contains("no host copy"));
+        assert!(held(false, true).unwrap().contains("not all its pipelines"));
+        assert!(held(false, false).unwrap().contains("not all its pipelines"));
     }
 
     /// Pipelines are the builder's by their bytecode in its image, or by

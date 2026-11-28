@@ -22,8 +22,8 @@ use windows_sys::Win32::System::Memory::{
 use crate::backend::HostMemory;
 use crate::host::host;
 use crate::watch::PAGE;
+use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
-#[cfg(any(test, feature = "diagnostics"))]
 use windows::Win32::Graphics::Direct3D12::*;
 
 #[cfg(target_arch = "x86_64")]
@@ -276,6 +276,20 @@ pub fn enabled() -> bool {
 
 /// Probes once whether `mach_vm_remap` onto a D3DMetal write-back L0 buffer
 /// works and whether fresh buffers arrive zero-initialized.
+/// D3DMetal places a buffer inside a larger one, at a 256-byte multiple, once
+/// small buffers are alive: on an M1 Max nearly every 64 KiB to 64 MiB buffer
+/// then came back mid-page. Remapping from there would share the pages around
+/// the buffer and shift the title's bytes by that offset, so this takes `len`
+/// bytes from a padded buffer's first byte on a 16 KiB (Apple Silicon page)
+/// boundary, and says how far in that is.
+fn shared_aligned(h: &crate::host::Host, len: usize) -> Option<(ID3D12Resource, *mut u8, usize)> {
+    const ALIGN: usize = 16 << 10;
+    let (buffer, mem) = h.shared_buffer((len + ALIGN) as u64)?;
+    let skip = (mem as usize).next_multiple_of(ALIGN) - mem as usize;
+    // SAFETY: `skip < ALIGN`, so `len` bytes from there are in the buffer.
+    Some((buffer, unsafe { mem.add(skip) }, skip))
+}
+
 fn supported() -> Option<bool> {
     static PROBE: OnceLock<Option<bool>> = OnceLock::new();
     *PROBE.get_or_init(|| {
@@ -284,7 +298,7 @@ fn supported() -> Option<bool> {
             return None;
         }
         let h = host()?;
-        let (buffer, gpu_mem) = h.shared_buffer(PAGE as u64)?;
+        let (buffer, gpu_mem, _) = shared_aligned(h, PAGE)?;
         // SAFETY: `gpu_mem` is our `PAGE`-byte mapped buffer.
         let zeroed = unsafe {
             gpu_mem.cast::<u64>().read_volatile() == 0
@@ -303,7 +317,7 @@ fn supported() -> Option<bool> {
         if title.is_null() {
             return None;
         }
-        // SAFETY: `title` and `gpu_mem` are both `PAGE`-aligned and `PAGE` bytes.
+        // SAFETY: `title` and `gpu_mem` are both page-aligned and `PAGE` bytes.
         let r = unsafe {
             mach::remap_shared(
                 title as u64,
@@ -345,7 +359,6 @@ fn supported() -> Option<bool> {
 
 /// CPU-visible backing for XMem physical pages. The placed buffer keeps a
 /// CPU mapping of the heap from which reserved resources can take tiles.
-#[cfg(any(test, feature = "diagnostics"))]
 pub struct PhysicalHeap {
     backing: ID3D12Resource,
     // A placed buffer must keep its heap alive.
@@ -354,7 +367,6 @@ pub struct PhysicalHeap {
     len: usize,
 }
 
-#[cfg(any(test, feature = "diagnostics"))]
 impl PhysicalHeap {
     pub(crate) fn new(device: &ID3D12Device, len: usize) -> windows::core::Result<Self> {
         let desc = D3D12_HEAP_DESC {
@@ -444,7 +456,6 @@ impl PhysicalHeap {
     }
 }
 
-#[cfg(any(test, feature = "diagnostics"))]
 impl Drop for PhysicalHeap {
     fn drop(&mut self) {
         // SAFETY: unmapped once, while the placed buffer still owns the view.
@@ -452,11 +463,61 @@ impl Drop for PhysicalHeap {
     }
 }
 
-/// Allocates CPU-visible physical tiles for the Rosetta diagnostics trial.
-#[cfg(feature = "diagnostics")]
-pub fn physical_heap(len: usize) -> Option<PhysicalHeap> {
+/// Whether the title's physical pages are GPU memory
+/// (`VICTORY_PHYSICAL_TILES=1`, off by default; Rosetta and D3DMetal only):
+/// each section of them is a CPU-visible heap, its title views remapped
+/// onto it ([`PhysicalHeap::alias_view`]), and host copies of title buffers
+/// on those pages read them in place (`crate::tiled`).
+pub fn physical_tiles() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_PHYSICAL_TILES.with(std::cell::Cell::get) {
+        return on && supported().is_some();
+    }
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    if !*ENABLED.get_or_init(|| crate::switch::on("VICTORY_PHYSICAL_TILES") && supported().is_some())
+    *ENABLED.get_or_init(|| {
+        let on = crate::switch::on("VICTORY_PHYSICAL_TILES") && supported().is_some();
+        if on {
+            tracing::info!("the title's physical pages are GPU memory, read in place (VICTORY_PHYSICAL_TILES=1)");
+        }
+        on
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`physical_tiles`] on this test's thread.
+    pub(crate) static TEST_PHYSICAL_TILES: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// One 64 KiB tile of a [`PhysicalHeap`]: a host copy's reserved buffer maps
+/// it (`crate::tiled`), holding the heap while it does.
+#[derive(Clone)]
+pub struct Tile {
+    pub(crate) heap: ID3D12Heap,
+    pub(crate) index: u32,
+}
+
+impl Tile {
+    /// Its 64 KiB tile in its heap.
+    pub fn index(&self) -> u32 {
+        self.index
+    }
+}
+
+impl PhysicalHeap {
+    /// The tile at byte `offset` of the heap.
+    pub fn tile(&self, offset: usize) -> Option<Tile> {
+        (offset.is_multiple_of(PAGE) && offset < self.len).then(|| Tile {
+            heap: self._heap.clone(),
+            index: (offset / PAGE) as u32,
+        })
+    }
+}
+
+/// CPU-visible GPU memory for a section of the title's physical pages, of
+/// `len` bytes ([`physical_tiles`]); none when off or not made.
+pub fn physical_heap(len: usize) -> Option<PhysicalHeap> {
+    if !physical_tiles()
         || len == 0
         || !len.is_multiple_of(PAGE)
     {
@@ -470,6 +531,54 @@ pub fn physical_heap(len: usize) -> Option<PhysicalHeap> {
             None
         }
     }
+}
+
+/// Why the runtime did not alias memory it committed for the title
+/// ([`note_unaliased`]): the frame report counts the bytes by reason, so a
+/// run shows which memory host copies are refreshed from.
+#[derive(Clone, Copy, Debug)]
+pub enum Unaliased {
+    /// Aliasing is off on this host.
+    Off,
+    /// Not read-write memory (write-combined, read-only, no access).
+    Protection,
+    /// A placeholder, for physical pages mapped later.
+    Placeholder,
+    /// Not whole 64 KiB pages.
+    Unaligned,
+    /// The remap itself failed or overlapped an alias.
+    Failed,
+}
+
+const UNALIASED_REASONS: [&str; 5] = ["aliasing off", "protection", "placeholder", "not whole pages", "remap failed"];
+
+/// Bytes committed for the title and not aliased, by [`Unaliased`], since
+/// the last frame report, and over the run.
+static UNALIASED: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+
+/// The runtime committed `len` bytes for the title without aliasing them.
+pub fn note_unaliased(len: usize, why: Unaliased) {
+    use std::sync::atomic::Ordering::Relaxed;
+    UNALIASED[why as usize].fetch_add(len as u64, Relaxed);
+    UNALIASED[5 + why as usize].fetch_add(len as u64, Relaxed);
+}
+
+/// The frame report's line: what was committed and not aliased, by reason,
+/// over the run (MB), and how much of it since the last report.
+pub(crate) fn log_unaliased() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let now: Vec<u64> = (0..5).map(|i| UNALIASED[i].swap(0, Relaxed)).collect();
+    let run: Vec<u64> = (5..10).map(|i| UNALIASED[i].load(Relaxed)).collect();
+    if run.iter().all(|&b| b == 0) {
+        return;
+    }
+    let parts: Vec<String> = UNALIASED_REASONS
+        .iter()
+        .zip(run.iter().zip(&now))
+        .filter(|(_, (run, _))| **run != 0)
+        .map(|(why, (run, now))| format!("{why} {:.0} MB (+{:.0})", *run as f64 / 1e6, *now as f64 / 1e6))
+        .collect();
+    tracing::info!("title memory committed without zero-copy aliasing, over the run: {}", parts.join(", "));
 }
 
 /// Aliases `[base, base + len)` onto a new write-back L0 D3D12 buffer so CPU
@@ -492,7 +601,7 @@ pub fn alias_region(base: usize, len: usize, preserve_contents: bool) -> bool {
     let Some(h) = host() else {
         return false;
     };
-    let Some((buffer, gpu_mem)) = h.shared_buffer(len as u64) else {
+    let Some((buffer, gpu_mem, skip)) = shared_aligned(h, len) else {
         return false;
     };
     // SAFETY: `base` and `gpu_mem` are `len`-byte owned mappings.
@@ -522,8 +631,15 @@ pub fn alias_region(base: usize, len: usize, preserve_contents: bool) -> bool {
         format!("aliased title buffer {base:#x}+{len:#x}")
     });
     // SAFETY: `buffer` is alive.
-    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    let shadow = crate::shadow::Shadow::new_aliased(buffer, gpu_mem, gpu, base as u64, len as u64);
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + skip as u64;
+    let shadow = crate::shadow::Shadow::new_aliased(
+        buffer,
+        gpu_mem,
+        gpu,
+        base as u64,
+        len as u64,
+        skip as u64,
+    );
     crate::shadow::register_aliased(shadow);
     if len >= 16 << 20 {
         tracing::info!(
@@ -786,13 +902,23 @@ mod tests {
                 // SAFETY: inside `alloc`.
                 unsafe { alloc.ptr.add(off + i).write_volatile(b) };
             }
-            let got = gpu_read(&h.device, &shadow.buffer, off as u64, PAGE);
+            let got = gpu_read(
+                &h.device,
+                &shadow.buffer,
+                shadow.offset(alloc.ptr as u64 + off as u64),
+                PAGE,
+            );
             for (i, &b) in got.iter().enumerate() {
                 assert_eq!(b, (i as u8).wrapping_mul(31) ^ round);
             }
 
             let new: Vec<u8> = (0..PAGE).map(|i| (i as u8) ^ round ^ 0xc3).collect();
-            gpu_write(&h.device, &shadow.buffer, (len - PAGE) as u64, &new);
+            gpu_write(
+                &h.device,
+                &shadow.buffer,
+                shadow.offset((alloc.ptr as usize + len - PAGE) as u64),
+                &new,
+            );
             // SAFETY: inside `alloc`.
             let cpu = unsafe { std::slice::from_raw_parts(alloc.ptr.add(len - PAGE), PAGE) };
             assert_eq!(cpu, &new[..]);
@@ -889,6 +1015,45 @@ mod tests {
         );
     }
 
+    /// With small buffers alive, D3DMetal hands out bigger ones mid-page;
+    /// the title's bytes must still be where the GPU reads them.
+    #[test]
+    fn aliasing_holds_when_d3dmetal_places_the_buffer_mid_page() {
+        if !crate::watch::rosetta() {
+            return;
+        }
+        let Some(h) = host() else {
+            return;
+        };
+        let _small: Vec<_> = (0..8)
+            .map(|i| h.shared_buffer(256 << (i % 5)).unwrap())
+            .collect();
+        let len = 2 * PAGE;
+        let init = |p: *mut u8| {
+            // SAFETY: `p` has `len` bytes.
+            unsafe { p.add(PAGE + 8).write(0x3c) }
+        };
+        let alloc = AliasedAlloc::new(len, Some(&init), true);
+        let shadow = crate::shadow::find(alloc.ptr as u64, len as u64).expect("aliased shadow");
+        // SAFETY: `alloc.ptr` has `len` bytes.
+        unsafe {
+            assert_eq!(alloc.ptr.add(PAGE + 8).read_volatile(), 0x3c);
+            alloc.ptr.add(len - 1).write_volatile(0xc3);
+        }
+        let at = shadow.offset(alloc.ptr as u64);
+        assert_eq!(
+            gpu_read(&h.device, &shadow.buffer, at + (PAGE + 8) as u64, 1),
+            vec![0x3c]
+        );
+        assert_eq!(
+            gpu_read(&h.device, &shadow.buffer, at + len as u64 - 1, 1),
+            vec![0xc3]
+        );
+        gpu_write(&h.device, &shadow.buffer, at, &[0x99]);
+        // SAFETY: as above.
+        assert_eq!(unsafe { alloc.ptr.read_volatile() }, 0x99);
+    }
+
     #[test]
     fn aliased_memory_supports_virtual_query_and_write_guard() {
         if !crate::watch::rosetta() {
@@ -945,7 +1110,12 @@ mod tests {
             assert!(hit, "VirtualProtect write guard did not fault");
         }
         assert_eq!(
-            gpu_read(&h.device, &shadow.buffer, (PAGE + 100) as u64, 1),
+            gpu_read(
+                &h.device,
+                &shadow.buffer,
+                shadow.offset(alloc.ptr as u64 + (PAGE + 100) as u64),
+                1
+            ),
             vec![0x77]
         );
     }

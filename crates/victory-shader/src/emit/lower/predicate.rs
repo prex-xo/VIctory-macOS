@@ -62,6 +62,16 @@ pub(super) enum FlatExit {
         exit: usize,
         stay_when_true: bool,
     },
+    /// The exit branch of a while-shaped lockstep-predicated loop, at a
+    /// block other than its latch (which jumps back to `header`): branching
+    /// to `stay` on `group_any_true(next_active) && iter < LOOP_LIMIT`, else
+    /// to `exit`.
+    LockstepExit {
+        header: usize,
+        stay: usize,
+        exit: usize,
+        stay_when_true: bool,
+    },
 }
 
 /// Predication plan computed before `split_wave_barriers` and `Lower::run`.
@@ -305,6 +315,42 @@ impl PredicatePlan {
                         plan.lockstep_exits.insert(exit, h);
                         plan.uniform_branches.insert(latch);
                         plan.in_lockstep_loop.extend(body);
+                        plan.step =
+                            barriers::in_step_with(p, st, &eff_exits, &plan.uniform_branches);
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+
+            if !changed && host_wave32 {
+                // Shape 5: single-exit while-shaped divergent loop (the exit
+                // branch at a block other than the latch, which jumps back to
+                // the header) promoted to group-uniform lockstep execution.
+                for &h in &order {
+                    if plan.dead_blocks.contains(&h)
+                        || plan.lockstep_headers.contains_key(&h)
+                        || plan.in_diamond.contains(&h)
+                    {
+                        continue;
+                    }
+                    if let Some(lp) =
+                        match_lockstep_while_loop(p, &eff_exits, h, &rpo, &needs, &plan)
+                    {
+                        plan.exits.insert(
+                            lp.exiting,
+                            FlatExit::LockstepExit {
+                                header: h,
+                                stay: lp.stay,
+                                exit: lp.exit,
+                                stay_when_true: lp.stay_when_true,
+                            },
+                        );
+                        plan.early_conts.insert(lp.stay, lp.exiting);
+                        plan.lockstep_headers.insert(h, lp.latch);
+                        plan.lockstep_exits.insert(lp.exit, h);
+                        plan.uniform_branches.insert(lp.exiting);
+                        plan.in_lockstep_loop.extend(lp.body);
                         plan.step =
                             barriers::in_step_with(p, st, &eff_exits, &plan.uniform_branches);
                         changed = true;
@@ -884,6 +930,165 @@ fn match_lockstep_loop(
     Some((latch, exit, stay_when_true, body))
 }
 
+/// A while-shaped loop [`match_lockstep_while_loop`] found.
+struct WhileLoop {
+    /// The block jumping back to the header, unconditionally.
+    latch: usize,
+    /// The block whose branch leaves the loop.
+    exiting: usize,
+    /// Its successor inside the loop, and the one outside.
+    stay: usize,
+    exit: usize,
+    /// Whether the branch's condition holds where it stays.
+    stay_when_true: bool,
+    body: Set<usize>,
+}
+
+/// A single-exit loop whose one exit branch is at a block other than its
+/// latch, the latch jumping back to the header `h` (a `while` loop as the
+/// console compiler lays one out, the test before the latch's work): it
+/// runs in lockstep like [`match_lockstep_loop`]'s, the exit branch taken
+/// by the whole group while any lane stays (`FlatExit::LockstepExit`).
+fn match_lockstep_while_loop(
+    p: &Program,
+    exits: &[LaneExit],
+    h: usize,
+    rpo: &[usize],
+    needs: &[bool],
+    plan: &PredicatePlan,
+) -> Option<WhileLoop> {
+    let preds = eff_preds(exits, &plan.dead_blocks, h);
+    let (back, out): (Vec<usize>, Vec<usize>) = preds.into_iter().partition(|&q| rpo[q] >= rpo[h]);
+    let [latch] = back[..] else {
+        return None;
+    };
+    if out.is_empty()
+        || exits[latch] != LaneExit::Jump(h)
+        || plan.exits.contains_key(&latch)
+        || plan.in_diamond.contains(&latch)
+        || plan.in_lockstep_loop.contains(&h)
+        || plan.in_lockstep_loop.contains(&latch)
+        || !out.iter().all(|&q| plan.step[q])
+    {
+        return None;
+    }
+    // The natural loop body, by reverse DFS from `latch` stopping at `h`.
+    let mut body = Set::default();
+    body.insert(h);
+    let mut stack = vec![latch];
+    while let Some(b) = stack.pop() {
+        if !body.insert(b) {
+            continue;
+        }
+        if body.len() > MAX_LOCKSTEP_LOOP_BLOCKS
+            || plan.in_diamond.contains(&b)
+            || plan.in_lockstep_loop.contains(&b)
+            || plan.dead_blocks.contains(&b)
+        {
+            return None;
+        }
+        for q in eff_preds(exits, &plan.dead_blocks, b) {
+            if !body.contains(&q) {
+                if rpo[q] < rpo[h] {
+                    return None; // side entry into loop body
+                }
+                stack.push(q);
+            }
+        }
+    }
+    // One edge leaves the body, from a branch whose other side stays; no
+    // cycle inside the body but the latch's.
+    let mut leaving = None;
+    for &b in &body {
+        let succs: Vec<usize> = match exits[b] {
+            LaneExit::Jump(t) => vec![t],
+            LaneExit::Branch {
+                taken, not_taken, ..
+            } => vec![taken, not_taken],
+            LaneExit::End | LaneExit::Indirect => return None,
+        };
+        for t in succs {
+            if !body.contains(&t) {
+                if leaving.replace((b, t)).is_some() {
+                    return None; // a second exit
+                }
+            } else if rpo[t] <= rpo[b] && !(b == latch && t == h) {
+                return None; // nested cycle inside loop
+            }
+        }
+    }
+    let (exiting, exit) = leaving?;
+    let LaneExit::Branch {
+        taken, not_taken, ..
+    } = exits[exiting]
+    else {
+        return None;
+    };
+    let (stay, stay_when_true) = if not_taken == exit && body.contains(&taken) {
+        (taken, true)
+    } else if taken == exit && body.contains(&not_taken) {
+        (not_taken, false)
+    } else {
+        return None;
+    };
+    if exiting == latch
+        || plan.exits.contains_key(&exiting)
+        || plan.early_conts.contains_key(&stay)
+        || eff_preds(exits, &plan.dead_blocks, stay) != [exiting]
+        || eff_preds(exits, &plan.dead_blocks, exit) != [exiting]
+        || rpo[exit] <= rpo[h]
+        || plan.lockstep_exits.contains_key(&exit)
+        || plan.diamond_joins.contains_key(&exit)
+        || !body.iter().any(|&b| needs[b] && !plan.step[b])
+    {
+        return None;
+    }
+    // As for `match_lockstep_loop`: no scalar the body writes (but EXEC and
+    // VCC) is read outside it, since lanes spinning inactive in lockstep
+    // still run the body's scalar instructions.
+    let is_mask_reg =
+        |r: Reg| matches!(r, Reg::S(k) if [EXEC, EXEC + 1, VCC, VCC + 1].contains(&k));
+    let mut loop_scalars: Set<Value> = Set::default();
+    for &b in &body {
+        for phi in &p.blocks[b].phis {
+            if matches!(phi.reg, Reg::S(_) | Reg::Scc) && !is_mask_reg(phi.reg) {
+                loop_scalars.insert(phi.value);
+            }
+        }
+        for inst in &p.blocks[b].insts {
+            for &(r, v) in &inst.writes {
+                if matches!(r, Reg::S(_) | Reg::Scc) && !is_mask_reg(r) {
+                    loop_scalars.insert(v);
+                }
+            }
+        }
+    }
+    for (b, block) in p.blocks.iter().enumerate() {
+        if body.contains(&b) || plan.dead_blocks.contains(&b) {
+            continue;
+        }
+        if block
+            .phis
+            .iter()
+            .any(|phi| phi.args.iter().any(|v| loop_scalars.contains(v)))
+            || block
+                .insts
+                .iter()
+                .any(|i| i.reads.iter().any(|(_, v)| loop_scalars.contains(v)))
+        {
+            return None;
+        }
+    }
+    Some(WhileLoop {
+        latch,
+        exiting,
+        stay,
+        exit,
+        stay_when_true,
+        body,
+    })
+}
+
 fn post_dominators(exits: &[LaneExit]) -> Vec<Vec<u64>> {
     let n = exits.len();
     let words = n.div_ceil(64);
@@ -1420,6 +1625,44 @@ impl Lower<'_> {
                 Ok(Some(Term::CondBr(
                     go,
                     self.block[header].expect("reachable"),
+                    exit_blk,
+                )))
+            }
+            FlatExit::LockstepExit {
+                header,
+                stay,
+                exit,
+                stay_when_true,
+            } => {
+                let LaneExit::Branch { when, .. } = self.x.st.exits[b] else {
+                    return Ok(None);
+                };
+                let cond = self
+                    .boolean(when, cur)
+                    .map_err(|w| unsupported(offset, w))?;
+                let stays = if stay_when_true {
+                    cond
+                } else {
+                    let t = self.s.m.bool(true);
+                    self.s.m.bin(cur, Bin::Xor, cond, t)
+                };
+                let next_act = and_base(self, stays);
+                self.pred_edge_active.insert((b, stay), next_act);
+                let any = self
+                    .group_any_true(next_act, cur)
+                    .map_err(|w| unsupported(offset, w))?;
+                let ok = self.count_iteration(header, pred::IULT);
+                let go = self.s.m.bin(cur, Bin::And, any, ok);
+                let exit_blk = self.edge(b, exit);
+                let from = if Some(exit_blk) == self.block[exit] {
+                    cur
+                } else {
+                    exit_blk
+                };
+                self.enter_loop(b, exit, from);
+                Ok(Some(Term::CondBr(
+                    go,
+                    self.block[stay].expect("reachable"),
                     exit_blk,
                 )))
             }

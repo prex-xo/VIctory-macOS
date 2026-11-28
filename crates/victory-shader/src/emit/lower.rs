@@ -21,8 +21,11 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Map, Set, Structured};
 
 mod atomics;
+mod back_edges;
+mod pages;
 mod barriers;
 mod bvh;
+mod descriptor_records;
 mod f64;
 mod first_lane;
 /// Format loads that move 16-bit halves without the d16 form, a child
@@ -30,6 +33,7 @@ mod first_lane;
 #[path = "half_views.rs"]
 mod half_views;
 mod halves;
+mod marks;
 mod meet;
 mod packed;
 mod round_mode;
@@ -40,6 +44,8 @@ mod thread_limits;
 #[cfg(test)]
 use barriers::split_wave_barriers;
 use barriers::{in_step, split_wave_barriers_with_step, step_and_cap};
+#[cfg(test)]
+pub(crate) use marks::per_lane_marks;
 pub(crate) use mesh::{KeptOutputs, idle_clip, plan_layout};
 use mesh::prune_signature;
 pub(crate) use meet::MeetSite;
@@ -430,7 +436,7 @@ struct Lower<'a> {
     /// ([`halves::lane_uniform`]), whose first lane either half reads.
     alike: HashSet<Value>,
     /// The results of first-lane reads each host half makes by itself
-    /// ([`first_lane::read_alone`]).
+    /// ([`first_lane::read_alone`], [`first_lane::index_waterfalls`]).
     first_alone: HashSet<Value>,
     /// Pixel: an ordered section (POPS), whose UAVs the host makes
     /// rasterizer-ordered views.
@@ -465,6 +471,10 @@ struct Lower<'a> {
     balloting: Set<Value>,
     /// Block writing each value.
     def_block: Map<Value, usize>,
+    /// Index in its block of the instruction writing each value (phis have
+    /// none): [`Lower::def_site`] without walking the block, which made
+    /// lowering quadratic in a long block's length.
+    def_index: Map<Value, usize>,
     /// IR block being lowered.
     cur_ir: usize,
     /// Whole-wave sections by block and start index.
@@ -478,6 +488,11 @@ struct Lower<'a> {
     memory_null: Option<V>,
     /// The offsets [`Lower::memory`] returned ([`Lower::raw_run`]).
     memory_offsets: HashSet<V>,
+    /// Reads of title memory that may cross onto the next page, by handle
+    /// ([`Lower::page_tail`]).
+    tails: Map<V, pages::Tail>,
+    /// The read being looked up lies in one page, as its caller knows.
+    one_page: bool,
     /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
@@ -708,9 +723,12 @@ impl<'a> Lower<'a> {
         let (mut halves, mut halves_refused) = (false, None);
         let mut alike_cache: Option<HashSet<Value>> = None;
         // First-lane reads each 32-lane host half of a console wave makes
-        // by itself (`first_lane`).
+        // by itself (`first_lane`): reads only active lanes see, and those
+        // opening a register-index waterfall.
         let first_alone = if x.host_wave32 {
-            first_lane::read_alone(x)
+            let mut alone = first_lane::read_alone(x);
+            alone.extend(first_lane::index_waterfalls(x));
+            alone
         } else {
             HashSet::new()
         };
@@ -729,7 +747,10 @@ impl<'a> Lower<'a> {
                     || n.starts_with("v_mbcnt")
                     || matches!(
                         n,
-                        "v_readlane_b32" | "v_writelane_b32" | "v_permlanex16_b32"
+                        "v_readlane_b32"
+                            | "v_writelane_b32"
+                            | "v_permlane16_b32"
+                            | "v_permlanex16_b32"
                     )
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
@@ -981,12 +1002,26 @@ impl<'a> Lower<'a> {
                         .chain(block.phis.iter().map(move |phi| (phi.value, b)))
                 })
                 .collect(),
+            def_index: {
+                let mut at = Map::default();
+                for block in &p.blocks {
+                    for (i, inst) in block.insts.iter().enumerate() {
+                        for w in &inst.writes {
+                            // The first writer, as a walk from the start finds.
+                            at.entry(w.1).or_insert(i);
+                        }
+                    }
+                }
+                at
+            },
             cur_ir: 0,
             sections: HashMap::new(),
             section_out: Set::default(),
             code_table: None,
             memory_null: None,
             memory_offsets: HashSet::new(),
+            tails: Map::default(),
+            one_page: false,
             counters: HashMap::new(),
             abort: None,
             round16: round16(p),
@@ -2378,12 +2413,7 @@ impl<'a> Lower<'a> {
         {
             return Err("a register joining a lane mask and data, read as data");
         }
-        let &b = self.def_block.get(&lo).ok_or(ELSEWHERE)?;
-        let inst = p.blocks[b]
-            .insts
-            .iter()
-            .find(|i| i.writes.iter().any(|w| w.1 == lo))
-            .ok_or(ELSEWHERE)?;
+        let (b, _, inst) = self.def_site(lo).ok_or(ELSEWHERE)?;
         let Fields::Sop {
             dst: Some(Operand::Scalar { code, .. }),
             src,
@@ -2670,14 +2700,14 @@ impl<'a> Lower<'a> {
     /// `dx.op.rawBufferLoad.f32` of the handle, index, offset, mask and
     /// alignment in `args`, in `block`.
     fn raw_buffer_load(&mut self, block: usize, args: &[V]) -> V {
-        self.s.op(
-            block,
-            "rawBufferLoad.f32",
-            Attr::ReadOnly,
-            self.s.t.res_ret,
-            139,
-            args,
-        )
+        match self.tails.get(&args[0]) {
+            Some(&tail) => self.tail_load(block, args, tail),
+            None => self.raw_op(block, args),
+        }
+    }
+
+    fn raw_op(&mut self, block: usize, args: &[V]) -> V {
+        self.s.op(block, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, args)
     }
 
     /// `dx.op.atomicBinOp.i32` of the handle, operation, coordinates and
@@ -3345,11 +3375,7 @@ impl<'a> Lower<'a> {
                 .find(|q| q.reg == h)
                 .map(|q| q.value);
         }
-        let b = *self.def_block.get(&lo)?;
-        let inst = p.blocks[b]
-            .insts
-            .iter()
-            .find(|i| i.writes.iter().any(|w| w.1 == lo))?;
+        let (_, _, inst) = self.def_site(lo)?;
         let &(reg, _) = inst.writes.iter().find(|w| w.1 == lo)?;
         inst.write(pick(reg)?)
     }
@@ -3722,6 +3748,12 @@ impl<'a> Lower<'a> {
         {
             return Some(self.lane_bit_of(c, src, lo, hi));
         }
+        Some(self.host_lane_active(src, guard, mesh_quad))
+    }
+
+    /// Whether this host wave is running the source lane under the guard.
+    fn host_lane_active(&mut self, src: V, guard: Option<V>, mesh_quad: bool) -> V {
+        let c = self.cur;
         let bit = guard.unwrap_or_else(|| self.s.m.bool(true));
         let i32t = self.s.t.i32;
         let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
@@ -3744,7 +3776,7 @@ impl<'a> Lower<'a> {
         } else {
             src
         };
-        Some(self.lane_bit_of(c, ballot_lane, lo, hi))
+        self.lane_bit_of(c, ballot_lane, lo, hi)
     }
 
     /// The float value of a register value.
@@ -4931,7 +4963,10 @@ impl<'a> Lower<'a> {
                 .find_map(|&(s, _)| use_of(s))
         });
         let Some((at, first)) = use_at else {
-            return self.view_addresses(inst, site, code, count);
+            return match self.unused_buffer(site) {
+                Some(props) => self.buffer_records(inst, site, code, count, props),
+                None => self.view_addresses(inst, site, code, count),
+            };
         };
         let src = Source::Loaded { load: site, first };
         let used = self.used_kind(&src);
@@ -5146,8 +5181,8 @@ impl<'a> Lower<'a> {
     /// key, in registers, before any of them locks. One pass a group: the
     /// lowest lane remaining leads, the lanes on its texel contribute to
     /// two wave maxima — the group's high dword, then the low dwords of
-    /// its best — and the lead takes the result while they leave. The
-    /// loop is wave-uniform: `remaining` is the ballot the caller took
+    /// its best — and the lead takes the result while they leave. A
+    /// singleton already holds its maximum. The loop is wave-uniform: `remaining` is the ballot the caller took
     /// where its guard was live, and every other edge carries another
     /// ballot, so every lane runs it alike and the wave operations inside
     /// see the participating set. A wave wider than 32 lanes has bits the
@@ -5161,11 +5196,11 @@ impl<'a> Lower<'a> {
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
         let (zero, one) = (k(self, 0), k(self, 1));
         let (yes, no) = (self.s.m.bool(true), self.s.m.bool(false));
-        let mut blocks = [0; 3];
+        let mut blocks = [0; 5];
         for b in &mut blocks {
             *b = self.s.m.new_block();
         }
-        let [head, body, done] = blocks;
+        let [head, body, reduce, next, done] = blocks;
         self.s.m.terminate(c, Term::Br(head));
         let remaining = self.s.m.phi(head, i32t);
         let rep = self.s.m.phi(head, i1);
@@ -5173,18 +5208,9 @@ impl<'a> Lower<'a> {
         let ghi = self.s.m.phi(head, i32t);
         let more = self.s.m.cmp(head, pred::NE, remaining, zero);
         self.s.m.terminate(head, Term::CondBr(more, body, done));
-        // The lead: the lowest lane remaining, by halving.
-        let mut x = remaining;
-        let mut lead = zero;
-        for b in [16u32, 8, 4, 2, 1] {
-            let (mask, step) = (k(self, (1 << b) - 1), k(self, b));
-            let low = self.s.m.bin(body, Bin::And, x, mask);
-            let has = self.s.m.cmp(body, pred::NE, low, zero);
-            let up = self.s.m.bin(body, Bin::Add, lead, step);
-            lead = self.s.m.select(body, has, lead, up);
-            let high = self.s.m.bin(body, Bin::LShr, x, step);
-            x = self.s.m.select(body, has, low, high);
-        }
+        // The body is reached only with a nonempty ballot, so FirstbitLo
+        // returns the lowest numbered lane remaining.
+        let lead = self.unary_bits(body, 32, remaining);
         // The group: the lanes remaining on the lead's texel.
         let mut same = yes;
         for &ck in cs.iter().take(coords) {
@@ -5201,41 +5227,51 @@ impl<'a> Lower<'a> {
         let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
         let group = self.s.op(body, "waveActiveBallot", Attr::NoUnwind, four, 116, &[same]);
         let group = self.s.m.extract(body, group, 0);
+        // The ballot is uniform. A single lane already has its own maximum.
+        let lower = self.s.m.bin(body, Bin::Sub, group, one);
+        let rest = self.s.m.bin(body, Bin::And, group, lower);
+        let multiple = self.s.m.cmp(body, pred::NE, rest, zero);
+        self.s.m.terminate(body, Term::CondBr(multiple, reduce, next));
         // The group's maximum key, in two maxima.
         let (kind, unsigned) = (self.s.m.i8(3), self.s.m.i8(1));
-        let offer_hi = self.s.m.select(body, same, ghi, zero);
+        let offer_hi = self.s.m.select(reduce, same, ghi, zero);
         let g_hi = self.s.op(
-            body,
+            reduce,
             "waveActiveOp.i32",
             Attr::NoUnwind,
             i32t,
             119,
             &[offer_hi, kind, unsigned],
         );
-        let best = self.s.m.cmp(body, pred::EQ, ghi, g_hi);
-        let same_lo = self.s.m.select(body, same, glo, zero);
-        let offer_lo = self.s.m.select(body, best, same_lo, zero);
+        let best = self.s.m.cmp(reduce, pred::EQ, ghi, g_hi);
+        let same_lo = self.s.m.select(reduce, same, glo, zero);
+        let offer_lo = self.s.m.select(reduce, best, same_lo, zero);
         let g_lo = self.s.op(
-            body,
+            reduce,
             "waveActiveOp.i32",
             Attr::NoUnwind,
             i32t,
             119,
             &[offer_lo, kind, unsigned],
         );
+        self.s.m.terminate(reduce, Term::Br(next));
+        let selected_lo = self.s.m.phi(next, i32t);
+        let selected_hi = self.s.m.phi(next, i32t);
+        self.s.m.set_phi(selected_lo, vec![(glo, body), (g_lo, reduce)]);
+        self.s.m.set_phi(selected_hi, vec![(ghi, body), (g_hi, reduce)]);
         // The lead takes the group's key; the group leaves.
-        let am = self.s.m.cmp(body, pred::EQ, me, lead);
-        let nlo = self.s.m.select(body, am, g_lo, glo);
-        let nhi = self.s.m.select(body, am, g_hi, ghi);
-        let nrep = self.s.m.bin(body, Bin::Or, rep, am);
+        let am = self.s.m.cmp(next, pred::EQ, me, lead);
+        let nlo = self.s.m.select(next, am, selected_lo, glo);
+        let nhi = self.s.m.select(next, am, selected_hi, ghi);
+        let nrep = self.s.m.bin(next, Bin::Or, rep, am);
         let not_group = k(self, u32::MAX);
-        let flip = self.s.m.bin(body, Bin::Xor, group, not_group);
-        let left = self.s.m.bin(body, Bin::And, remaining, flip);
-        self.s.m.terminate(body, Term::Br(head));
-        self.s.m.set_phi(remaining, vec![(present, c), (left, body)]);
-        self.s.m.set_phi(rep, vec![(no, c), (nrep, body)]);
-        self.s.m.set_phi(glo, vec![(vlo, c), (nlo, body)]);
-        self.s.m.set_phi(ghi, vec![(vhi, c), (nhi, body)]);
+        let flip = self.s.m.bin(next, Bin::Xor, group, not_group);
+        let left = self.s.m.bin(next, Bin::And, remaining, flip);
+        self.s.m.terminate(next, Term::Br(head));
+        self.s.m.set_phi(remaining, vec![(present, c), (left, next)]);
+        self.s.m.set_phi(rep, vec![(no, c), (nrep, next)]);
+        self.s.m.set_phi(glo, vec![(vlo, c), (nlo, next)]);
+        self.s.m.set_phi(ghi, vec![(vhi, c), (nhi, next)]);
         self.cur = done;
         let lo = self.s.m.cast(done, Cast::ZExt, glo, i64t);
         let hi = self.s.m.cast(done, Cast::ZExt, ghi, i64t);
@@ -5265,75 +5301,6 @@ impl<'a> Lower<'a> {
         (self.as_int(a), self.as_int(b))
     }
 
-    /// Marks the pages a write of `bytes` bytes at byte `x` of the unordered
-    /// buffer view `h` touches, in the lanes `guard` lets through (module
-    /// notes, "Write marks"): the bits of its first and last byte, set only
-    /// where still clear (both read in one word when they share it, as they
-    /// nearly always do). Nothing for handles that are no heap view, or
-    /// without [`Parts::view_marks`].
-    fn mark_view_write(&mut self, h: V, x: V, bytes: V, guard: Option<V>) {
-        if !self.x.view_marks {
-            return;
-        }
-        let Some(&index) = self.s.view_index.get(&h) else {
-            return;
-        };
-        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
-        let table = self.s.view_marks_handle();
-        let c = self.cur;
-        let eight = k(self, 8);
-        let at = self.s.m.bin(c, Bin::Mul, index, eight);
-        let (base, phase) = self.raw_pair(table, at);
-        let none = k(self, super::VIEW_MARK_NONE);
-        let valid = self.s.m.cmp(c, pred::NE, base, none);
-        let active = match guard {
-            Some(g) => self.s.m.bin(c, Bin::And, g, valid),
-            None => valid,
-        };
-        let first = self.s.m.bin(c, Bin::Add, phase, x);
-        let (zero, one) = (k(self, 0), k(self, 1));
-        let nonempty = self.s.m.cmp(c, pred::NE, bytes, zero);
-        let span = self.s.m.bin(c, Bin::Sub, bytes, one);
-        let span = self.s.m.select(c, nonempty, span, zero);
-        let last = self.s.m.bin(c, Bin::Add, first, span);
-        let (k16, cap) = (k(self, 16), k(self, super::VIEW_WRITE_BITS - 1));
-        let (k5, k2, k31) = (k(self, 5), k(self, 2), k(self, 31));
-        // Each byte's page bit, and its bitmap dword's byte offset and mask.
-        let mut bits = Vec::new();
-        for byte in [first, last] {
-            let page = self.s.m.bin(c, Bin::LShr, byte, k16);
-            let n = self.s.m.bin(c, Bin::Add, base, page);
-            let over = self.s.m.cmp(c, pred::IUGT, n, cap);
-            let n = self.s.m.select(c, over, cap, n);
-            let word = self.s.m.bin(c, Bin::LShr, n, k5);
-            let word = self.s.m.bin(c, Bin::Shl, word, k2);
-            let bit = self.s.m.bin(c, Bin::And, n, k31);
-            bits.push((word, self.s.m.bin(c, Bin::Shl, one, bit)));
-        }
-        let [(word, first_bit), (last_word, last_bit)] = [bits[0], bits[1]];
-        // In bounds for any lane (the bit is capped), so read before the
-        // guard; most writes find their pages marked: a load, not an atomic.
-        let bitmap = self.s.view_writes_handle();
-        let old = self.raw_dword(bitmap, word);
-        let together = self.s.m.cmp(c, pred::EQ, word, last_word);
-        let also = self.s.m.select(c, together, last_bit, zero);
-        let want = self.s.m.bin(c, Bin::Or, first_bit, also);
-        let set = self.s.m.bin(c, Bin::And, old, want);
-        let clear = self.s.m.cmp(c, pred::NE, set, want);
-        let apart = self.s.m.cmp(c, pred::NE, word, last_word);
-        let more = self.s.m.bin(c, Bin::Or, clear, apart);
-        let go = self.s.m.bin(c, Bin::And, active, more);
-        let outer = self.begin_guarded(Some(go));
-        let iu = self.s.m.undef(self.s.t.i32);
-        // Operation 2 is OR; setting a set bit again changes nothing.
-        self.atomic_bin_op(self.cur, &[bitmap, k2, word, iu, iu, want]);
-        // A write across two bitmap dwords: the last byte's is its own.
-        let inner = self.begin_guarded(Some(apart));
-        self.atomic_bin_op(self.cur, &[bitmap, k2, last_word, iu, iu, last_bit]);
-        self.end_guarded(inner, &[]);
-        self.end_guarded(outer, &[]);
-    }
-
     /// Title memory at a raw GPU address (decision 0005: the unified-memory
     /// item). Every access to an address the program computes goes through
     /// here: scalar and global loads, stores and atomics, the BVH node
@@ -5349,8 +5316,11 @@ impl<'a> Lower<'a> {
     /// [`super::shader::MEMORY_SPACE`]; the root UAV `u0` there takes a bit
     /// per page written and per page or 256 MiB region missed. May end in a
     /// new block: callers take [`Lower::cur`] afresh.
-    // shortcut: one lookup per access, so its bytes are taken to lie in one
-    // host copy of title memory (any access within a 64 KiB page does).
+    // A read of more than a dword that crosses onto the next 64 KiB page
+    // looks that page up too and takes its dwords there from that page's
+    // copy (`pages`); a BVH node's reads see to that themselves (`bvh`).
+    // shortcut: one lookup for an access of a dword or less, which lies in
+    // one page unless its address is not 4-byte aligned.
     pub(crate) fn memory(
         &mut self,
         lo: V,
@@ -5404,6 +5374,9 @@ impl<'a> Lower<'a> {
             self.mark_memory_bit(bitmap, second);
             self.end_guarded(at, &[]);
         }
+        if !write && bytes > 4 && !self.one_page {
+            self.page_tail(lo, hi, bytes, e.handle, e.offset, active);
+        }
         self.memory_offsets.insert(e.offset);
         (e.handle, e.offset)
     }
@@ -5425,27 +5398,6 @@ impl<'a> Lower<'a> {
         let (word, bit) = self.memory_bit(n);
         // Operation 2 is OR.
         self.atomic_bin_op(c, &[bitmap, k2, word, iu, iu, bit]);
-    }
-
-    /// Sets bit `n` in `bitmap` in the lanes `guard` lets through (`None`:
-    /// all), with an atomic only where a load finds it clear: most stores
-    /// find their page marked. A lane that reads a stale 0 only ORs again.
-    fn mark_memory_bit_if_clear(&mut self, bitmap: V, n: V, guard: Option<V>) {
-        let c = self.cur;
-        let (k2, zero) = (self.s.m.i32(2), self.s.m.i32(0));
-        let (word, bit) = self.memory_bit(n);
-        // Read in every lane: out of the bitmap reads 0, an index the
-        // atomic then drops.
-        let old = self.raw_dword(bitmap, word);
-        let set = self.s.m.bin(c, Bin::And, old, bit);
-        let mut clear = self.s.m.cmp(c, pred::EQ, set, zero);
-        if let Some(g) = guard {
-            clear = self.s.m.bin(c, Bin::And, clear, g);
-        }
-        let at = self.begin_guarded(Some(clear));
-        let iu = self.s.m.undef(self.s.t.i32);
-        self.atomic_bin_op(self.cur, &[bitmap, k2, word, iu, iu, bit]);
-        self.end_guarded(at, &[]);
     }
 
     /// The byte offset of the bitmap dword holding bit `n`, and the bit's
@@ -7568,15 +7520,16 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.select(c, is, a, old);
                 int(self, r)
             }
-            "v_permlanex16_b32" => {
+            "v_permlane16_b32" | "v_permlanex16_b32" => {
                 self.cross_lane(false)?;
+                let cross_row = name == "v_permlanex16_b32";
                 let (value, low, high) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
                 let lane = self.lane_index();
                 let [two, seven, eight, fifteen, sixteen, row_mask] =
                     [2, 7, 8, 15, 16, !15].map(|n| self.s.m.i32(n));
                 // The nibble for this lane comes from src1 at offsets 0..7
-                // and src2 at offsets 8..15. It indexes the other row of 16
-                // in the same 32-lane half of the wave.
+                // and src2 at offsets 8..15. Only permlanex16 switches
+                // rows. Both source rows are within this host wave.
                 let in_row = self.s.m.bin(c, Bin::And, lane, fifteen);
                 let hi = self.s.m.cmp(c, pred::IUGE, in_row, eight);
                 let selectors = self.s.m.select(c, hi, high, low);
@@ -7585,22 +7538,42 @@ impl<'a> Lower<'a> {
                 let pick = self.s.m.bin(c, Bin::LShr, selectors, shift);
                 let pick = self.s.m.bin(c, Bin::And, pick, fifteen);
                 let row = self.s.m.bin(c, Bin::And, lane, row_mask);
-                let row = self.s.m.bin(c, Bin::Xor, row, sixteen);
+                let row = if cross_row {
+                    self.s.m.bin(c, Bin::Xor, row, sixteen)
+                } else {
+                    row
+                };
                 let source = self.s.m.bin(c, Bin::Or, row, pick);
+                // In a partial row the selector can name an absent lane
+                // even with no explicit EXEC guard. With FI clear, use a
+                // ballot and a live index for the DXIL lane read.
+                let same_row_active = if !cross_row && v.opsel & 1 == 0 {
+                    Some(self.host_lane_active(source, guard, false))
+                } else {
+                    None
+                };
+                let source =
+                    same_row_active.map_or(source, |on| self.s.m.select(c, on, source, lane));
                 let value = self.read_lane(value, source);
 
                 // With FI clear, guest EXEC controls whether the source
                 // contributes. BOUND_CTRL selects zero or keeps the old dst.
-                if let Some(active) = guard.filter(|_| v.opsel & 1 == 0) {
-                    let src_active = self.s.m.cast(c, Cast::ZExt, active, self.s.t.i32);
-                    let src_active = self.read_lane(src_active, source);
+                let src_active = same_row_active.or_else(|| {
+                    let active = guard.filter(|_| v.opsel & 1 == 0)?;
+                    let active = self.s.m.cast(c, Cast::ZExt, active, self.s.t.i32);
+                    let active = self.read_lane(active, source);
                     let zero = self.s.m.i32(0);
-                    let src_active = self.s.m.cmp(c, pred::NE, src_active, zero);
+                    Some(self.s.m.cmp(c, pred::NE, active, zero))
+                });
+                if let Some(src_active) = src_active {
                     if v.opsel & 2 != 0 {
+                        let zero = self.s.m.i32(0);
                         let value = self.s.m.select(c, src_active, value, zero);
                         return int(self, value);
                     }
-                    let write = self.s.m.bin(c, Bin::And, active, src_active);
+                    let write = guard.map_or(src_active, |active| {
+                        self.s.m.bin(c, Bin::And, active, src_active)
+                    });
                     return self.write_i(inst, value, Some(write));
                 }
                 int(self, value)
@@ -7620,8 +7593,13 @@ impl<'a> Lower<'a> {
                 // for a value the same in both halves, or where the group is
                 // one host wave.
                 let is_vec = matches!(v.src.first(), Some(&Operand::Vector { .. }));
-                let is_alike = matches!(v.src.first(), Some(&Operand::Vector { reg, .. })
-                    if inst.read(Reg::V(reg)).is_some_and(|x| self.alike.contains(&x)));
+                // Alike in the lanes that made it: in a block predication
+                // runs in every lane the others hold an old value, and a
+                // half may have none of the first. There it is read as any
+                // other: from a lane of the predicate, between the halves.
+                let is_alike = self.pred_active(self.cur_ir).is_none()
+                    && matches!(v.src.first(), Some(&Operand::Vector { reg, .. })
+                        if inst.read(Reg::V(reg)).is_some_and(|x| self.alike.contains(&x)));
                 // Each half's own first active lane is the console's
                 // (`first_lane`): read it, with no exchange.
                 let alone = inst.writes.first().is_some_and(|w| self.first_alone.contains(&w.1));
@@ -9425,34 +9403,6 @@ impl<'a> Lower<'a> {
         lowered
     }
 
-    /// Sets the read mark of resource-heap index `index` (module notes,
-    /// "Read marks") where it is still clear. Nothing without
-    /// [`Parts::view_marks`].
-    fn mark_view_read(&mut self, index: V) {
-        if !self.x.view_marks {
-            return;
-        }
-        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
-        let bitmap = self.s.view_writes_handle();
-        let c = self.cur;
-        let (base, k5, k2, k31, one, zero) =
-            (k(self, super::VIEW_READS), k(self, 5), k(self, 2), k(self, 31), k(self, 1), k(self, 0));
-        let n = self.s.m.bin(c, Bin::Add, index, base);
-        let word = self.s.m.bin(c, Bin::LShr, n, k5);
-        let word = self.s.m.bin(c, Bin::Shl, word, k2);
-        let bit = self.s.m.bin(c, Bin::And, n, k31);
-        let bit = self.s.m.bin(c, Bin::Shl, one, bit);
-        // Most reads find their slot marked: a load, not an atomic.
-        let old = self.raw_dword(bitmap, word);
-        let set = self.s.m.bin(c, Bin::And, old, bit);
-        let clear = self.s.m.cmp(c, pred::EQ, set, zero);
-        let at = self.begin_guarded(Some(clear));
-        let iu = self.s.m.undef(self.s.t.i32);
-        // Operation 2 is OR.
-        self.atomic_bin_op(self.cur, &[bitmap, k2, word, iu, iu, bit]);
-        self.end_guarded(at, &[]);
-    }
-
     fn image_op(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Image {
             data,
@@ -10444,11 +10394,7 @@ impl<'a> Lower<'a> {
             let io = self.x.io.inputs.iter().any(|i| i.0 == v);
             return (vgpr && !io).then_some(true);
         };
-        let (i, inst) = p.blocks[b]
-            .insts
-            .iter()
-            .enumerate()
-            .find(|(_, i)| i.writes.iter().any(|w| w.1 == v))?;
+        let (_, i, inst) = self.def_site(v)?;
         let Fields::Valu(f) = &inst.fields else {
             return None;
         };
@@ -11273,10 +11219,9 @@ impl<'a> Lower<'a> {
                     && back(self, taken)
                     && back(self, not_taken)
                 {
-                    return Err(unsupported(
-                        offset,
-                        "a wave64 branch with two loop back edges",
-                    ));
+                    let term = self.two_back_edges(b, cond, taken, not_taken);
+                    self.s.m.terminate(self.cur, term);
+                    return Ok(());
                 }
                 // (No `xor` of a compare: a loop exit testing one hung the
                 // AMD driver.)
@@ -11580,11 +11525,9 @@ impl<'a> Lower<'a> {
     /// The block, instruction index, and instruction writing `v`.
     fn def_site(&self, v: Value) -> Option<(usize, usize, &'a Inst)> {
         let b = *self.def_block.get(&v)?;
-        let (i, inst) = self.x.p.blocks[b]
-            .insts
-            .iter()
-            .enumerate()
-            .find(|(_, inst)| inst.writes.iter().any(|w| w.1 == v))?;
+        let i = *self.def_index.get(&v)?;
+        let inst = self.x.p.blocks[b].insts.get(i)?;
+        debug_assert!(inst.writes.iter().any(|w| w.1 == v));
         Some((b, i, inst))
     }
 

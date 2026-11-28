@@ -663,6 +663,28 @@ impl Layout {
         slice: u32,
         ranges: &[(usize, usize)],
     ) -> Option<(std::ops::Range<u32>, std::ops::Range<usize>)> {
+        if self.desc.swizzle != Swizzle::LINEAR {
+            return self.tiled_touched_rows(mip, slice, ranges);
+        }
+        let m = self.mips.get(mip as usize)?;
+        let first = if self.desc.dimension == Dimension::Tex3d {
+            (slice == 0).then_some(0)?
+        } else {
+            slice
+        };
+        if first >= self.slices || !self.addressable() {
+            return None;
+        }
+        Some(self.linear_touched_rows(m, first, ranges))
+    }
+
+    #[inline(never)]
+    fn tiled_touched_rows(
+        &self,
+        mip: u32,
+        slice: u32,
+        ranges: &[(usize, usize)],
+    ) -> Option<(std::ops::Range<u32>, std::ops::Range<usize>)> {
         let m = self.mips.get(mip as usize)?;
         let first = if self.desc.dimension == Dimension::Tex3d {
             (slice == 0).then_some(0)?
@@ -678,16 +700,12 @@ impl Layout {
         let (lo, hi) = if linear {
             (0, m.width as usize * n)
         } else {
-            let (mut lo, mut hi) = (usize::MAX, 0usize);
-            for x in 0..m.width {
-                let c = self.column(m, x) as usize;
-                lo = lo.min(c);
-                hi = hi.max(c + n);
-            }
-            if lo >= hi {
-                return None;
-            }
-            (lo, hi)
+            // The swizzle places successive X bits in increasing address-bit
+            // order. Column offsets therefore increase even across blocks.
+            (
+                self.column(m, 0) as usize,
+                self.column(m, m.width - 1) as usize + n,
+            )
         };
         let start = |z: u32, y: u32| {
             let (s, inner) = self.split(first + z);
@@ -704,11 +722,25 @@ impl Layout {
                 .is_some_and(|r| r.0 < b)
         };
         let (mut y0, mut y1) = (u32::MAX, 0);
+        let tiled_mip = !linear && m.tail.is_none();
+        let band_height = if tiled_mip { self.block[1] } else { 1 };
+        let block_bytes = self.alignment as usize;
         for z in 0..m.depth {
-            for y in 0..m.height {
-                let at = start(z, y);
-                if hit(at + lo, at + hi) {
-                    (y0, y1) = (y0.min(y), y1.max(y + 1));
+            for first_y in (0..m.height).step_by(band_height as usize) {
+                if tiled_mip {
+                    // A full band occupies one row of blocks. Strip the
+                    // within-block Y and Z bits to test its enclosing span.
+                    let base = start(z, first_y) & !(block_bytes - 1);
+                    let end = base + (m.pitch / self.block[0]) as usize * block_bytes;
+                    if !hit(base, end) {
+                        continue;
+                    }
+                }
+                for y in first_y..(first_y + band_height).min(m.height) {
+                    let at = start(z, y);
+                    if hit(at + lo, at + hi) {
+                        (y0, y1) = (y0.min(y), y1.max(y + 1));
+                    }
                 }
             }
         }
@@ -723,6 +755,45 @@ impl Layout {
             }
         }
         Some((y0..y1, a..b))
+    }
+
+    // Keep the interval arithmetic out of the tiled row walk.
+    #[inline(never)]
+    fn linear_touched_rows(
+        &self,
+        m: &Mip,
+        first: u32,
+        ranges: &[(usize, usize)],
+    ) -> (std::ops::Range<u32>, std::ops::Range<usize>) {
+        let pitch = m.pitch as usize * self.desc.element_bytes as usize;
+        let bytes = m.width as usize * self.desc.element_bytes as usize;
+        let base = |z: u32| (u64::from(first + z) * self.slice_size + m.offset) as usize;
+        let (mut y0, mut y1) = (m.height, 0);
+        for z in 0..m.depth {
+            let at = base(z);
+            for &(a, b) in ranges {
+                if b <= at {
+                    continue;
+                }
+                let from = if a < at + bytes {
+                    0
+                } else {
+                    (a - at - bytes) / pitch + 1
+                };
+                let to = (b - at).div_ceil(pitch).min(m.height as usize);
+                if from < to {
+                    y0 = y0.min(from as u32);
+                    y1 = y1.max(to as u32);
+                }
+            }
+        }
+        if y0 >= y1 {
+            return (0..0, 0..0);
+        }
+        (
+            y0..y1,
+            base(0) + y0 as usize * pitch..base(m.depth - 1) + (y1 - 1) as usize * pitch + bytes,
+        )
     }
 
     /// The reverse of [`Layout::detile`]: linear rows into tiled memory.
@@ -1219,6 +1290,68 @@ mod tests {
         }
     }
 
+    #[test]
+    fn linear_row_bounds_match_a_row_scan() {
+        let mut seed = 7u64;
+        for dimension in [Dimension::Tex2d, Dimension::Tex3d] {
+            for width in [1, 17, 64, 257] {
+                let l = Layout::new(&Desc {
+                    dimension,
+                    width,
+                    height: 67,
+                    depth: 3,
+                    mips: 4,
+                    element_bytes: 4,
+                    block: 1,
+                    samples: 1,
+                    swizzle: Swizzle::LINEAR,
+                })
+                .unwrap();
+                for mip in 0..4 {
+                    let m = &l.mips[mip as usize];
+                    for slice in 0..if dimension == Dimension::Tex2d { 3 } else { 1 } {
+                        for _ in 0..100 {
+                            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                            let a = seed as usize % (l.size as usize + 4096);
+                            let len = (seed >> 32) as usize % 8192;
+                            let ranges = match seed & 7 {
+                                0 => vec![],
+                                1 => vec![(a, a)],
+                                _ => vec![(a, a + len), (a + len + 100, a + len + 301)],
+                            };
+                            let mut rows = Vec::new();
+                            for z in 0..m.depth {
+                                for y in 0..m.height {
+                                    let at = l.offset(mip, 0, y, z + slice).unwrap() as usize;
+                                    if ranges
+                                        .iter()
+                                        .any(|&(a, b)| b > at && a < at + m.width as usize * 4)
+                                    {
+                                        rows.push(y);
+                                    }
+                                }
+                            }
+                            let expected = if rows.is_empty() {
+                                (0..0, 0..0)
+                            } else {
+                                let from = *rows.iter().min().unwrap();
+                                let to = *rows.iter().max().unwrap() + 1;
+                                (
+                                    from..to,
+                                    l.offset(mip, 0, from, slice).unwrap() as usize
+                                        ..l.offset(mip, 0, to - 1, m.depth - 1 + slice).unwrap()
+                                            as usize
+                                            + m.width as usize * 4,
+                                )
+                            };
+                            assert_eq!(l.touched_rows(mip, slice, &ranges), Some(expected));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Active bytes copied per second on synthetic surfaces:
     /// `cargo test --release -p victory-formats detile_throughput -- --ignored --nocapture`.
     #[test]
@@ -1566,12 +1699,81 @@ mod tests {
         assert!(odd_start > 0);
     }
 
+    #[test]
+    fn tiled_dirty_bands_match_a_scan_of_element_addresses() {
+        for (dimension, swizzle) in [
+            (Dimension::Tex2d, Swizzle::SW_256B_D),
+            (Dimension::Tex2d, Swizzle::SW_4KB_D),
+            (Dimension::Tex2d, Swizzle::SW_64KB_D),
+            (Dimension::Tex3d, Swizzle::SW_4KB_S),
+            (Dimension::Tex3d, Swizzle::SW_64KB_S),
+        ] {
+            for element_bytes in [1, 2, 4, 8, 16] {
+                let l = Layout::new(&Desc {
+                    dimension,
+                    depth: 3,
+                    ..desc(259, 137, 7, element_bytes, swizzle)
+                })
+                .unwrap();
+                let slice = u32::from(dimension == Dimension::Tex2d);
+                for (mip, m) in l.mips.iter().enumerate() {
+                    let rows: Vec<_> = (0..m.depth)
+                        .flat_map(|z| (0..m.height).map(move |y| (z, y)))
+                        .map(|(z, y)| {
+                            let offsets = (0..m.width).map(|x| {
+                                l.offset(mip as u32, x, y, slice + z).unwrap() as usize
+                            });
+                            let lo = offsets.clone().min().unwrap();
+                            let hi = offsets.max().unwrap() + element_bytes as usize;
+                            (y, lo, hi)
+                        })
+                        .collect();
+                    let (_, first, _) = rows[0];
+                    let (_, middle, _) = rows[rows.len() / 2];
+                    let (_, _, end) = rows[rows.len() - 1];
+                    for ranges in [
+                        &[][..],
+                        &[(first, first + 1)],
+                        &[(middle, middle + 1)],
+                        &[(end - 1, end)],
+                        &[(first, first + 1), (end - 1, end)],
+                        &[(0, l.size as usize)],
+                    ] {
+                        let mut y0 = m.height;
+                        let mut y1 = 0;
+                        for &(y, lo, hi) in &rows {
+                            if ranges.iter().any(|&(a, b)| lo < b && a < hi) {
+                                (y0, y1) = (y0.min(y), y1.max(y + 1));
+                            }
+                        }
+                        let expected = if y0 < y1 {
+                            let (mut lo, mut hi) = (usize::MAX, 0);
+                            for &(_, a, b) in rows.iter().filter(|r| (y0..y1).contains(&r.0)) {
+                                (lo, hi) = (lo.min(a), hi.max(b));
+                            }
+                            (y0..y1, lo..hi)
+                        } else {
+                            (0..0, 0..0)
+                        };
+                        assert_eq!(
+                            l.touched_rows(mip as u32, slice, ranges),
+                            Some(expected),
+                            "{dimension:?} {swizzle:?}, {element_bytes} B, mip {mip}, {ranges:?}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// Timing (run with --release --ignored --nocapture): one 64 KiB page
     /// written into mip 0 of a 4096x4096 BC7 texture, detiled whole (as a
     /// changed subresource is without the rows) and as its touched rows.
     #[test]
     #[ignore]
     fn detile_the_rows_of_one_written_page_of_a_4k_bc7_texture() {
+        use std::hint::black_box;
+
         let d = Desc {
             block: 4,
             ..desc(4096, 4096, 13, 16, Swizzle::SW_64KB_S)
@@ -1581,11 +1783,23 @@ mod tests {
         let tiled: Vec<u8> = (0..l.size as usize).map(|i| (i * 31) as u8).collect();
         let row = m.width as usize * 16;
         let mut linear = vec![0u8; row * m.height as usize];
-        let from = (l.mips[0].offset as usize
-            + (m.width as usize * 16 * m.height as usize) / 2)
+        let from = (l.mips[0].offset as usize + (m.width as usize * 16 * m.height as usize) / 2)
             / 65536
             * 65536;
         let ranges = [(from, from + 65536)];
+        let queries = 20_000;
+        let t = std::time::Instant::now();
+        for _ in 0..queries {
+            black_box(
+                black_box(&l)
+                    .touched_rows(0, 0, black_box(&ranges))
+                    .unwrap(),
+            );
+        }
+        println!(
+            "BC7 4096x4096 mip 0 dirty-row query: {:?}",
+            t.elapsed() / queries
+        );
         let runs = 20;
         let t = std::time::Instant::now();
         for _ in 0..runs {

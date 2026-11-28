@@ -42,8 +42,12 @@ impl Cache {
     }
 
     fn path_for(&self, key: &CacheKey) -> PathBuf {
-        let hex = key.to_hex();
-        self.root.join(&hex[..2]).join(&hex[2..])
+        let hex = key.0.to_hex();
+        let mut path = PathBuf::with_capacity(self.root.as_os_str().len() + hex.len() + 2);
+        path.push(&self.root);
+        path.push(&hex[..2]);
+        path.push(&hex[2..]);
+        path
     }
 
     /// Returns the cached output for `input`, converting it first if needed.
@@ -443,6 +447,41 @@ mod tests {
             runs: AtomicUsize::new(0),
         };
         assert_ne!(CacheKey::new(&v1, b"x"), CacheKey::new(&v2, b"x"));
+    }
+
+    #[test]
+    fn preallocated_cache_paths_match_component_joins() {
+        let roots: Vec<PathBuf> = [
+            "",
+            "/",
+            ".",
+            "relative/cache",
+            "/tmp/cache/",
+            "/tmp/cache//",
+            "/tmp/café",
+            "C:",
+            "C:cache",
+            "C:\\cache\\",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+        #[cfg(unix)]
+        let roots = {
+            use std::os::unix::ffi::OsStringExt;
+            let mut roots = roots;
+            roots.push(std::ffi::OsString::from_vec(vec![b'/', b't', 0xff]).into());
+            roots
+        };
+        for root in roots {
+            let cache = Cache { root };
+            for byte in 0..=255 {
+                let key = CacheKey(blake3::Hash::from_bytes([byte; 32]));
+                let hex = key.to_hex();
+                let expected = cache.root.join(&hex[..2]).join(&hex[2..]);
+                assert_eq!(cache.path_for(&key).as_os_str(), expected.as_os_str());
+            }
+        }
     }
 
     #[test]

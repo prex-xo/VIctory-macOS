@@ -9,9 +9,18 @@
 //! (heap slots keep views' resources until the running submission has run,
 //! lists until they are reset), so no view or list sees its memory reused.
 //! Empty heaps past [`SPARE`] are released.
+//!
+//! A heap is memory of the process whole until it is released, and holes
+//! left by textures given up are refilled first fit in every heap, so few
+//! empty. The eviction pass empties a sparse heap now and then
+//! ([`choose_to_empty`], `crate::heap_fit::to_empty`): it gives up the
+//! heap's textures, and nothing new is placed there while another heap has
+//! room.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
+
+use crate::heap_fit::{HeapUse, give, pick, take};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::Interface;
@@ -45,46 +54,15 @@ struct Heaps {
     /// Ranges whose texture may still be held elsewhere, with a holder of
     /// our own.
     pending: Vec<(ID3D12Resource, Placement)>,
+    /// The heap being emptied ([`choose_to_empty`]): new textures go
+    /// elsewhere while another heap has room.
+    emptying: Option<u64>,
 }
 
 // SAFETY: D3D12 heaps and resources are free-threaded; used under the lock.
 unsafe impl Send for Heaps {}
 
 static HEAPS: Mutex<Option<Heaps>> = Mutex::new(None);
-
-/// The first range of `free` that fits `size` bytes at `align`: its
-/// offset, taken out of `free`.
-fn take(free: &mut BTreeMap<u64, u64>, size: u64, align: u64) -> Option<u64> {
-    let (&start, &len, at) = free.iter().find_map(|(s, l)| {
-        let at = s.next_multiple_of(align);
-        (at + size <= s + l).then_some((s, l, at))
-    })?;
-    free.remove(&start);
-    if at > start {
-        free.insert(start, at - start);
-    }
-    if at + size < start + len {
-        free.insert(at + size, start + len - at - size);
-    }
-    Some(at)
-}
-
-/// Gives `[offset, offset + size)` back to `free`, joined with its
-/// neighbours.
-fn give(free: &mut BTreeMap<u64, u64>, offset: u64, size: u64) {
-    let (mut start, mut end) = (offset, offset + size);
-    if let Some((&s, &l)) = free.range(..start).next_back()
-        && s + l == start
-    {
-        free.remove(&s);
-        start = s;
-    }
-    if let Some(&l) = free.get(&end) {
-        free.remove(&end);
-        end += l;
-    }
-    free.insert(start, end - start);
-}
 
 /// Whether a resource has no holder but the one passed.
 fn last_holder(resource: &ID3D12Resource) -> bool {
@@ -113,6 +91,10 @@ impl Heaps {
             }
         }
         let empty = |h: &Heap| h.free.get(&0) == Some(&HEAP);
+        // Emptied (or released): an ordinary heap again.
+        if !self.heaps.iter().any(|h| Some(h.id) == self.emptying && !empty(h)) {
+            self.emptying = None;
+        }
         let mut spare = 0;
         let mut i = 0;
         while i < self.heaps.len() {
@@ -130,12 +112,14 @@ impl Heaps {
         }
     }
 
-    /// A range of `size` bytes: in a heap with room, else in a new heap.
+    /// A range of `size` bytes: in the first heap with room, the one being
+    /// emptied last, else in a new heap.
     fn allocate(&mut self, device: &ID3D12Device, size: u64, align: u64) -> Option<(ID3D12Heap, Placement)> {
-        for h in &mut self.heaps {
-            if let Some(offset) = take(&mut h.free, size, align) {
-                return Some((h.heap.clone(), Placement { heap: h.id, offset, size }));
-            }
+        let emptying = self.heaps.iter().position(|h| Some(h.id) == self.emptying);
+        if let Some(i) = pick(self.heaps.iter().map(|h| &h.free), size, align, emptying) {
+            let h = &mut self.heaps[i];
+            let offset = take(&mut h.free, size, align)?;
+            return Some((h.heap.clone(), Placement { heap: h.id, offset, size }));
         }
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: HEAP,
@@ -222,10 +206,37 @@ pub(crate) fn stats() -> (usize, u64, u64) {
     (h.heaps.len(), h.heaps.len() as u64 * HEAP - free, free)
 }
 
+/// Picks the heap to empty (`crate::heap_fit::to_empty`), with
+/// `may_go(heap)` the bytes of its textures that may be given up now, and
+/// places nothing new there while another heap has room. Returns its id,
+/// whose textures the caller gives up.
+pub(crate) fn choose_to_empty(may_go: impl Fn(u64) -> u64) -> Option<u64> {
+    let mut heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let h = heaps.as_mut()?;
+    h.reap();
+    let uses: Vec<HeapUse> = h
+        .heaps
+        .iter()
+        .map(|heap| HeapUse { id: heap.id, free: heap.free.values().sum(), may_go: may_go(heap.id) })
+        .collect();
+    h.emptying = crate::heap_fit::to_empty(&uses, HEAP);
+    h.emptying
+}
+
 impl Placement {
     /// Its offset in its heap.
     pub(crate) fn offset(&self) -> u64 {
         self.offset
+    }
+
+    /// Its heap's id ([`choose_to_empty`]).
+    pub(crate) fn heap(&self) -> u64 {
+        self.heap
+    }
+
+    /// Its bytes in the heap.
+    pub(crate) fn size(&self) -> u64 {
+        self.size
     }
 }
 
@@ -269,24 +280,32 @@ mod tests {
         assert_eq!(c, a, "nothing holds it: free again");
     }
 
+    /// New ranges go elsewhere while a heap is emptied, there only when no
+    /// other heap has room, and the heap is an ordinary one once empty.
     #[test]
-    fn ranges_are_taken_first_fit_and_joined_when_given_back() {
-        let k = 64 << 10;
-        let mut free = BTreeMap::from([(0, 10 * k)]);
-        let a = take(&mut free, 3 * k, k).unwrap();
-        let b = take(&mut free, 2 * k, k).unwrap();
-        let c = take(&mut free, 4 * k, k).unwrap();
-        assert_eq!((a, b, c), (0, 3 * k, 5 * k));
-        assert_eq!(take(&mut free, 2 * k, k), None, "one 64 KiB range left");
-        give(&mut free, b, 2 * k);
-        assert_eq!(take(&mut free, 3 * k, k), None, "two ranges of 2 and 1, not joined");
-        give(&mut free, c, 4 * k);
-        assert_eq!(free, BTreeMap::from([(3 * k, 7 * k)]), "joined with both neighbours");
-        give(&mut free, a, 3 * k);
-        assert_eq!(free, BTreeMap::from([(0, 10 * k)]));
-        // An aligned range inside a free one keeps the padding before it.
-        let mut free = BTreeMap::from([(k, 10 * k)]);
-        assert_eq!(take(&mut free, k, 4 * k), Some(4 * k));
-        assert_eq!(free, BTreeMap::from([(k, 3 * k), (5 * k, 6 * k)]));
+    fn nothing_new_goes_into_the_heap_being_emptied() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let mut heaps = Heaps::default();
+        let (_, a) = heaps.allocate(&host.device, HEAP / 2, ALIGN).unwrap();
+        let (_, b) = heaps.allocate(&host.device, HEAP * 3 / 4, ALIGN).unwrap();
+        assert_ne!(a.heap, b.heap, "no room in the first: a second heap");
+        heaps.emptying = Some(a.heap);
+        let (_, c) = heaps.allocate(&host.device, HEAP / 8, ALIGN).unwrap();
+        assert_eq!(c.heap, b.heap, "not into the heap emptied");
+        let (_, d) = heaps.allocate(&host.device, HEAP / 4, ALIGN).unwrap();
+        assert_eq!(
+            d.heap, a.heap,
+            "no other heap has room: there, not a new heap"
+        );
+        assert_eq!(heaps.heaps.len(), 2);
+        heaps.reap();
+        assert_eq!(heaps.emptying, Some(a.heap), "not empty yet");
+        for p in [a, d] {
+            give(&mut heaps.heaps[0].free, p.offset, p.size);
+        }
+        heaps.reap();
+        assert_eq!(heaps.emptying, None, "empty: an ordinary heap again");
     }
 }

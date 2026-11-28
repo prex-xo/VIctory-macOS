@@ -462,6 +462,31 @@ fn patch(list: &HostList, copier: &Copier, view: &Widened, prepared: Prepared) {
     list.keep(&view.buffer);
     list.keep(&copier.root);
     list.keep(&copier.patch);
+    // The copies read what shaders earlier in the list wrote through
+    // unordered views, and a UAV barrier orders unordered accesses only: each
+    // source goes to the copy-source state for them and back (D3DMetal ran
+    // the copies before such writes landed). One barrier per buffer: copies
+    // of a shared buffer share it.
+    let mut sources: Vec<&ID3D12Resource> = Vec::new();
+    for segment in &prepared.segments {
+        let buffer = &segment.shadow.buffer;
+        if !sources.iter().any(|b| b.as_raw() == buffer.as_raw()) {
+            sources.push(buffer);
+        }
+    }
+    let moved = |before, after| -> Vec<D3D12_RESOURCE_BARRIER> {
+        sources
+            .iter()
+            .map(|b| transition(b, before, after))
+            .collect()
+    };
+    // SAFETY: an open list and live buffers, in the state shaders wrote them.
+    unsafe {
+        list.list.ResourceBarrier(&moved(
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        ));
+    }
     for segment in &prepared.segments {
         list.keep_shadow(&segment.shadow);
         // SAFETY: an open list and live buffers; the source range is inside
@@ -476,13 +501,19 @@ fn patch(list: &HostList, copier: &Copier, view: &Widened, prepared: Prepared) {
             );
         }
     }
-    // SAFETY: an open list and the staging buffer the copies just wrote.
+    // SAFETY: an open list, the staging buffer the copies just wrote, and
+    // the sources back for later shaders' unordered accesses.
     unsafe {
-        list.list.ResourceBarrier(&[transition(
+        let mut barriers = moved(
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        );
+        barriers.push(transition(
             &prepared.patches,
             D3D12_RESOURCE_STATE_COPY_DEST,
             D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE,
-        )]);
+        ));
+        list.list.ResourceBarrier(&barriers);
     }
     // SAFETY: live buffers.
     let (destination, patches, metadata) = unsafe {

@@ -44,7 +44,7 @@ struct Latch {
     triggers: [f32; 2],
     /// While holding the handed-out state stable: timestamp (µs) of hand-out.
     holding: Option<u64>,
-    /// Timestamp (µs) of the last reading hand-out.
+    /// Timestamp (µs) of the last reading hand-out or latch reset.
     handed: u64,
 }
 
@@ -62,8 +62,12 @@ impl Latch {
     }
 
     fn apply(&mut self, pad: PadState, now: u64, hold: u64) -> PadState {
-        if self.holding.is_none() && now.saturating_sub(self.handed) >= LATCH_MAX {
-            self.hand_out(now);
+        if now.saturating_sub(self.handed) >= LATCH_MAX {
+            // Expiry discards unread input. Only a real reading starts a hold.
+            *self = Self {
+                handed: now,
+                ..Self::default()
+            };
         }
         let host = pad.buttons;
         self.again |= self.up & host;
@@ -270,11 +274,28 @@ mod tests {
     }
 
     #[test]
-    fn unread_latch_expires_after_max_interval() {
-        let mut filter = for_tests(Some(0), 0.0);
-        assert_eq!(buttons(&mut filter, A, 10), A);
-        assert_eq!(buttons(&mut filter, 0, 20), A);
-        assert_eq!(buttons(&mut filter, 0, LATCH_MAX + 1), 0);
+    fn unread_latch_expires_to_live_input_at_the_max_interval() {
+        const B: u32 = 8;
+        let mut filter = for_tests(Some(LATCH_HOLD), 0.0);
+        filter.latch(0, pad(A, 0.75), 10);
+        let before = filter.latch(0, pad(0, 0.0), LATCH_MAX - 1).unwrap();
+        assert_eq!((before.buttons, before.left_trigger), (A, 0.75));
+
+        let expired = filter.latch(0, pad(B, 0.25), LATCH_MAX).unwrap();
+        assert_eq!((expired.buttons, expired.left_trigger), (B, 0.25));
+        let next = filter.latch(0, pad(0, 0.0), LATCH_MAX + 1).unwrap();
+        assert_eq!((next.buttons, next.left_trigger), (B, 0.25));
+    }
+
+    #[test]
+    fn unread_latch_expires_even_after_a_polling_gap() {
+        let mut filter = for_tests(Some(LATCH_HOLD), 0.0);
+        assert_eq!(buttons(&mut filter, 0, 10), 0);
+        filter.handed(0, 11);
+        assert_eq!(buttons(&mut filter, A, 12), 0);
+
+        // The tap ends before polling resumes, and the last read is too old.
+        assert_eq!(buttons(&mut filter, 0, 11 + LATCH_MAX), 0);
     }
 
     #[test]

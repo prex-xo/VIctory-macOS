@@ -341,6 +341,8 @@ struct Tracer<'a> {
     spill_at: std::collections::HashMap<usize, Result<u32, &'static str>>,
     /// Address sums already traced, indexed by SSA value.
     sums: std::cell::RefCell<Vec<Option<Sum>>>,
+    /// The access whose descriptor is being traced ([`Tracer::runs`]).
+    access: std::cell::Cell<Option<Site>>,
 }
 
 /// What lanes are known to satisfy: each [`Bool`] where its flag is set,
@@ -458,6 +460,7 @@ impl<'a> Tracer<'a> {
             first_spilled: Default::default(),
             spill_at: Default::default(),
             sums: Default::default(),
+            access: Default::default(),
         };
         t.origin = t.propagate_copies(n)?;
         // Loads from the root signature's memory are found by their address,
@@ -1124,7 +1127,10 @@ impl<'a> Tracer<'a> {
                 known.push((guard, true));
             }
         }
-        self.classify(&words, &mut Vec::new(), &mut known)
+        self.access.set(Some(at));
+        let source = self.classify(&words, &mut Vec::new(), &mut known);
+        self.access.set(None);
+        source
     }
 
     /// The source of a descriptor's words; `joins` are the phi blocks
@@ -1689,12 +1695,95 @@ impl<'a> Tracer<'a> {
         let Some(&Some(guard)) = lanes.guards.get(site.0).and_then(|g| g.get(site.1)) else {
             return Ok(());
         };
+        if self.access.get().is_some_and(|at| self.ran_under(at, site)) {
+            return Ok(());
+        }
         let mut skips = known.clone();
         skips.extend([(lanes.reach[site.0], true), (guard, false)]);
         if meet(lanes, &skips) {
             return Err("a per-lane descriptor written where some lanes may keep the old one");
         }
         Ok(())
+    }
+
+    /// Whether every lane that runs the access at `at` ran the copy at
+    /// `copy` (whose value the access reads, so the copy's block ran on the
+    /// way): the access's EXEC holds no lane the copy's EXEC did not
+    /// ([`Tracer::exec_within`]). A waterfall loop's EXEC starts as the
+    /// EXEC before it and each pass only takes lanes out, which the lane
+    /// conditions cannot tell where the loop's header forgets them.
+    fn ran_under(&self, at: Site, copy: Site) -> bool {
+        let (access, copy) = (self.inst(at), self.inst(copy));
+        let halves: &[u8] = if self.p.wave64 { &[0, 1] } else { &[0] };
+        halves.iter().all(
+            |&h| match (access.read(Reg::S(EXEC + h)), copy.read(Reg::S(EXEC + h))) {
+                (Some(e), Some(x)) => self.exec_within(e, x, h, &mut Vec::new()),
+                _ => false,
+            },
+        )
+    }
+
+    /// Whether lane mask half `v` (low dword 0, high 1: `half`) holds no lane
+    /// `x` does not: `x` itself, a phi of such, or a lane-mask operation that
+    /// keeps or takes out lanes of such (`and` of one, `andn2` or
+    /// `andn2_wrexec` of its first, `or` and `xor` of both, `v_cmpx` of the
+    /// EXEC it reads, the old EXEC an `_saveexec` saves). Going round a loop
+    /// back to a value being checked holds: lanes enter it only from the
+    /// rest.
+    fn exec_within(&self, v: Value, x: Value, half: u8, seen: &mut Vec<Value>) -> bool {
+        if v == x || seen.contains(&v) {
+            return true;
+        }
+        seen.push(v);
+        if let Some((b, i)) = self.phis[v.0 as usize] {
+            let args = self.p.blocks[b].phis[i].args.clone();
+            return args.iter().all(|&a| self.exec_within(a, x, half, seen));
+        }
+        let Some(inst) = self.def(v) else {
+            return false;
+        };
+        let exec_in = inst.read(Reg::S(EXEC + half));
+        let within = |l: &Self, w: Option<Value>, seen: &mut Vec<Value>| {
+            w.is_some_and(|w| l.exec_within(w, x, half, seen))
+        };
+        let name = inst.name();
+        if name.starts_with("v_cmpx_") {
+            return inst.write(Reg::S(EXEC + half)) == Some(v) && within(self, exec_in, seen);
+        }
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return false;
+        };
+        let width = if self.p.wave64 { "_b64" } else { "_b32" };
+        let Some(op) = name.strip_prefix("s_").and_then(|n| n.strip_suffix(width)) else {
+            return false;
+        };
+        // A source operand's half, or an inline 0 (no lanes).
+        let operand = |k: usize| -> Option<Option<Value>> {
+            match *src.get(k)? {
+                Operand::Scalar { code, .. } if code != NULL => {
+                    Some(Some(inst.read(Reg::S(code + half))?))
+                }
+                Operand::Const(128) => Some(None),
+                _ => None,
+            }
+        };
+        let arg = |l: &Self, k: usize, seen: &mut Vec<Value>| match operand(k) {
+            Some(None) => true,
+            Some(w) => within(l, w, seen),
+            None => false,
+        };
+        let to_exec = inst.write(Reg::S(EXEC + half)) == Some(v);
+        match op {
+            "mov" => arg(self, 0, seen),
+            "and" => arg(self, 0, seen) || arg(self, 1, seen),
+            "andn2" => arg(self, 0, seen),
+            "or" | "xor" => arg(self, 0, seen) && arg(self, 1, seen),
+            "and_saveexec" if to_exec => arg(self, 0, seen) || within(self, exec_in, seen),
+            "andn2_saveexec" if to_exec => arg(self, 0, seen),
+            "andn2_wrexec" => arg(self, 0, seen),
+            _ if op.ends_with("_saveexec") && !to_exec => within(self, exec_in, seen),
+            _ => false,
+        }
     }
 
     /// The source of descriptor dwords each lane holds its own of (a
@@ -3191,6 +3280,37 @@ pub(crate) mod tests {
         0xBF81_0000, // s_endpgm
     ];
 
+    /// The waterfall loop of [`WATERFALL_JOINED_WAVE32`] over one image
+    /// descriptor that is the same in every lane, moved into v[4:11] after
+    /// `v_cmpx_gt_u32` narrowed EXEC to the lanes below 16: the lanes above
+    /// keep their old VGPRs, but the loop starts with that EXEC and each
+    /// pass only takes lanes out, so no lane that samples skipped the move.
+    /// v12 starts at 0; the sample goes to the buffer at dword 16 of the
+    /// table, at lane * 4, in every lane.
+    pub(crate) fn waterfall_narrowed_wave32() -> Vec<u32> {
+        let joined = WATERFALL_JOINED_WAVE32;
+        // Up to and including s_waitcnt lgkmcnt(0).
+        let wait = joined.iter().position(|&w| w == 0xBF8C_C07F).unwrap();
+        // From the loop's first v_readfirstlane_b32 on.
+        let read = joined.iter().position(|&w| w == 0x7E18_0504).unwrap();
+        let mut w: Vec<u32> = joined[..=wait].to_vec();
+        w.extend([
+            0x7E18_0280, // v_mov_b32 v12, 0
+            0xBE97_037E, // s_mov_b32 s23, exec_lo
+            0x7DA8_0090, // v_cmpx_gt_u32 16, v0
+            0x7E08_0218, // v_mov_b32 v4, s24
+            0x7E0A_0219, // v_mov_b32 v5, s25
+            0x7E0C_021A, // v_mov_b32 v6, s26
+            0x7E0E_021B, // v_mov_b32 v7, s27
+            0x7E10_021C, // v_mov_b32 v8, s28
+            0x7E12_021D, // v_mov_b32 v9, s29
+            0x7E14_021E, // v_mov_b32 v10, s30
+            0x7E16_021F, // v_mov_b32 v11, s31
+        ]);
+        w.extend(&joined[read..]);
+        w
+    }
+
     /// The console compiler's waterfall (Grand Theft Auto VI's ray-tracing
     /// resolve and others): each lane holds its entry's byte offset in the
     /// table at s0 (v7 = (lane & 1) * 32); the loop reads the first active
@@ -3911,6 +4031,22 @@ pub(crate) mod tests {
             ),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn a_per_lane_descriptor_moved_under_the_exec_its_waterfall_starts_with_is_traced() {
+        let words = waterfall_narrowed_wave32();
+        let r = waterfall(&words, false).unwrap();
+        let image = r
+            .descriptors
+            .iter()
+            .find(|d| d.role == Role::Resource)
+            .unwrap();
+        let Source::Loaded { load, first: 0 } = image.source else {
+            panic!("{:?}", image.source)
+        };
+        let a = r.scalar.iter().find(|s| s.0 == load).unwrap().1;
+        assert_eq!((a.param, a.offset), (0, 0));
     }
 
     #[test]

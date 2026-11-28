@@ -93,6 +93,10 @@ enum Command {
         /// driver; a second time only what is not there yet).
         #[arg(long)]
         pipelines: bool,
+        /// With `--cache`, pre-build only pack pipelines named in this file
+        /// (one full key per line, as in early-pipelines.txt).
+        #[arg(long, requires = "cache", conflicts_with = "pipelines")]
+        pipeline_selection: Option<PathBuf>,
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
@@ -186,16 +190,17 @@ fn main() -> Result<()> {
             paths,
             jobs,
             pipelines,
+            pipeline_selection,
             cache: true,
             ..
         } => {
             #[cfg(windows)]
             {
-                translate::warm(paths, jobs.map(NonZeroUsize::get), pipelines)
+                translate::warm(paths, jobs.map(NonZeroUsize::get), pipelines, pipeline_selection)
             }
             #[cfg(not(windows))]
             {
-                let _ = (paths, jobs, pipelines);
+                let _ = (paths, jobs, pipelines, pipeline_selection);
                 anyhow::bail!("translate needs a Windows host for now")
             }
         }
@@ -207,6 +212,7 @@ fn main() -> Result<()> {
             jobs,
             cache: false,
             wave32,
+            ..
         } => {
             #[cfg(windows)]
             {
@@ -339,7 +345,19 @@ pub(crate) fn write_prebuild_keys(path: &Path, text: &str) -> Result<()> {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{check_policy, write_prebuild_keys};
+    use clap::Parser;
+
+    use super::{Cli, check_policy, write_prebuild_keys};
+
+    #[test]
+    fn pipeline_selection_requires_cache_and_excludes_full_prewarm() {
+        let selection = ["victory", "translate", "--pipeline-selection", "keys.txt"];
+        assert!(Cli::try_parse_from(selection).is_err());
+        let selected = selection.into_iter().chain(["--cache"]);
+        assert!(Cli::try_parse_from(selected.clone()).is_ok());
+        assert!(Cli::try_parse_from(selected.chain(["--pipelines"])).is_err());
+        assert!(Cli::try_parse_from(["victory", "translate", "--cache", "--pipelines"]).is_ok());
+    }
 
     fn outside() -> PathBuf {
         std::env::temp_dir().join("victory-config-test")

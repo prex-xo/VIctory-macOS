@@ -6,22 +6,24 @@
 # DEPS names an x86_64 prefix with FreeType, GnuTLS and SDL2, as
 # tools/macos/build-deps.sh builds it.
 #
-# The patches in tools/macos/patches are applied to the source. A Wine that
-# is already installed gets only its server, ntdll and HID bus rebuilt (see
-# below), and
+# The patches in tools/macos/patches are applied to the source. A patch-only
+# update can rebuild just the server, ntdll and HID bus (see below), and
 #   tools/macos/build-crossover-wine.sh --stamp
-# prints the stamp of the patches and the SDL2 build that setup.sh compares
-# with the install's. The stamp baked into the cached source tree is kept
-# inside the tree, and the tree is recreated from the cached tarball when the
-# two differ, so a patch that was removed or edited cannot stay in the cache.
+# prints the release and patch/SDL2 stamp that setup.sh compares with the
+# install's. The cached source tree is recreated when its stamp differs,
+# so neither a previous release nor an old patch can stay in the cache.
 set -eu
 VERSION="${CROSSOVER_VERSION:-26.3.0}"
 ROOT="${0:A:h:h:h}"
 PATCHES=("${0:A:h}"/patches/*.patch(N))
-# "with SDL2" marks the installs whose HID bus has SDL, so setup.sh rebuilds
-# the ones from before it.
-stamp() { { cat "${PATCHES[@]}" /dev/null; print 'with SDL2'; } | shasum -a 256 | cut -c1-64; }
-if [[ ${1-} == --stamp ]]; then stamp; exit 0; fi
+# Keep the release readable so the partial install can check it separately.
+# "with SDL2" marks the installs whose HID bus has SDL.
+stamp() {
+  printf '%s:' "$VERSION"
+  { cat "${PATCHES[@]}" /dev/null; print 'with SDL2'; } | shasum -a 256 | cut -c1-64
+}
+build_stamp="$(stamp)"
+if [[ ${1-} == --stamp ]]; then print -r -- "$build_stamp"; exit 0; fi
 DEPS_REAL="${DEPS:?set DEPS to an x86_64 prefix with FreeType, GnuTLS and SDL2}"
 # Wine's build splits flags at spaces, and both the project and the deps
 # can live under folders with spaces in their names. Space-free links to
@@ -40,6 +42,18 @@ BUILD="$ALIAS/target-$BUILD"
 # The deps are copied, and each library's recorded path is pointed at the
 # copy, because a prefix built elsewhere may record a folder that is gone.
 DEPS="$BUILD/deps"
+# install_name_tool warns on every call that the code signature is now
+# invalid (each library is signed again below). Its output is shown only when
+# it fails, so a new path that does not fit in a library's header stops the
+# script with the reason instead of without a word.
+rename_in() {
+  local out
+  out="$(install_name_tool "$@" 2>&1)" || {
+    print -r -- "$out" >&2
+    echo "could not relink ${@[-1]:t}: libraries built before -headerpad_max_install_names must be built again (empty ${DEPS_REAL} and run tools/macos/build-deps.sh)" >&2
+    exit 1
+  }
+}
 # A copy from before SDL2 was in the deps is made again.
 if [[ ! -f $DEPS/.relinked || ! -f $DEPS/lib/libSDL2-2.0.0.dylib ]]; then
   rm -rf "$DEPS"
@@ -47,9 +61,9 @@ if [[ ! -f $DEPS/.relinked || ! -f $DEPS/lib/libSDL2-2.0.0.dylib ]]; then
   for lib in "$DEPS"/lib/*.dylib(.N); do
     old_dir="$(otool -D "$lib" | sed -n 2p)"
     old_dir="${old_dir:h}"
-    install_name_tool -id "$DEPS/lib/${lib:t}" "$lib" 2> /dev/null
+    rename_in -id "$DEPS/lib/${lib:t}" "$lib"
     for ref in $(otool -L "$lib" | awk 'NR > 2 {print $1}' | grep -F "$old_dir/" || true); do
-      install_name_tool -change "$ref" "$DEPS/lib/${ref:t}" "$lib" 2> /dev/null
+      rename_in -change "$ref" "$DEPS/lib/${ref:t}" "$lib"
     done
     codesign -f -s - "$lib" 2> /dev/null || true
   done
@@ -81,19 +95,15 @@ fetch_source_tar() {
   fi
 }
 SRC="$WORK/sources/wine"
-# The stamp of the patches baked into the source tree lives inside the tree.
-# When it is missing or differs from this checkout's patches (a patch was
-# removed, edited or renamed), the tarball is fetched and verified first,
-# then the source and the build folder are both dropped and the tree is
-# recreated from the tarball, so nothing built from the old patches
-# survives -- also when the source tree itself is gone and only a stale
-# build folder is left behind.
+# The stamp lives inside the source tree. When the release or patches
+# change, fetch and verify the selected tarball before dropping the source
+# and build folders. A stale build is also dropped if its source is gone.
 SRC_STAMP="$SRC/.victory-patches"
-if [[ -d $SRC && -f $SRC_STAMP && "$(< "$SRC_STAMP")" == "$(stamp)" ]]; then
+if [[ -d $SRC && -f $SRC_STAMP && "$(< "$SRC_STAMP")" == "$build_stamp" ]]; then
   :
 else
   if [[ -d $SRC ]]; then
-    echo "the patches changed: recreating the CrossOver source from the cached tarball"
+    echo "the CrossOver release or patches changed: recreating the source tree"
   fi
   fetch_source_tar
   rm -rf "$OBJ" "$WORK/sources"
@@ -118,17 +128,20 @@ patch_paths() { grep -h '^+++ ' "$@" /dev/null | awk '{sub(/^b\//, "", $2); prin
 # library and the HID bus's (winebus.so, where SDL2 support lives) rebuilt,
 # which D3DMetal does not replace. That is enough only while neither the
 # patches baked into the installed Wine nor the current ones change anything
-# but the server and ntdll: the sorted paths of the applied patches are
-# recorded next to the install stamp, and a path outside server/ and
-# dlls/ntdll/unix/ on either side forces a full reinstall.
+# but the server and ntdll, and the installed release matches. The paths of
+# the applied patches are recorded next to the install stamp.
 installed=0
 PATCH_PATHS="$PREFIX/.victory-patch-paths"
 if [[ -x $PREFIX/bin/wine && -f $PREFIX/.victory-patches && -f $PATCH_PATHS ]]; then
-  installed=1
-  outside=($( { patch_paths "${PATCHES[@]}"; cat "$PATCH_PATHS"; } | grep -v -e '^server/' -e '^dlls/ntdll/unix/' -e '^$' | sort -u || true))
-  if (( ${#outside} > 0 )); then
-    echo "the patches change ${outside[*]}: reinstalling Wine fully"
-    installed=0
+  if [[ "$(< "$PREFIX/.victory-patches")" != "$VERSION:"* ]]; then
+    echo "the installed CrossOver release changed or was not recorded: reinstalling Wine fully"
+  else
+    outside=($( { patch_paths "${PATCHES[@]}"; cat "$PATCH_PATHS"; } | grep -v -e '^server/' -e '^dlls/ntdll/unix/' -e '^$' | sort -u || true))
+    if (( ${#outside} > 0 )); then
+      echo "the patches change ${outside[*]}: reinstalling Wine fully"
+    else
+      installed=1
+    fi
   fi
 elif [[ -x $PREFIX/bin/wine ]]; then
   echo "the installed Wine metadata is incomplete: reinstalling it fully"
@@ -143,7 +156,7 @@ for p in $PATCHES; do
   echo "applying ${p:t}"
   patch -d "$SRC" -p1 -f -s < "$p"
 done
-stamp > "$SRC_STAMP"
+print -r -- "$build_stamp" > "$SRC_STAMP"
 
 cd "$OBJ"
 # A build configured before SDL2 was in the deps is configured again.
@@ -198,5 +211,5 @@ else
   done
 fi
 patch_paths "${PATCHES[@]}" > "$PATCH_PATHS"
-stamp > "$PREFIX/.victory-patches"
+print -r -- "$build_stamp" > "$PREFIX/.victory-patches"
 echo "installed in $PREFIX"

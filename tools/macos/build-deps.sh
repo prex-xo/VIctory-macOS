@@ -46,7 +46,10 @@ fetch_source() {
 
 common=(--host=x86_64-apple-darwin --build=aarch64-apple-darwin --prefix="$PREFIX")
 export CC="clang -arch x86_64" CXX="clang++ -arch x86_64"
-export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" CPPFLAGS="-I$PREFIX/include" LDFLAGS="-L$PREFIX/lib"
+# build-crossover-wine.sh copies these libraries and points their recorded
+# paths at the copy, which can be a longer path than this prefix: the
+# headerpad leaves install_name_tool room for it.
+export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" CPPFLAGS="-I$PREFIX/include" LDFLAGS="-L$PREFIX/lib -Wl,-headerpad_max_install_names"
 # build <library it installs> <source folder> <configure options>. A library
 # already in the prefix is kept, so a prefix from before a library was added
 # gets only that one built.

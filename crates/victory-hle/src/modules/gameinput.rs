@@ -790,8 +790,10 @@ extern "system" fn temporal_reading(
     };
     let mut state = hub.state();
     let history = &state.slots[index].history;
+    let reads_latest = history.back().is_some_and(|r| r.timestamp <= time);
     let hr = hand(out, history.iter().rev().find(|r| r.timestamp <= time));
-    if hr == S_OK {
+    // Reading an older snapshot does not acknowledge the pending latch.
+    if hr == S_OK && reads_latest {
         state.filter.handed(index, now());
     }
     hr
@@ -2538,6 +2540,57 @@ mod tests {
         assert_eq!(read_pad(FALLBACK), A, "fallback pad tap latched");
         hub.poll();
         assert_eq!(read_pad(FALLBACK), 0, "fallback pad tap cleared");
+    }
+
+    #[test]
+    fn historical_temporal_reading_keeps_an_unread_tap_latched() {
+        let (hub, _) = fake();
+        hub.state().filter = filter::for_tests(Some(0), 0.0);
+        let index = 1;
+        let sample = |timestamp, buttons| {
+            let mut state = hub.state();
+            let host = PadState {
+                buttons,
+                ..Default::default()
+            };
+            let latched = state.filter.latch(index, Some(host), timestamp);
+            state.update(
+                &hub.devices,
+                index,
+                latched.map(Value::Pad),
+                timestamp,
+                &mut Vec::new(),
+            );
+        };
+        let read_at = |timestamp| {
+            type Temporal = extern "system" fn(This, u64, *const Device, Out) -> HRESULT;
+            let mut out = std::ptr::null();
+            let hr = slot::<Temporal, _>(&hub.object, 0x38)(
+                &hub.object,
+                timestamp,
+                &hub.devices[index],
+                &mut out,
+            );
+            let reading = result(hr, out).unwrap();
+            let buttons = pad(reading).buttons;
+            release(reading);
+            buttons
+        };
+
+        sample(10, 0);
+        sample(20, A);
+        sample(30, 0);
+        assert_eq!(read_at(10), 0);
+
+        sample(40, 0);
+        assert_eq!(
+            read_at(40),
+            A,
+            "the historical read did not observe the tap"
+        );
+
+        sample(50, 0);
+        assert_eq!(read_at(50), 0, "reading the latest state consumed the tap");
     }
 
     #[test]

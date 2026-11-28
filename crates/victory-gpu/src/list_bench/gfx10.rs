@@ -568,3 +568,112 @@ pub(super) fn compute_container() -> Vec<u8> {
     };
     container(5, &p, &[])
 }
+
+/// A program ID for matching the pack's record with this container.
+fn pack_id(id: u32) -> Vec<u32> {
+    vec![0xD580_0000, 0x03FF_0000, id, 0xD580_0000, 0x03FF_0000, !id]
+}
+
+/// The constant in each round of an original, observable per-thread mix.
+pub(crate) fn mix_constant(id: u32, round: u32) -> u32 {
+    id.wrapping_mul(0x9E37_79B9).rotate_left(round % 32) ^ round.wrapping_mul(0x7F4A_7C15)
+}
+
+/// A row of RGBA32F texels. Its red mantissas depend on the program's index
+/// and thread x, so the distinct programs cannot share one compiled shader.
+pub(crate) fn prewarm_compute(id: u32, rounds: u32) -> Vec<u8> {
+    let mut a = Asm(pack_id(id));
+    a.s_mov(6, 4);
+    a.s_mov(7, ZERO);
+    a.smem(3, 8, 6, 0);
+    a.vop1(1, v(7), 5);
+    a.vop2(0x1a, v(7), 6 + ZERO, 7);
+    a.vop2(0x25, v(5), v(7), 0); // group x * 64 + thread x
+    a.vop1(1, v(1), v(5));
+    for round in 0..rounds {
+        a.vop2(0x25, v(1), LITERAL, 1);
+        a.0.push(mix_constant(id, round));
+        a.vop2(0x16, v(7), 13 + ZERO, 1);
+        a.vop2(0x1d, v(1), v(7), 1); // x ^= x >> 13
+    }
+    a.vop2(0x1b, v(1), LITERAL, 1);
+    a.0.push(0x007f_ffff);
+    a.vop2(0x1c, v(1), LITERAL, 1);
+    a.0.push(1f32.to_bits());
+    for d in [2, 3, 4, 6] {
+        a.vop1(1, v(d), ZERO);
+    }
+    a.wait_scalar();
+    a.image(8, 1, 5, 8, 0);
+    a.end();
+    let mut stage_data = vec![0; 0x40];
+    put(&mut stage_data, 0x24, &(5u32 << 1 | 1 << 7).to_le_bytes());
+    for (i, n) in [64u32, 1, 1].into_iter().enumerate() {
+        put(&mut stage_data, 0x28 + 4 * i, &n.to_le_bytes());
+    }
+    let p = Program {
+        stage: CS,
+        code: a.0,
+        vgprs: 16,
+        sgprs: 24,
+        layout: vec![(0, 4)],
+        used: vec![(3, 0, 4, 0, 0, 8)],
+        stage_data,
+    };
+    container(5, &p, &[])
+}
+
+pub(crate) fn prewarm_vertex() -> Vec<u8> {
+    let mut a = Asm(pack_id(u32::MAX));
+    // A full-screen triangle from the vertex id in v0.
+    for (dst, id, base, alternate) in [(4, 1, -1.0f32, 3.0f32), (5, 2, 1.0, -3.0)] {
+        a.vop1(1, v(dst), LITERAL);
+        a.0.push(alternate.to_bits());
+        a.0.push(0x7C00_0000 | 0xc2 << 17 | (ZERO + id)); // v_cmp_eq_u32 vcc, id, v0
+        a.vop2(1, v(dst), LITERAL, dst); // v_cndmask_b32
+        a.0.push(base.to_bits());
+    }
+    a.vop1(1, v(6), HALF);
+    a.vop1(1, v(7), F1);
+    a.export(12, 15, true, false, [4, 5, 6, 7]);
+    a.end();
+    let p = Program {
+        stage: VS,
+        code: a.0,
+        vgprs: 8,
+        sgprs: 16,
+        layout: vec![],
+        used: vec![],
+        stage_data: vec![0; 0x190],
+    };
+    let osg = signature(&[Element("SV_Position", 1, 0, 0xF)], false);
+    container(1, &p, &[(b"OSG1", osg)])
+}
+
+pub(crate) fn prewarm_pixel() -> Vec<u8> {
+    let mut a = Asm(pack_id(u32::MAX - 1));
+    for (dst, src) in [F1, ZERO, HALF, F1].into_iter().enumerate() {
+        a.vop1(1, v(dst as u32), src);
+    }
+    a.export(0, 15, true, true, [0, 1, 2, 3]);
+    a.end();
+    let mut stage_data = vec![0; 0x14c + 8 * (4 + 400)];
+    for mrt in 0..8 {
+        put(&mut stage_data, 0x14c + mrt * 404, &u32::MAX.to_le_bytes());
+    }
+    let p = Program {
+        stage: PS,
+        code: a.0,
+        vgprs: 8,
+        sgprs: 16,
+        layout: vec![],
+        used: vec![],
+        stage_data,
+    };
+    let osg = signature(&[Element("SV_Target", 64, 0, 0xF)], false);
+    container(0, &p, &[(b"OSG1", osg)])
+}
+
+pub(crate) fn pack_id_bytes(id: u32) -> Vec<u8> {
+    pack_id(id).into_iter().flat_map(u32::to_le_bytes).collect()
+}

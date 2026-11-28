@@ -12,7 +12,9 @@
 //!    lane holds the same function of the same scalars. The scalars are
 //!    root parameters and what scalar loads and scalar ALU operations make
 //!    of them: what each host half computes for itself in every halves
-//!    translation, none of them made from a lane mask or a lane's value.
+//!    translation, none of them made from a lane mask or a lane's value. A
+//!    multiply-accumulate (`v_mac_f32`, `v_fmac_f32`) adds to its old
+//!    destination, which is held to the same as its operands.
 //! 2. **Only lanes EXEC has at the read see the result.** A half with no
 //!    active lane reads a lane of its own that does not hold the value; that
 //!    is harmless only if no lane outside the read's EXEC ever sees what it
@@ -185,14 +187,26 @@ impl Analysis<'_, '_> {
             && f.carry.is_none()
             && f.opsel == 0
             && ![
-                "lane", "cndmask", "mbcnt", "_co_", "interp", "mac", "dot", "cmp", "16", "mix",
-                "perm", "sad", "msad", "qsad",
+                "lane", "cndmask", "mbcnt", "_co_", "interp", "dot", "cmp", "16", "mix", "perm",
+                "sad", "msad", "qsad",
             ]
             .iter()
             .any(|n| name.contains(n));
         if !plain || self.exec(inst) != Some(exec) || !matches!(f.dst, Some(Operand::Vector { .. }))
         {
             return false;
+        }
+        // A multiply-accumulate adds to its old destination: an operand too.
+        if name.contains("mac") {
+            let Some(Operand::Vector { reg, .. }) = f.dst else {
+                return false;
+            };
+            if !inst
+                .read(Reg::V(reg))
+                .is_some_and(|old| self.active_alike(old, exec, memo))
+            {
+                return false;
+            }
         }
         f.src.iter().all(|op| match *op {
             Operand::Const(c) => c < 251,
@@ -424,4 +438,141 @@ impl Analysis<'_, '_> {
             }
         }
     }
+}
+
+/// M0, the register-index base `v_movrels_b32` and `v_movreld_b32` add.
+const M0: u8 = 124;
+
+/// The results of the `v_readfirstlane_b32` reads of a wave64 program that
+/// open a register-index waterfall: a loop of one block that runs a lane
+/// index's `v_movrels_b32` or `v_movreld_b32` once for each value the index
+/// takes among the lanes left:
+///
+/// ```text
+/// loop: v_readfirstlane_b32 s, v        ; an index one lane left holds
+///       v_cmp_eq_u32 c, s, v            ; the lanes holding it (VCC or a pair)
+///       s_and_saveexec_b64 m, c         ; run just those
+///       s_mov_b32 m0, s
+///       v_movrels_b32 / v_movreld_b32 … ; register moves by m0
+///       s_xor_b64 exec, exec, m         ; drop them
+///       s_cbranch_execnz loop
+/// ```
+///
+/// Each host half makes such a read by itself, exactly: the half's loop
+/// visits each of its lanes once, with `m0` that lane's own index, and the
+/// body only moves and computes that lane's registers (vector ALU
+/// operations that write no scalar register and read no other lane), so
+/// every lane ends with the console's registers whichever lanes share its
+/// iteration. The read's result, `m0`, the compare and the saved EXEC are
+/// seen nowhere outside the loop, so the order and number of iterations,
+/// which differ between the console and the halves, are never seen.
+pub(super) fn index_waterfalls(x: &Parts) -> HashSet<Value> {
+    let p = x.p;
+    let mut out = HashSet::new();
+    if !x.native.wave64 {
+        return out;
+    }
+    let mut uses: HashMap<Value, Vec<usize>> = HashMap::new();
+    let mut phi_read: HashSet<Value> = HashSet::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        for phi in &block.phis {
+            phi_read.extend(phi.args.iter().copied());
+        }
+        for inst in &block.insts {
+            for &(_, v) in &inst.reads {
+                uses.entry(v).or_default().push(b);
+            }
+        }
+    }
+    // Read only by instructions of block `b`, and by no phi.
+    let only_in = |v: Value, b: usize| {
+        !phi_read.contains(&v) && uses.get(&v).is_none_or(|u| u.iter().all(|&ub| ub == b))
+    };
+    for (b, block) in p.blocks.iter().enumerate() {
+        let insts = &block.insts;
+        let crate::ir::Exit::Branch { taken, .. } = block.exit else {
+            continue;
+        };
+        if taken != b || insts.len() < 6 || insts[insts.len() - 1].name() != "s_cbranch_execnz" {
+            continue;
+        }
+        let last = insts.len() - 1;
+        let (read, cmp, save, drop) = (&insts[0], &insts[1], &insts[2], &insts[last - 1]);
+        if read.name() != "v_readfirstlane_b32" {
+            continue;
+        }
+        let (Some(&(_, s)), Some(v)) = (
+            read.writes.first(),
+            read.reads
+                .iter()
+                .find(|(r, _)| matches!(r, Reg::V(_)))
+                .map(|r| r.1),
+        ) else {
+            continue;
+        };
+        // The lanes whose index is the one read, into a lane mask (VCC or an
+        // SGPR pair); EXEC narrowed to them, the old saved; and the old less
+        // them back in EXEC.
+        let compares = cmp.name() == "v_cmp_eq_u32"
+            && cmp.reads.iter().any(|&(_, r)| r == s)
+            && cmp.reads.iter().any(|&(_, r)| r == v)
+            && !cmp.writes.is_empty()
+            && cmp
+                .writes
+                .iter()
+                .all(|w| matches!(w.0, Reg::S(c) if c <= VCC + 1));
+        let saved: Vec<Value> = save
+            .writes
+            .iter()
+            .filter(|w| matches!(w.0, Reg::S(c) if c < VCC))
+            .map(|w| w.1)
+            .collect();
+        let saves = save.name() == "s_and_saveexec_b64"
+            && cmp
+                .writes
+                .iter()
+                .all(|&(_, w)| save.reads.iter().any(|&(_, r)| r == w));
+        let drops = drop.name() == "s_xor_b64"
+            && drop.writes.iter().any(|w| w.0 == Reg::S(EXEC))
+            && saved.len() == 2
+            && saved
+                .iter()
+                .all(|&m| drop.reads.iter().any(|&(_, r)| r == m));
+        if !(compares && saves && drops) {
+            continue;
+        }
+        // The body: `s_mov_b32 m0, s`, and vector operations on each lane's
+        // own registers.
+        let mut m0s = Vec::new();
+        let body_ok = insts[3..last - 1].iter().all(|i| {
+            let name = i.name();
+            if name == "s_mov_b32"
+                && i.writes.iter().all(|w| w.0 == Reg::S(M0))
+                && i.reads.iter().all(|&(_, r)| r == s)
+            {
+                m0s.extend(i.writes.iter().map(|w| w.1));
+                return true;
+            }
+            if matches!(name, "s_nop" | "s_waitcnt") {
+                return true;
+            }
+            let Fields::Valu(f) = &i.fields else {
+                return false;
+            };
+            f.dpp.is_none()
+                && f.sdwa.is_none()
+                && i.writes.iter().all(|w| matches!(w.0, Reg::V(_)))
+                && !["lane", "mbcnt", "permlane", "interp", "cmp"]
+                    .iter()
+                    .any(|n| name.contains(n))
+        });
+        let seen_inside = only_in(s, b)
+            && m0s.iter().all(|&m| only_in(m, b))
+            && cmp.writes.iter().all(|w| only_in(w.1, b))
+            && saved.iter().all(|&m| only_in(m, b));
+        if body_ok && !m0s.is_empty() && seen_inside {
+            out.insert(s);
+        }
+    }
+    out
 }

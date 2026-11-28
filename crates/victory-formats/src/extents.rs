@@ -6,6 +6,8 @@
 /// `(start, end, key)` of a copy's memory.
 type Entry = (usize, usize, usize);
 
+const WALK_BLOCK: usize = 32;
+
 /// The memory extents of copies, each named by the key its holder is
 /// filed under: sorted by start, with the largest end up to each entry
 /// beside it, a window `[from, to)` walks only the entries that can
@@ -38,12 +40,15 @@ struct Level {
     /// The largest end in `entries[..=i]`: past the first entry that
     /// reaches a window's `from`, nothing before it reaches either.
     ends: Vec<usize>,
+    /// Maximum end inside each block, independent of earlier large extents.
+    block_ends: Vec<usize>,
 }
 
 impl Level {
     fn clear(&mut self) {
         self.entries.clear();
         self.ends.clear();
+        self.block_ends.clear();
     }
 
     /// Merges `new`, in start order, into the entries. The entries before
@@ -76,11 +81,19 @@ impl Level {
             self.entries.truncate(keep);
             self.entries.extend_from_slice(scratch);
         }
-        self.ends.truncate(keep);
+        let first_block = keep / WALK_BLOCK;
+        let first_entry = first_block * WALK_BLOCK;
+        self.ends.truncate(first_entry);
+        self.block_ends.truncate(first_block);
         let mut max = self.ends.last().copied().unwrap_or(0);
-        for &(_, end, _) in &self.entries[keep..] {
-            max = max.max(end);
-            self.ends.push(max);
+        for block in self.entries[first_entry..].chunks(WALK_BLOCK) {
+            let mut block_max = 0;
+            for &(_, end, _) in block {
+                max = max.max(end);
+                block_max = block_max.max(end);
+                self.ends.push(max);
+            }
+            self.block_ends.push(block_max);
         }
     }
 
@@ -89,12 +102,36 @@ impl Level {
     /// largest end so far says whether), kept where the entry reaches it.
     fn walk(&self, from: usize, to: usize) -> impl Iterator<Item = usize> + '_ {
         let last = self.entries.partition_point(|&(start, ..)| start < to);
-        let empty = from >= to;
-        (0..last)
-            .rev()
-            .take_while(move |&i| !empty && self.ends[i] > from)
-            .filter(move |&i| self.entries[i].1 > from)
-            .map(move |i| self.entries[i].2)
+        Walk {
+            level: self,
+            at: if from < to { last } else { 0 },
+            from,
+        }
+    }
+}
+
+struct Walk<'a> {
+    level: &'a Level,
+    at: usize,
+    from: usize,
+}
+
+impl Iterator for Walk<'_> {
+    type Item = usize;
+    fn next(&mut self) -> Option<usize> {
+        while self.at > 0 && self.level.ends[self.at - 1] > self.from {
+            let i = self.at - 1;
+            self.at = i;
+            let (_, end, key) = self.level.entries[i];
+            if end > self.from {
+                return Some(key);
+            }
+            let block = i / WALK_BLOCK;
+            if self.level.block_ends[block] <= self.from {
+                self.at = block * WALK_BLOCK;
+            }
+        }
+        None
     }
 }
 
@@ -285,6 +322,42 @@ mod tests {
                 .collect();
             walked.sort_unstable();
             assert_eq!(reached, walked, "the window {from:#x}..{to:#x}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod blocked_query_regression {
+    use super::*;
+    #[test]
+    fn a_large_extent_preserves_small_overlaps_across_incremental_merges() {
+        let mut e = Extents::default();
+        let mut all = Vec::new();
+        for generation in 0..2 {
+            e.clear();
+            all.clear();
+            e.flushed(9999, 0, 1 << 24);
+            all.push((9999, 0, 1 << 24));
+            for k in 0..1025 {
+                let a = ((k * 419 + generation * 13) % 2049) * 4096;
+                e.flushed(k, a, a + 2048);
+                all.push((k, a, a + 2048));
+                if k % 7 == 0 {
+                    for from in [0, a, a + 2048, a + 4096, 1 << 24] {
+                        let to = from + 64;
+                        let mut expected: Vec<_> = all
+                            .iter()
+                            .filter(|&&(_, a, b)| a < to && b > from)
+                            .map(|x| x.0)
+                            .collect();
+                        let mut actual: Vec<_> = e.overlapping(from, to).collect();
+                        expected.sort_unstable();
+                        actual.sort_unstable();
+                        assert_eq!(actual, expected);
+                    }
+                }
+            }
+            assert_eq!(e.overlapping(1, 1).count(), 0);
         }
     }
 }

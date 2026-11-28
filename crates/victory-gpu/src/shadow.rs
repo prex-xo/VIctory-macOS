@@ -628,13 +628,14 @@ impl Shadow {
     }
 
     /// A zero-copy shadow whose title range `[start, start + len)` shares
-    /// physical pages with `buffer` (`mach_vm_remap`).
+    /// physical pages with `buffer` from `base` on (`mach_vm_remap`).
     pub(crate) fn new_aliased(
         buffer: ID3D12Resource,
         data: *mut u8,
         gpu: u64,
         start: u64,
         len: u64,
+        base: u64,
     ) -> Arc<Shadow> {
         let marks = marks().take(pages(start, len));
         let shadow = Arc::new(Shadow {
@@ -650,7 +651,7 @@ impl Shadow {
             widened: Mutex::default(),
             widened_source: Mutex::default(),
             has_widened: AtomicBool::new(false),
-            base: 0,
+            base,
             slice: None,
             aliased: true,
             sums: Mutex::default(),
@@ -723,6 +724,34 @@ impl Shadow {
             marked && self.marked() && !has_untracked,
         );
         list.mark_widened_write(self, address as usize, len as usize);
+    }
+
+    /// Arms the pages of `[address, address + len)` (tracked memory only)
+    /// for shaders that may write them through views no list declared (a
+    /// flight's heaps and title-memory programs, `crate::host::flight`): a
+    /// title write there before the copy-back saves the page's bytes from
+    /// before it, so that [`Shadow::copy_back_marked`] keeps both writers'
+    /// bytes, as for a declared marked write ([`Shadow::writing`]), instead
+    /// of the title's page whole.
+    pub(crate) fn arm_undeclared(&self, address: usize, len: usize) {
+        if let Some(t) = &self.tracked {
+            t.arm(address, address.saturating_add(len));
+        }
+    }
+
+    /// The flight that armed the copy ([`Shadow::arm_undeclared`]) has been
+    /// copied back: nothing stays armed or saved, unless a submitted list
+    /// still declares writes there (its own copy-back disarms it then).
+    pub(crate) fn disarm_undeclared(&self) {
+        if let Some(t) = &self.tracked
+            && self
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        {
+            t.disarm();
+        }
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders
@@ -1516,6 +1545,31 @@ static MARKS: Mutex<Marks> = Mutex::new(Marks {
     owners: BTreeMap::new(),
 });
 
+/// The host copies that own write-mark bits: what shaders writing through
+/// views can reach at all (the `VICTORY_PREP_AHEAD` probe).
+pub(crate) fn mark_owners() -> std::collections::HashSet<usize> {
+    marks()
+        .owners
+        .values()
+        .filter_map(std::sync::Weak::upgrade)
+        .map(|s| Arc::as_ptr(&s) as usize)
+        .collect()
+}
+
+/// [`mark_owners`], each with its memory (start, bytes):
+/// `VICTORY_PREP_AHEAD=ranges` keeps a preparation off all of it while a
+/// flight marking its writes is in the air.
+pub(crate) fn mark_owner_extents() -> Vec<(usize, usize, usize)> {
+    let mut seen = std::collections::HashSet::new();
+    marks()
+        .owners
+        .values()
+        .filter_map(std::sync::Weak::upgrade)
+        .filter(|s| seen.insert(Arc::as_ptr(s) as usize))
+        .map(|s| (Arc::as_ptr(&s) as usize, s.start as usize, s.len as usize))
+        .collect()
+}
+
 fn marks() -> std::sync::MutexGuard<'static, Marks> {
     MARKS.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -1852,6 +1906,9 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         let m = marks();
         marked.iter().filter_map(|&n| page_of(&m, n)).collect()
     };
+    for (_, page) in &pages {
+        crate::host::probe_marked(*page, PAGE);
+    }
     // Per copy, in page order, so its pages go back together.
     let mut by_copy: Vec<(Arc<Shadow>, Vec<usize>)> = Vec::new();
     for (copy, page) in pages {
@@ -2272,16 +2329,25 @@ fn find_uncached(address: u64, end: u64) -> Option<Arc<Shadow>> {
     if let Some(shadow) = find_aliased(address, end) {
         return Some(shadow);
     }
-    {
+    let found = {
         let map = buffers_read();
         let Some(key) = enclosing(&map, MAX_SPAN.load(Ordering::Relaxed), address, end) else {
             drop(map);
             return loose(address, end);
         };
-        if let Some(shadow) = map.get(&key).and_then(|entry| entry.shadow.clone()) {
-            return Some(shadow);
+        match map.get(&key) {
+            Some(entry) => match &entry.shadow {
+                Some(shadow) => return Some(shadow.clone()),
+                None => Some((key, entry.end - key.0)),
+            },
+            None => None,
         }
-    }
+    };
+    // `VICTORY_PHYSICAL_TILES=1`: a buffer on the title's physical pages
+    // reads them in place. Asked without the buffers' lock: the runtime's
+    // lookup takes its own, which it holds while it tells the trackers of
+    // a mapping (and they may read the buffers).
+    let mut tiled = found.and_then(|(key, len)| Some((key, crate::tiled::make(key.0, len)?)));
     let mut map = buffers();
     let key = enclosing(&map, MAX_SPAN.load(Ordering::Relaxed), address, end);
     let Some(key) = key else {
@@ -2289,6 +2355,13 @@ fn find_uncached(address: u64, end: u64) -> Option<Arc<Shadow>> {
         return loose(address, end);
     };
     let entry = map.get_mut(&key)?;
+    if entry.shadow.is_none()
+        && let Some((_, copy)) = tiled.take().filter(|(k, _)| *k == key)
+    {
+        entry.shadow = Some(copy);
+        released().remade(key.0);
+        changed();
+    }
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
@@ -2649,6 +2722,196 @@ pub(crate) fn forget_range(at: usize, len: usize) {
     }
 }
 
+/// Bytes and microseconds each host copy's refreshes took since the last
+/// frame report, by copy: where it is, how long, whether its memory is
+/// tracked (else copied whole each time).
+type RefreshedBy = std::collections::HashMap<usize, (u64, u64, bool, u64, u64)>;
+static REFRESHED: Mutex<Option<RefreshedBy>> = Mutex::new(None);
+
+/// A refresh of `copy` copied `bytes` in `us` microseconds.
+pub(crate) fn note_refreshed(copy: &Arc<Shadow>, bytes: usize, us: u64) {
+    if bytes == 0 {
+        return;
+    }
+    let mut map = REFRESHED.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = map
+        .get_or_insert_with(Default::default)
+        .entry(Arc::as_ptr(copy) as usize)
+        .or_insert((copy.start, copy.len, copy.tracked.is_some(), 0, 0));
+    entry.3 += bytes as u64;
+    entry.4 += us;
+}
+
+/// The bytes [`note_refreshed`] counted for `copy` since the last report.
+#[cfg(test)]
+pub(crate) fn refreshed_bytes(copy: &Arc<Shadow>) -> u64 {
+    REFRESHED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(&(Arc::as_ptr(copy) as usize)))
+        .map_or(0, |e| e.3)
+}
+
+/// The runtime's lookup of how title memory lies on its physical pages
+/// (pages, runs, sections; [`on_physical_runs`]).
+type PhysicalRuns = fn(usize, usize) -> Option<(usize, usize, usize)>;
+static PHYSICAL_RUNS: std::sync::OnceLock<PhysicalRuns> = std::sync::OnceLock::new();
+
+/// Sets the runtime's lookup of how title memory lies on its physical
+/// pages, for the refreshed-copies line: a host copy over memory in few
+/// runs of physical pages could be read by the GPU in place, if those
+/// pages were the GPU's memory.
+pub fn on_physical_runs(lookup: PhysicalRuns) {
+    let _ = PHYSICAL_RUNS.set(lookup);
+}
+
+/// `at`'s copy of `len` bytes on physical pages, for the line.
+fn physical_layout(at: usize, len: usize) -> String {
+    match PHYSICAL_RUNS.get().and_then(|lookup| lookup(at, len)) {
+        Some((pages, runs, sections)) => {
+            format!(", physical pages {pages} in {runs} runs over {sections} sections")
+        }
+        None => String::new(),
+    }
+}
+
+/// What memory title address `at` is, for the refreshed-copies line: its
+/// type (private: `XMemVirtualAlloc`, which zero-copy aliasing remaps;
+/// mapped: a section view, as physical pages are shown), protection, and
+/// the region of its allocation it lies in.
+fn memory_kind(at: usize) -> String {
+    use windows_sys::Win32::System::Memory::{
+        MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    // SAFETY: a plain query into a local.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is valid for writes of its size.
+    if unsafe { VirtualQuery(at as *const _, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
+        return "unknown".to_owned();
+    }
+    let kind = match info.Type {
+        MEM_PRIVATE => "private",
+        MEM_MAPPED => "mapped",
+        MEM_IMAGE => "image",
+        _ => "other",
+    };
+    format!(
+        "{kind}, protect {:#x}, allocation {:#x}, region {:.1} MB",
+        info.Protect,
+        info.AllocationBase as usize,
+        info.RegionSize as f64 / 1e6
+    )
+}
+
+#[cfg(test)]
+#[test]
+fn memory_kind_names_private_memory() {
+    let mut v = vec![0u8; 1 << 16];
+    let at = v.as_mut_ptr() as usize;
+    assert!(memory_kind(at).starts_with("private, protect 0x4"), "{}", memory_kind(at));
+}
+
+/// The frame report's line: how many copies were refreshed, the bytes of
+/// tracked and untracked ones, and the five that took most, per frame.
+pub(crate) fn log_refreshed(frames: f64) {
+    let Some(map) = REFRESHED.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        return;
+    };
+    let mb = |b: u64| b as f64 / 1e6 / frames;
+    let (mut tracked, mut whole) = (0, 0);
+    for e in map.values() {
+        if e.2 { tracked += e.3 } else { whole += e.3 }
+    }
+    let mut top: Vec<_> = map.values().copied().collect();
+    top.sort_unstable_by_key(|e| std::cmp::Reverse(e.3));
+    let top: Vec<String> = top
+        .iter()
+        .take(5)
+        .map(|&(start, len, t, bytes, us)| {
+            // Memory shown at several addresses: physical pages the title
+            // maps more than once (`XMemMapPhysicalPages`), which zero-copy
+            // aliasing does not reach (it remaps `XMemVirtualAlloc` commits).
+            let shown = crate::watch::aliased(start as usize, len as usize);
+            format!(
+                "{start:#x}+{:.1} MB{}{} [{}{}] {:.1} MB {:.1} ms",
+                len as f64 / 1e6,
+                if t { "" } else { " (untracked)" },
+                if shown { " (shown at several addresses)" } else { "" },
+                memory_kind(start as usize),
+                physical_layout(start as usize, len as usize),
+                mb(bytes),
+                us as f64 / 1e3 / frames
+            )
+        })
+        .collect();
+    tracing::info!(
+        "host copies refreshed per frame: {:.0} copies, tracked {:.1} MB, untracked (whole) {:.1} MB; most: {}",
+        map.len() as f64 / frames,
+        mb(tracked),
+        mb(whole),
+        top.join(", ")
+    );
+}
+
+/// Every host copy holding any of title memory `[from, to)`: buffers, loose
+/// windows and exact copies (`crate::host::same_copy`).
+pub(crate) fn over(from: usize, to: usize) -> Vec<Arc<Shadow>> {
+    let (from, to) = (from as u64, to as u64);
+    let mut found: Vec<Arc<Shadow>> = Vec::new();
+    {
+        let map = buffers_read();
+        let lowest = from.saturating_sub(MAX_SPAN.load(Ordering::Relaxed));
+        for (_, entry) in map.range((lowest, 0)..(to, 0)) {
+            if entry.end > from
+                && let Some(shadow) = &entry.shadow
+            {
+                found.push(shadow.clone());
+            }
+        }
+    }
+    {
+        let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let lowest = from.saturating_sub(LOOSE_SPAN.load(Ordering::Relaxed));
+        for (&(start, slen), shadow) in map.range((lowest, 0)..(to, 0)) {
+            if start.saturating_add(slen) > from {
+                found.push(shadow.clone());
+            }
+        }
+    }
+    {
+        let guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        let lowest = from.saturating_sub(EXACT_SPAN.load(Ordering::Relaxed));
+        for (&(start, slen, _), weak) in guard.1.range((lowest, 0, 0)..(to, 0, 0)) {
+            if start.saturating_add(slen) > from
+                && let Some(shadow) = weak.upgrade()
+            {
+                found.push(shadow);
+            }
+        }
+    }
+    found
+}
+
+impl Shadow {
+    /// Whether the copy's bytes of title memory `[address, address +
+    /// bytes.len())`, where it holds them, are `bytes` (a zero-copy alias
+    /// is the title's memory itself).
+    pub(crate) fn holds(&self, address: usize, bytes: &[u8]) -> bool {
+        if self.aliased {
+            return true;
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), address.saturating_add(bytes.len()).min(end));
+        if from >= to {
+            return true;
+        }
+        // SAFETY: inside the copy's mapping.
+        let host = unsafe { std::slice::from_raw_parts(self.data.add(from - start), to - from) };
+        host == &bytes[from - address..to - address]
+    }
+}
+
 /// Every host copy of title memory made so far (buffers, aliases, and windows).
 /// Presented frames a copy goes unasked for before [`release_idle`] may
 /// give it up.
@@ -2968,6 +3231,8 @@ pub(crate) fn near(va: u64) -> String {
 mod parallel_copy_tests;
 #[cfg(test)]
 mod snapshot_bench;
+#[cfg(test)]
+mod refresh_bench;
 #[cfg(test)]
 mod widened_bench;
 
@@ -3962,6 +4227,104 @@ pub(crate) mod tests {
         list.close();
     }
 
+    /// A shader writes the copy a widened view is patched from earlier in
+    /// the same list, a UAV barrier between: the patch's copy out of that
+    /// copy takes what the shader wrote. A UAV barrier orders UAV accesses
+    /// only, and D3DMetal ran the copy before the shader's writes landed.
+    #[test]
+    fn a_widened_patch_takes_what_a_shader_wrote_before_it_in_the_list() {
+        use crate::compute::{Param, pipeline};
+        const SHADER: &str = r#"
+cbuffer C : register(b0) { uint count; uint seed; };
+RWByteAddressBuffer dst : register(u0);
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x < count) {
+        uint v = id.x;
+        [loop] for (uint k = 0; k < 256; ++k) {
+            v = v * 1664525u + 1013904223u;
+        }
+        dst.Store(id.x * 4, id.x + seed + (v & 0u));
+    }
+}
+"#;
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let Ok((root, pso)) = pipeline(
+            SHADER,
+            windows::core::s!("widen_after_uav_writes"),
+            0,
+            &[
+                Param::Constants {
+                    register: 0,
+                    count: 2,
+                },
+                Param::Uav { register: 0 },
+            ],
+        ) else {
+            return; // no shader compiler here
+        };
+        // A title range of its own, as in
+        // `widened_views_patch_partial_elements_from_another_shadow`.
+        const ELEMENTS: u64 = 8192;
+        let start = 0x10_0000u64;
+        let bytes = ELEMENTS * 12;
+        let (parent_buffer, parent_data) = host.shared_buffer(bytes).unwrap();
+        // SAFETY: a live buffer.
+        let parent_gpu = unsafe { parent_buffer.GetGPUVirtualAddress() };
+        let parent = Shadow::new(parent_buffer, parent_data, parent_gpu, start, bytes);
+        // SAFETY: the parent shadow's bytes.
+        unsafe { std::ptr::write_bytes(parent_data, 0, bytes as usize) };
+        // A distinct shadow one dword in: its writes patch the view.
+        let len = bytes - 4;
+        let (writer_buffer, writer_data) = host.shared_buffer(len).unwrap();
+        // SAFETY: a live buffer.
+        let writer_gpu = unsafe { writer_buffer.GetGPUVirtualAddress() };
+        // SAFETY: the writer's bytes, stale until the shader writes them.
+        unsafe { std::ptr::write_bytes(writer_data, 0xee, len as usize) };
+        let writer = Shadow::new(writer_buffer, writer_data, writer_gpu, start + 4, len);
+        let widened = parent.widened(start, bytes, 1).expect("a widened view");
+        let seed = 0x5000_0000u32;
+        let dwords = (len / 4) as u32;
+        let list = host.new_list().unwrap();
+        // SAFETY: an open list, our pipeline and a live buffer.
+        unsafe {
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetPipelineState(&pso);
+            let constants = [dwords, seed];
+            list.list
+                .SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
+            list.list.SetComputeRootUnorderedAccessView(1, writer_gpu);
+            list.list.Dispatch(dwords.div_ceil(64), 1, 1);
+            list.list.ResourceBarrier(&[crate::host::uav_barrier()]);
+        }
+        list.keep(&root);
+        list.keep(&pso);
+        let writes = [(writer.clone(), start as usize + 4, len as usize)];
+        assert!(
+            crate::widened::sync(&list, &[], &writes, &std::collections::HashSet::new()).is_some()
+        );
+        list.close();
+        host.execute(&[&list]);
+        let got = widened.read_host(ELEMENTS as usize * 4);
+        // Title dword k (from 1) is the writer's dword k - 1; dword 0 the
+        // parent's 0; each element's fourth dword the view's 1.
+        let want = |i: usize| match (i / 4 * 3 + i % 4, i % 4) {
+            (_, 3) => 1,
+            (0, _) => 0,
+            (k, _) => seed + k as u32 - 1,
+        };
+        let stale = (0..got.len()).filter(|&i| got[i] != want(i)).count();
+        assert_eq!(
+            stale,
+            0,
+            "{stale} of {} widened dwords miss the shader's writes",
+            got.len()
+        );
+        drop((widened, writer, parent));
+    }
+
     /// An element-aligned shadow that starts after the widened view cannot
     /// back the direct source root SRV; it must use the composed patch path.
     #[test]
@@ -4522,13 +4885,26 @@ pub(crate) mod tests {
         assert!(loose(0, 16).is_none());
         assert!(loose(0x1000, 0x1010).is_none());
         assert!(loose(LOWEST_MAPPED - 1, LOWEST_MAPPED + 1).is_none());
-        // Reserved, not committed.
-        // SAFETY: a fresh reservation, released below.
-        let p = unsafe { VirtualAlloc(std::ptr::null(), loose_window_bytes() as usize, MEM_RESERVE, PAGE_READWRITE) } as u64;
-        assert_ne!(p, 0);
+        // Reserved, not committed. Memory another test gave back may still
+        // have a copy registered over it (that one is found, as it should
+        // be): such a reservation is held, and another taken.
+        let window = loose_window_bytes() as usize;
+        let mut held = Vec::new();
+        let p = loop {
+            // SAFETY: a fresh reservation, released below.
+            let p = unsafe { VirtualAlloc(std::ptr::null(), window, MEM_RESERVE, PAGE_READWRITE) } as u64;
+            assert_ne!(p, 0);
+            if over(p as usize, p as usize + window).is_empty() {
+                break p;
+            }
+            assert!(held.len() < 8, "no reservation without a copy over it");
+            held.push(p);
+        };
         assert!(loose(p + 64, p + 128).is_none());
-        // SAFETY: our reservation.
-        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        for p in held.into_iter().chain([p]) {
+            // SAFETY: our reservation.
+            unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        }
         // Too close to the top to round up to a window.
         assert!(loose(u64::MAX - 8, u64::MAX).is_none());
     }
@@ -4589,7 +4965,7 @@ pub(crate) mod tests {
         let outer = find(base + 0x100, 64).expect("outer shadow");
         assert!(!outer.is_aliased());
 
-        let aliased = Shadow::new_aliased(buffer, data, gpu, base, 0x10000);
+        let aliased = Shadow::new_aliased(buffer, data, gpu, base, 0x10000, 0);
         register_aliased(aliased.clone());
         let hit = find(base + 0x100, 64).expect("aliased shadow");
         assert!(hit.is_aliased());

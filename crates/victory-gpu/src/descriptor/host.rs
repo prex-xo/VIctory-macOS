@@ -21,6 +21,9 @@ use crate::backend::{HostGpu, HostMemory};
 use crate::host::host;
 
 const SYNC_BLOCK_SLOTS: u32 = 128;
+/// The widest span of stale slots a heap sync's batch reads in one call
+/// (`mirror_synced_batch`); its callers pass a page's slots (64 KiB).
+const SPAN_READ_MAX: u64 = 1 << 20;
 
 thread_local! {
     /// True while this thread is inside [`HostHeap::publish`], preventing
@@ -599,6 +602,11 @@ pub(crate) struct HostHeap {
     widened: Mutex<HashMap<usize, (usize, std::sync::Weak<crate::shadow::Widened>)>>,
     /// Slots queued for background texture upload (`crate::heap_worker`).
     uploads: Mutex<UploadQueue>,
+    /// Slots left showing what they showed before, because the texture
+    /// their new record views was made while a submission may still run
+    /// ([`show_after`]): slot, and the title's handle and record. Made at
+    /// the next submission ([`HostHeap::show_held`]).
+    held: Mutex<HashMap<u32, (u64, u64)>>,
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -642,6 +650,17 @@ const DYNAMIC: u32 = 1 << 18;
 /// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
 /// (a capped heap, NVIDIA): the title's slots keep their room first.
 const MIN_DYNAMIC: u32 = 1 << 16;
+
+/// Counts a [`HostHeap::mirror_synced_batch`] into `crate::descriptor::SYNC_STATS` when dropped.
+struct MakeTimer(std::time::Instant, u64);
+
+impl Drop for MakeTimer {
+    fn drop(&mut self) {
+        use crate::descriptor::{SyncStat, sync_stat};
+        sync_stat(SyncStat::MakeUs, self.0.elapsed().as_micros() as u64);
+        sync_stat(SyncStat::Made, self.1);
+    }
+}
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -771,6 +790,7 @@ impl HostHeap {
             viewed: Default::default(),
             widened: Default::default(),
             uploads: Default::default(),
+            held: Default::default(),
         };
         if !sampler {
             crate::bindless::register(&h.viewed);
@@ -1706,6 +1726,7 @@ impl HostHeap {
     /// deduplicating `prepare` and descriptor creation via [`StagingHeap`] +
     /// `CopyDescriptorsSimple`.
     fn mirror_synced_batch(&self, stale: &[(u32, [u32; 3])], at: impl Fn(u32) -> u64) {
+        let _making = MakeTimer(std::time::Instant::now(), stale.len() as u64);
         struct CachedTemplate {
             src: D3D12_CPU_DESCRIPTOR_HANDLE,
             kept: Option<Kept>,
@@ -1739,6 +1760,13 @@ impl HostHeap {
             }
         }
 
+        use crate::descriptor::{SyncStat as S, sync_stat};
+        let lap = |stat: S, since: &mut std::time::Instant| {
+            let now = std::time::Instant::now();
+            sync_stat(stat, (now - *since).as_micros() as u64);
+            *since = now;
+        };
+        let mut clock = std::time::Instant::now();
         let at_once = placed_at_once();
         let pins = views_at_batch(&unique_keys);
         let mut defer: Vec<bool> = Vec::with_capacity(unique_keys.len());
@@ -1760,6 +1788,7 @@ impl HostHeap {
             }
         }
 
+        lap(S::PrepareUs, &mut clock);
         // Initialize the staging heap before acquiring `self.made`.
         let staging = self.staging();
         let host = host();
@@ -1782,13 +1811,37 @@ impl HostHeap {
             };
             let mut forgot_reads: Vec<u32> = Vec::new();
             let mut finalize: Vec<(u32, u64, u64)> = Vec::with_capacity(stale.len());
+            // What the slots took, for the frame report's line.
+            let (mut unchanged, mut from_template, mut deferred, mut nulled) = (0u64, 0u64, 0u64, 0u64);
+            let mut created: Vec<u64> = Vec::new();
+            let mut create_us = 0u64;
+            let mut make_marked = |view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE, key: u64| {
+                let started = std::time::Instant::now();
+                let made = make_marked(view, at);
+                create_us += started.elapsed().as_micros() as u64;
+                created.push(key);
+                made
+            };
             let addr_data = self
                 .addresses
                 .get()
                 .and_then(Option::as_ref)
                 .map(|&(_, data, _)| data);
             let addr_slots = self.address_slots();
-
+            // The live records of every stale slot, read once under
+            // `self.made` (one `ReadProcessMemory` for the span, a page's at
+            // most): read a slot at a time it was a call per slot, ~0.5 us
+            // each under Wine, most of the batch's time for ~39,000 slots.
+            // A span that cannot be read whole is read a slot at a time.
+            let span = stale
+                .iter()
+                .map(|&(i, _)| at(i))
+                .fold((u64::MAX, 0u64), |(lo, hi), a| (lo.min(a), hi.max(a + 12)));
+            let mut live_span: Vec<u8> = Vec::new();
+            let span_read = !stale.is_empty() && span.1 - span.0 <= SPAN_READ_MAX && {
+                live_span.resize((span.1 - span.0) as usize, 0);
+                crate::host::read_into(span.0 as *const u8, &mut live_span)
+            };
             for (entry_idx, &(index, snapshot)) in stale.iter().enumerate() {
                 let addr = at(index);
                 // Re-read live title memory under `self.made`: if a title
@@ -1796,7 +1849,10 @@ impl HostHeap {
                 // during `prepare`), defer to `mirror` after dropping locks.
                 // SAFETY: the caller holds the heap alive until the sync completes.
                 let mut raw = [0u8; 12];
-                if !crate::host::read_into(addr as *const u8, &mut raw) {
+                if span_read {
+                    let off = (addr - span.0) as usize;
+                    raw.copy_from_slice(&live_span[off..off + 12]);
+                } else if !crate::host::read_into(addr as *const u8, &mut raw) {
                     continue;
                 }
                 let live = [
@@ -1820,6 +1876,7 @@ impl HostHeap {
                 });
                 let Some((kidx, key, view)) = resolved else {
                     if made[index as usize] != 0 {
+                        nulled += 1;
                         self.ready[index as usize].store(0, Ordering::Relaxed);
                         self.synced[index as usize].store(0, Ordering::Relaxed);
                         made[index as usize] = 0;
@@ -1847,6 +1904,7 @@ impl HostHeap {
                     continue;
                 };
                 if made[index as usize] == key {
+                    unchanged += 1;
                     continue;
                 }
                 self.ready[index as usize].store(0, Ordering::Relaxed);
@@ -1866,6 +1924,7 @@ impl HostHeap {
                 made[index as usize] = key;
 
                 let (kept, mark) = if later {
+                    deferred += 1;
                     if !self.sampler && !keep_old {
                         if let (Some(_), Some(st)) = (host, staging) {
                             let null_slot = null_slot_index(false, Some(view));
@@ -1880,13 +1939,14 @@ impl HostHeap {
                     && let (Some(_), Some(st)) = (host, staging)
                 {
                     if let Some(tpl) = &templates[kidx] {
+                        from_template += 1;
                         copy_dsts.push(self.cpu(index));
                         copy_srcs.push(tpl.src);
                         (tpl.kept.clone(), tpl.mark)
                     } else if next_template < st.count {
                         let t = next_template;
                         next_template += 1;
-                        let (k, m) = make_marked(view, st.cpu(t));
+                        let (k, m) = make_marked(view, st.cpu(t), key);
                         let src = if k.is_none() && !self.sampler {
                             st.cpu(null_slot_index(false, Some(view)))
                         } else {
@@ -1901,7 +1961,7 @@ impl HostHeap {
                         });
                         (k, m)
                     } else {
-                        let (k, m) = make_marked(view, self.cpu(index));
+                        let (k, m) = make_marked(view, self.cpu(index), key);
                         if k.is_none() && !self.sampler {
                             let null_slot = null_slot_index(false, Some(view));
                             copy_dsts.push(self.cpu(index));
@@ -1910,7 +1970,7 @@ impl HostHeap {
                         (k, m)
                     }
                 } else {
-                    let (k, m) = make_marked(view, self.cpu(index));
+                    let (k, m) = make_marked(view, self.cpu(index), key);
                     if k.is_none() && !self.sampler {
                         if let (Some(_), Some(st)) = (host, staging) {
                             let null_slot = null_slot_index(false, Some(view));
@@ -1941,6 +2001,19 @@ impl HostHeap {
                 finalize.push((index, key, ready));
             }
 
+            lap(S::LoopUs, &mut clock);
+            {
+                sync_stat(S::Unchanged, unchanged);
+                sync_stat(S::Created, created.len() as u64);
+                sync_stat(S::CreateUs, create_us);
+                sync_stat(S::FromTemplate, from_template);
+                sync_stat(S::Deferred, deferred);
+                sync_stat(S::Nulled, nulled);
+                if crate::descriptor::view_probe() {
+                    sync_stat(S::SeenBefore, crate::descriptor::seen_before(&created));
+                }
+            }
+            let copying = std::time::Instant::now();
             if !copy_dsts.is_empty()
                 && let (Some(h), Some(st)) = (host, staging)
             {
@@ -1962,10 +2035,14 @@ impl HostHeap {
                 }
             }
 
+            sync_stat(S::CopyUs, copying.elapsed().as_micros() as u64);
+            clock = std::time::Instant::now();
             self.keep_batch(kept_updates, &mut retired);
+            lap(S::KeepUs, &mut clock);
             if !self.sampler {
                 self.viewed.set_batch(&viewed_updates);
             }
+            lap(S::ViewedUs, &mut clock);
             crate::shadow::forget_reads(&forgot_reads);
             // Coalesce `made_nonzero` bit updates per 64-slot word (stale indices
             // arrive in ascending order): set nonzero bits before publishing
@@ -2179,6 +2256,13 @@ impl HostHeap {
             if made[index as usize] == key && !needs_remake() {
                 return Some(view);
             }
+            // Lists already on the GPU read this slot by index: a texture
+            // made while they may run is shown once they have ([`show_after`]).
+            if !self.sampler && show_after() && fresh_texture(&view) {
+                drop(made);
+                self.hold(index, handle, key);
+                return Some(view);
+            }
         }
         {
             let keep_old = later && at_once == PlacedAtOnce::Keep && self.kept(index);
@@ -2241,6 +2325,74 @@ impl HostHeap {
         }
         let _guard = PublishingGuard(PUBLISHING.replace(true));
         self.mirror(index, handle, true).is_some()
+    }
+
+    /// Leaves slot `index` showing what it showed, to be made from the
+    /// record `key` at `handle` at the next submission ([`show_after`]).
+    fn hold(&self, index: u32, handle: u64, key: u64) {
+        let fresh = self
+            .held
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(index, (handle, key))
+            .is_none();
+        if fresh {
+            let n = SHOWN_AFTER[0].fetch_add(1, Ordering::Relaxed) + 1;
+            if n == 1 {
+                tracing::info!(
+                    "a heap slot's new texture was made while a submission may still run: \
+                     the slot is shown after it (VICTORY_SHOW_AFTER=1)"
+                );
+            }
+        }
+    }
+
+    /// Makes the slots [`HostHeap::hold`] left as they were, if the title
+    /// still has the same record there; returns how many were made. Called
+    /// while preparing a submission, when no submission runs any more
+    /// (`Host::execute`, after `crate::descriptor::sync_heaps`).
+    pub(crate) fn show_held(&self) -> usize {
+        let held: Vec<(u32, (u64, u64))> = {
+            let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+            if held.is_empty() {
+                return 0;
+            }
+            held.drain().collect()
+        };
+        let mut shown = 0;
+        for (index, (handle, key)) in held {
+            // SAFETY: a descriptor slot in the live title heap the caller
+            // holds (`SHADER_HEAPS`).
+            let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+            if tag != VIEW_TAG || (u64::from(generation) << 32 | u64::from(i)) != key {
+                // Written again since: that write made (or held) the slot.
+                SHOWN_AFTER[2].fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            if self.mirror(index, handle, true).is_some() {
+                shown += 1;
+            }
+        }
+        let n = SHOWN_AFTER[1].fetch_add(shown as u64, Ordering::Relaxed) + shown as u64;
+        if shown > 0 && (n == shown as u64 || n / 5000 != (n - shown as u64) / 5000) {
+            tracing::info!(
+                held = SHOWN_AFTER[0].load(Ordering::Relaxed),
+                shown = n,
+                rewritten = SHOWN_AFTER[2].load(Ordering::Relaxed),
+                "heap slots shown after the submissions that ran while their texture was made \
+                 (VICTORY_SHOW_AFTER=1), since the start"
+            );
+        }
+        shown
+    }
+
+    /// Whether slot `index` waits for [`HostHeap::show_held`] (tests).
+    #[cfg(test)]
+    pub(crate) fn is_held(&self, index: u32) -> bool {
+        self.held
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&index)
     }
 
     /// Whether slot `index` currently shows a non-null host view made from the
@@ -3444,6 +3596,59 @@ fn prepare(view: &View) {
 
 /// Whether `view` is a shader view of a texture (one placed in memory, or a
 /// resource object's): such a slot left null is made when read.
+/// Slots held for [`show_after`] since the start: held, made later, and
+/// written again by the title before that.
+static SHOWN_AFTER: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only per-thread override for [`show_after`].
+    static TEST_SHOW_AFTER: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Forces [`show_after`] on or off on this thread (`None`: the switch).
+#[cfg(test)]
+pub(crate) fn set_show_after(on: Option<bool>) {
+    TEST_SHOW_AFTER.set(on);
+}
+
+/// Whether a heap slot whose new record views a host texture made while a
+/// submission may still run keeps showing what it showed until the next
+/// submission (`VICTORY_SHOW_AFTER=1`; off by default).
+///
+/// Lists on the GPU read heap slots by index. Changed at once, a slot shows
+/// those lists a texture made after they were handed to the queue: under
+/// D3D12 on an RX 7900 XTX every device loss with a page-fault address was at
+/// a texture made and shown in the last tenth of a second (ported from
+/// avatarmanz/VIctory-7900XTX's `VICTORY_SHOW_AFTER` and
+/// `VICTORY_SHOW_NEW_LATER`). Here the held slot is made in the next
+/// submission's preparation, when no submission runs, and before the
+/// uploads of the textures heap slots view are collected.
+pub(crate) fn show_after() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_SHOW_AFTER.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_SHOW_AFTER"))
+}
+
+/// Whether `view` views a host texture made while a submission may still
+/// run ([`crate::resource::HostTexture::fresh`]).
+fn fresh_texture(view: &View) -> bool {
+    if !is_texture(view) {
+        return false;
+    }
+    let resource = match view {
+        View::Shader(r, _) => *r,
+        _ => match placed_texture(view) {
+            Some(View::Shader(r, _)) => r,
+            _ => return false,
+        },
+    };
+    crate::resource::host_copy(resource as crate::object::This).is_some_and(|copy| copy.fresh())
+}
+
 pub(crate) fn is_texture(view: &View) -> bool {
     is_placed_texture(view)
         || matches!(view, View::Shader(r, _) if crate::resource::texture_memory(*r as crate::object::This).is_some())
@@ -5302,6 +5507,155 @@ mod tests {
         crate::object::release(buf_c);
         let _ = title_heap.as_mut_ptr();
         let _ = tex_mem.as_ptr();
+    }
+
+    /// Slots made again as a ring of descriptor tables does it: every slot
+    /// takes another view each pass. Times a slot made again and prints
+    /// where its time goes ("heap slots made again" in the frame report).
+    /// `cargo test --release -p victory-gpu --lib bench_made_again --
+    /// --ignored --nocapture`.
+    #[test]
+    #[ignore = "times heap slots made again"]
+    fn bench_made_again() {
+        const SLOTS: u32 = 16_384;
+        const PAGE_SLOTS: u32 = 2_048;
+        let Some(host) = HostHeap::new(false, SLOTS) else {
+            return;
+        };
+        let srv_desc = [62u32, 1, 0x1688, 0, 0, 0, 256, 0, 0, 0];
+        let records: Vec<[u32; 3]> = (0..256)
+            .map(|_| {
+                let b = crate::resource::test_buffer(256);
+                let (ptr, len) = crate::resource::buffer_bytes(b).expect("buffer bytes");
+                crate::shadow::register(b as usize, ptr as u64, len);
+                let mut rec = [0u32; 3];
+                crate::descriptor::create_srv(std::ptr::null(), b, &srv_desc, rec.as_mut_ptr() as u64);
+                rec
+            })
+            .collect();
+        let mem = private_memory(SLOTS as usize * 32);
+        let start = mem.as_ptr() as u64;
+        let write = |mem: &mut [u8], pass: usize| {
+            for i in 0..SLOTS as usize {
+                let rec = records[(i * 7 + pass * 13) % records.len()];
+                for (k, w) in rec.iter().enumerate() {
+                    mem[i * 32 + 4 * k..i * 32 + 4 * k + 4].copy_from_slice(&w.to_le_bytes());
+                }
+            }
+        };
+        let sync = |mem: &[u8]| {
+            for p in 0..SLOTS / PAGE_SLOTS {
+                let (first, last) = (p * PAGE_SLOTS, (p + 1) * PAGE_SLOTS);
+                let (b0, b1) = (first as usize * 32, last as usize * 32);
+                host.sync_slots_bytes_with(first..last, start, 32, start + b0 as u64, &mem[b0..b1], true);
+            }
+        };
+        write(mem, 0);
+        sync(mem);
+        let _ = crate::descriptor::SYNC_STATS.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
+        let passes = 20;
+        let started = std::time::Instant::now();
+        for pass in 1..=passes {
+            write(mem, pass);
+            sync(mem);
+        }
+        let each = started.elapsed().as_secs_f64() * 1e6 / (passes * SLOTS as usize) as f64;
+        let st = crate::descriptor::SYNC_STATS.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
+        eprintln!(
+            "a slot made again: {each:.2} us; made again {}: unchanged {}, created {} ({} us), from a template {}; \
+             us: prepare {}, loop {}, copy {}, keep {}, viewed {}, all making {}",
+            st[7], st[8], st[9], st[10], st[11], st[16], st[17], st[15], st[18], st[19], st[6]
+        );
+    }
+
+    #[test]
+    fn the_view_probe_counts_descriptors_an_earlier_sync_created() {
+        // Keys no other test makes (generation 0xffff_fff0..).
+        let keys: Vec<u64> = (0..4).map(|i| (0xffff_fff0u64 + i) << 32 | 7).collect();
+        assert_eq!(crate::descriptor::seen_before(&keys[..2]), 0);
+        assert_eq!(crate::descriptor::seen_before(&keys), 2, "the first two again");
+    }
+
+    /// What a 12-byte read through the kernel costs (one a slot made
+    /// again, `mirror_synced_batch`) against reading the page once.
+    #[test]
+    #[ignore = "times kernel reads of heap records"]
+    fn bench_record_reads() {
+        let mem = private_memory(1 << 16);
+        let rounds = 100_000;
+        let mut raw = [0u8; 12];
+        let started = std::time::Instant::now();
+        for i in 0..rounds {
+            assert!(crate::host::read_into(mem[(i % 2048) * 32..].as_ptr(), &mut raw));
+        }
+        let each = started.elapsed().as_secs_f64() * 1e6 / rounds as f64;
+        let mut page = vec![0u8; 1 << 16];
+        let started = std::time::Instant::now();
+        for _ in 0..1000 {
+            assert!(crate::host::read_into(mem.as_ptr(), &mut page));
+        }
+        let whole = started.elapsed().as_secs_f64() * 1e6 / 1000.0;
+        eprintln!("12-byte kernel read {each:.2} us; a 64 KiB page {whole:.1} us (2,048 records)");
+    }
+
+    /// What syncing a heap page the title rewrote with the same records
+    /// costs (every slot scanned, none stale), against comparing the page
+    /// with its bytes from the last sync. `cargo test --release -p
+    /// victory-gpu --lib bench_unchanged_page -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "times a sync of unchanged heap pages"]
+    fn bench_unchanged_page_scan_vs_compare() {
+        const SLOTS: u32 = 65_536;
+        const PAGE_SLOTS: u32 = 2_048;
+        let Some(host) = HostHeap::new(false, SLOTS) else {
+            return;
+        };
+        let srv_desc = [62u32, 1, 0x1688, 0, 0, 0, 256, 0, 0, 0];
+        let records: Vec<[u32; 3]> = (0..64)
+            .map(|_| {
+                let b = crate::resource::test_buffer(256);
+                let (ptr, len) = crate::resource::buffer_bytes(b).expect("buffer bytes");
+                crate::shadow::register(b as usize, ptr as u64, len);
+                let mut rec = [0u32; 3];
+                crate::descriptor::create_srv(std::ptr::null(), b, &srv_desc, rec.as_mut_ptr() as u64);
+                rec
+            })
+            .collect();
+        let mem = private_memory(SLOTS as usize * 32);
+        for i in 0..SLOTS as usize {
+            let rec = records[i % records.len()];
+            for (k, w) in rec.iter().enumerate() {
+                mem[i * 32 + 4 * k..i * 32 + 4 * k + 4].copy_from_slice(&w.to_le_bytes());
+            }
+        }
+        let start = mem.as_ptr() as u64;
+        let sync = |host: &HostHeap| {
+            for p in 0..SLOTS / PAGE_SLOTS {
+                let (first, last) = (p * PAGE_SLOTS, (p + 1) * PAGE_SLOTS);
+                let (b0, b1) = (first as usize * 32, last as usize * 32);
+                host.sync_slots_bytes_with(first..last, start, 32, start + b0 as u64, &mem[b0..b1], true);
+            }
+        };
+        sync(&host);
+        let pages = (SLOTS / PAGE_SLOTS) as usize;
+        let rounds = 20;
+        let started = std::time::Instant::now();
+        for _ in 0..rounds {
+            sync(&host);
+        }
+        let scan = started.elapsed().as_secs_f64() * 1e6 / (rounds * pages) as f64;
+        let saved = mem.to_vec();
+        let started = std::time::Instant::now();
+        let mut same = 0;
+        for _ in 0..rounds {
+            for p in 0..pages {
+                let r = p * 65_536..(p + 1) * 65_536;
+                same += usize::from(std::hint::black_box(&mem[r.clone()]) == &saved[r]);
+            }
+        }
+        let compare = started.elapsed().as_secs_f64() * 1e6 / (rounds * pages) as f64;
+        assert_eq!(same, rounds * pages);
+        eprintln!("unchanged 64 KiB heap page ({PAGE_SLOTS} slots): scan {scan:.1} us, compare {compare:.1} us");
     }
 
     #[test]

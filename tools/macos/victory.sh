@@ -52,6 +52,32 @@ fi
 # Ask Cargo where it built the executable, including any configured target directory.
 metadata=$(cargo metadata --format-version 1 --no-deps)
 target_dir=$(printf '%s\n' "$metadata" | /usr/bin/plutil -extract target_directory raw -o - -)
+# VICTORY_SET=<name> reads the switches in tools/macos/sets/<name>.txt (one
+# NAME=value a line, # comments), as a named set testers can compare runs by
+# (#555). A variable already set in the environment wins over the set.
+if [ -n "${VICTORY_SET:-}" ]; then
+    case "$VICTORY_SET" in
+        *[!A-Za-z0-9_-]*) echo "VICTORY_SET names a file in tools/macos/sets: $VICTORY_SET" >&2; exit 1 ;;
+    esac
+    applied=
+    set_file="$ROOT/tools/macos/sets/$VICTORY_SET.txt"
+    [ -f "$set_file" ] || { echo "no switch set $VICTORY_SET: the sets are $(ls "$ROOT/tools/macos/sets" | sed 's/\.txt$//' | tr '\n' ' ')" >&2; exit 1; }
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            ''|'#'*) continue ;;
+        esac
+        name=${line%%=*}
+        case "$name" in
+            VICTORY_*|WINE*) ;;
+            *) echo "$set_file: not a VICTORY_ or WINE variable: $line" >&2; exit 1 ;;
+        esac
+        if ! printenv "$name" > /dev/null; then
+            export "$name=${line#*=}"
+        fi
+        applied="${applied:+$applied }$name=$(printenv "$name")"
+    done < "$set_file"
+    echo "switch set $VICTORY_SET: $applied" >&2
+fi
 export WINEPREFIX="${WINEPREFIX:-$ROOT/target/wineprefix-play}"
 export WINEDEBUG="${WINEDEBUG:--all}"
 export WINEDLLOVERRIDES="mscoree,mshtml=;winedbg.exe=d;d3d12,d3d12core,dxgi=b${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
@@ -68,5 +94,15 @@ fi
 if [ "${1:-}" = run ]; then
     "$(dirname "$WINE")/wineserver" -k 2>/dev/null || true
     "$(dirname "$WINE")/wineserver" -w 2>/dev/null || true
+fi
+# Keep the Mac and its display awake while VIctory runs. Runs left alone
+# stopped on the loading artwork at 0.8 fps, and a --cache pre-build paused
+# for about 16 minutes, while the same builds went on with someone at the Mac
+# (#554): display sleep hides the game's window, and macOS then throttles a
+# hidden app (App Nap). caffeinate holds its assertions on behalf of Wine and
+# lets them go when Wine exits, with Wine's exit status.
+# VICTORY_CAFFEINATE=0 leaves sleep to macOS.
+if [ "${VICTORY_CAFFEINATE:-1}" != 0 ] && [ -x /usr/bin/caffeinate ]; then
+    exec /usr/bin/caffeinate -dim "$WINE" "$target_dir/$TARGET/release/victory.exe" "$@"
 fi
 exec "$WINE" "$target_dir/$TARGET/release/victory.exe" "$@"

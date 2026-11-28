@@ -220,46 +220,7 @@ fn a_dispatch_counted_in_threads_runs_only_those_threads() {
             "dispatch did not record"
         );
         crate::list::ensure_state(&list, placed, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
-        let row = (TEXELS * 16) as u32;
-        let (readback, data) = list.readback(host, u64::from(row)).unwrap();
-        // SAFETY: an open list; a live texture in the copy-source state and
-        // a readback buffer the list holds, large enough for the row.
-        unsafe {
-            let to = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: std::mem::transmute_copy(&readback),
-                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                        Offset: 0,
-                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
-                            Width: TEXELS as u32,
-                            Height: 1,
-                            Depth: 1,
-                            RowPitch: row,
-                        },
-                    },
-                },
-            };
-            let from = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: std::mem::transmute_copy(&texture),
-                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    SubresourceIndex: 0,
-                },
-            };
-            list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
-        }
-        list.close();
-        host.execute(&[&list]);
-        // SAFETY: a plain query; the mapped row, read after the synchronous
-        // submission.
-        let texels: Vec<[f32; 4]> = unsafe {
-            assert!(host.device.GetDeviceRemovedReason().is_ok());
-            (0..TEXELS)
-                .map(|i| data.cast::<[f32; 4]>().add(i).read_unaligned())
-                .collect()
-        };
+        let texels = read_texture_row(host, &list, &texture, TEXELS as u32);
         for t in &texels {
             assert!(*t == [0.0; 4] || *t == [1.0, 0.0, 0.0, 0.0], "texel {t:?}");
         }
@@ -285,4 +246,54 @@ fn a_dispatch_counted_in_threads_runs_only_those_threads() {
         .iter()
         .find(|u| u.root == kind);
     assert_eq!(word.map(|u| u.dword), Some(64));
+}
+
+/// Copies one RGBA32F row from an existing copy-source texture and waits.
+pub(super) fn read_texture_row(
+    host: &crate::host::Host,
+    list: &crate::host::HostList,
+    texture: &ID3D12Resource,
+    texels: u32,
+) -> Vec<[f32; 4]> {
+    assert_eq!(texels * 16 % 256, 0);
+    let row = texels * 16;
+    let (readback, data) = list.readback(host, u64::from(row)).unwrap();
+    // SAFETY: an open list; a live texture in the copy-source state and
+    // a readback buffer the list holds, large enough for the row.
+    unsafe {
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::transmute_copy(&readback),
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                        Width: texels,
+                        Height: 1,
+                        Depth: 1,
+                        RowPitch: row,
+                    },
+                },
+            },
+        };
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::transmute_copy(texture),
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: 0,
+            },
+        };
+        list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+    }
+    list.close();
+    host.execute(&[list]);
+    // SAFETY: a plain query; the mapped row, read after the synchronous
+    // submission.
+    unsafe {
+        host.device.GetDeviceRemovedReason().unwrap();
+        (0..texels as usize)
+            .map(|i| data.cast::<[f32; 4]>().add(i).read_unaligned())
+            .collect()
+    }
 }

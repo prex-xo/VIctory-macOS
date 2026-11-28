@@ -263,6 +263,23 @@ impl Changed {
 /// Byte runs `[start, end)` in order.
 pub(crate) type Runs = Vec<(usize, usize)>;
 
+fn split_runs(pages: &[usize], from: usize, to: usize, unmapped: &[usize]) -> (Runs, Runs) {
+    let (mut copy, mut zero): (Runs, Runs) = (Vec::new(), Vec::new());
+    for &page in pages {
+        let (a, b) = ((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
+        let runs = if unmapped.binary_search(&page).is_ok() {
+            &mut zero
+        } else {
+            &mut copy
+        };
+        match runs.last_mut() {
+            Some((_, end)) if *end == a => *end = b,
+            _ => runs.push((a, b)),
+        }
+    }
+    (copy, zero)
+}
+
 /// Title memory a host copy or texture staging takes: bytes `[start, end)`.
 pub(crate) struct Tracked {
     start: usize,
@@ -888,6 +905,9 @@ impl Tracked {
     /// first of as many calls would have taken it, leaving the others to see
     /// it changed no more.
     pub(crate) fn take_split_many(&self, ranges: &[(usize, usize)]) -> Vec<(Runs, Runs)> {
+        if let &[(from, to)] = ranges {
+            return vec![self.take_split(from, to)];
+        }
         let clipped: Vec<(usize, usize)> = ranges
             .iter()
             .map(|&(from, to)| (from.max(self.start), to.min(self.end)))
@@ -911,34 +931,23 @@ impl Tracked {
         if pages.iter().all(Vec::is_empty) {
             return vec![(Vec::new(), Vec::new()); ranges.len()];
         }
-        let whole: Vec<usize> = pages
+        // Any range that covers a whole page already includes that page in
+        // its snapshot. Partial occurrences in other ranges add no aliases.
+        let whole: Vec<usize> = clipped
             .iter()
-            .flatten()
-            .copied()
-            .filter(|&p| {
-                clipped.iter().any(|&(from, to)| {
+            .zip(&pages)
+            .flat_map(|(&(from, to), pages)| {
+                pages.iter().copied().filter(move |&p| {
                     (p * PAGE).max(self.start) >= from && ((p + 1) * PAGE).min(self.end) <= to
                 })
             })
             .collect();
-        let push = |out: &mut Vec<(Runs, Runs)>, pages: &[usize], from: usize, to: usize, unmapped: &[usize]| {
-            let (mut copy, mut zero): (Runs, Runs) = (Vec::new(), Vec::new());
-            for &p in pages {
-                let (a, b) = ((p * PAGE).max(from), ((p + 1) * PAGE).min(to));
-                let runs = if unmapped.binary_search(&p).is_ok() { &mut zero } else { &mut copy };
-                match runs.last_mut() {
-                    Some((_, end)) if *end == a => *end = b,
-                    _ => runs.push((a, b)),
-                }
-            }
-            out.push((copy, zero));
-        };
         let mut unmapped = Vec::new();
         let mut taken: BTreeSet<usize> = BTreeSet::new();
         let mut out: Vec<(Runs, Runs)> = Vec::with_capacity(ranges.len());
         if whole.is_empty() {
             for (i, &(from, to)) in clipped.iter().enumerate() {
-                push(&mut out, &pages[i], from, to, &unmapped);
+                out.push(split_runs(&pages[i], from, to, &unmapped));
             }
             return out;
         }
@@ -979,7 +988,7 @@ impl Tracked {
                 self.changed.taken_many(pages);
             });
             unmapped.sort_unstable();
-            push(&mut out, &pages, from, to, &unmapped);
+            out.push(split_runs(&pages, from, to, &unmapped));
         }
         drop(g);
         out
@@ -989,7 +998,53 @@ impl Tracked {
     /// read as zeros, with no copy to try (each such page cost a dozen
     /// failing kernel reads, 7-30 ms a frame in run perf4).
     pub(crate) fn take_split(&self, from: usize, to: usize) -> (Runs, Runs) {
-        self.take_split_many(&[(from, to)]).pop().unwrap()
+        let (from, to) = (from.max(self.start), to.min(self.end));
+        if from >= to {
+            return (Vec::new(), Vec::new());
+        }
+        let pages: Vec<usize> = {
+            #[cfg(feature = "diagnostics")]
+            let waited = Timed(std::time::Instant::now(), crate::copystat::C::GuardWaitUs);
+            let changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
+            #[cfg(feature = "diagnostics")]
+            drop(waited);
+            changed.range(from / PAGE..to.div_ceil(PAGE)).copied().collect()
+        };
+        // The sorted dirty pages can only be partial at either edge.
+        let first_whole = if from == self.start {
+            from / PAGE
+        } else {
+            from.div_ceil(PAGE)
+        };
+        let end_whole = if to == self.end {
+            to.div_ceil(PAGE)
+        } else {
+            to / PAGE
+        };
+        let first = pages.partition_point(|&p| p < first_whole);
+        let end = first + pages[first..].partition_point(|&p| p < end_whole);
+        let whole = &pages[first..end];
+        let mut unmapped = Vec::new();
+        if !whole.is_empty() {
+            #[cfg(feature = "diagnostics")]
+            let waited = Timed(std::time::Instant::now(), crate::copystat::C::GuardWaitUs);
+            let mut g = guards();
+            #[cfg(feature = "diagnostics")]
+            drop(waited);
+            // This is the only call under this guard. The protection
+            // routine already checks its current aliases before unlocking.
+            protect_with_aliases(&mut g, whole, &[], true, Some(&mut unmapped), |taken| {
+                let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
+                for &page in taken {
+                    changed.remove(&page);
+                }
+                set_dirty(self.changed.2, !changed.is_empty());
+                drop(changed);
+                self.changed.taken_many(taken);
+            });
+        }
+        unmapped.sort_unstable();
+        split_runs(&pages, from, to, &unmapped)
     }
 
     /// Whether page `page` (a page number) changed since it was taken.
@@ -2358,6 +2413,32 @@ pub(crate) mod tests {
         assert!(batched.clean(), "the final range takes the remaining partial page");
         drop(batched);
         free(p);
+    }
+
+    #[test]
+    fn a_later_whole_range_guards_its_alias_after_a_partial_take() {
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+
+        let (a, b) = twin_views(2);
+        let tracked = track(a, 2 * PAGE, true).expect("views are tracked");
+        let ranges = [(a + PAGE / 2, a + PAGE), (a + PAGE, a + 2 * PAGE), (a, a + PAGE)];
+        assert_eq!(
+            tracked.take_split_many(&ranges),
+            ranges.map(|range| (vec![range], vec![])),
+        );
+        assert!(tracked.clean());
+        // SAFETY: write through the second view of the first tracked page.
+        unsafe { (b as *mut u8).write_volatile(1) };
+        assert_eq!(tracked.take(a, a + 2 * PAGE), [(a, a + PAGE)]);
+        drop(tracked);
+        for view in [a, b] {
+            let unmapping = title_memory_unmapping(view, 2 * PAGE);
+            // SAFETY: these views belong to the fixture and the tracker is gone.
+            let unmapped =
+                unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
+            assert_ne!(unmapped, 0);
+            drop(unmapping);
+        }
     }
 
     /// Pages of the ranges armed keep their bytes from before the first

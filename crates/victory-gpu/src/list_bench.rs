@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use crate::object::{Iid, S_OK, This, guid, slot};
 
-mod gfx10;
+pub(crate) mod gfx10;
 
 /// The render target's width and height, and the compute shader's group
 /// size (the compute shader's own constants).

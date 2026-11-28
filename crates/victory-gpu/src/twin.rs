@@ -19,8 +19,10 @@
 //! depth gets no twin. Upgrade when a frame trace shows such a use, or the
 //! copies (counted on the frame-rate line) cost.
 
+use std::cell::Cell;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering::Relaxed};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering::Relaxed};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -46,12 +48,102 @@ const RESOLVE_DEST: u32 = 0x1000;
 /// line (either way, within lists and at submission).
 pub(crate) static COPIES: AtomicU64 = AtomicU64::new(0);
 
+/// Since the last frame-rate line: copies into the depth texture and into
+/// the twin, the bytes they moved (the twin's side), and the copies into
+/// the depth texture a whole clear made pointless (`CLEARED`: owed before
+/// a clear of every plane of a one-subresource texture; `SKIPPED`: of
+/// those, left out, with `VICTORY_TWIN_CLEAR_SKIP=1`).
+static INTO_DEPTH: AtomicU64 = AtomicU64::new(0);
+static INTO_TWIN: AtomicU64 = AtomicU64::new(0);
+static BYTES: AtomicU64 = AtomicU64::new(0);
+static CLEARED: AtomicU64 = AtomicU64::new(0);
+static SKIPPED: AtomicU64 = AtomicU64::new(0);
+/// Copies into the depth texture from a twin no shader stored to since the
+/// two were last the same (every unordered use since stored nothing): the
+/// bytes they move are unchanged.
+static UNCHANGED: AtomicU64 = AtomicU64::new(0);
+
+/// `VICTORY_TWIN_UAV_READS=1`: an unordered use of a depth texture whose
+/// shaders store nothing through it (`crate::draw`'s per-slot write bits)
+/// reads the twin and leaves it as current as it was, instead of making it
+/// the newer side: the next depth use copies nothing back.
+fn uav_reads() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_TWIN_UAV_READS"))
+}
+
+/// `VICTORY_TWIN_CLEAR_SKIP=1`: a clear that overwrites a whole depth
+/// texture needs none of its older contents, so the copy into it from a
+/// newer twin is left out.
+fn clear_skip() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_TWIN_CLEAR_SKIP"))
+}
+
+thread_local! {
+    /// While the use being routed is a clear without rectangles
+    /// (`overwriting`): its flags (1 depth, 2 stencil); else 0.
+    static WHOLE: Cell<u32> = const { Cell::new(0) };
+    /// While the use being routed is an unordered one whose shaders store
+    /// nothing through the view (`reading`).
+    static READING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Runs `f`, the transition for an unordered view no shader of the draw
+/// or dispatch stores through.
+pub(crate) fn reading<R>(f: impl FnOnce() -> R) -> R {
+    READING.with(|r| r.set(true));
+    let r = f();
+    READING.with(|r| r.set(false));
+    r
+}
+
+/// Runs `f`, the transition for a clear without rectangles of the planes
+/// `flags` names (1 depth, 2 stencil): if those are all the texture has and
+/// it has one subresource per plane, the use overwrites all of it.
+pub(crate) fn overwriting<R>(flags: u32, f: impl FnOnce() -> R) -> R {
+    WHOLE.with(|w| w.set(flags & 3));
+    let r = f();
+    WHOLE.with(|w| w.set(0));
+    r
+}
+
+/// Whether a clear of the planes `flags` names overwrites a texture whose
+/// twin has `planes` planes and `routes` subresources in all.
+fn covers(flags: u32, planes: usize, routes: usize) -> bool {
+    let need = if planes > 1 { 3 } else { 1 };
+    flags & need == need && routes == planes
+}
+
+/// The twin copy line, after the frame-rate line's total.
+pub(crate) fn log(frames: f64) {
+    let [depth, twin, bytes, cleared, skipped, unchanged] =
+        [&INTO_DEPTH, &INTO_TWIN, &BYTES, &CLEARED, &SKIPPED, &UNCHANGED].map(|c| c.swap(0, Relaxed));
+    if depth + twin + cleared == 0 {
+        return;
+    }
+    tracing::info!(
+        "depth twin copies: {:.1}/frame into depth, {:.1}/frame into twins, {:.1} MB/frame; \
+         {:.1}/frame into depth before a whole clear, {:.1}/frame of them left out (VICTORY_TWIN_CLEAR_SKIP); \
+         {:.1}/frame into depth from a twin no shader stored to (VICTORY_TWIN_UAV_READS)",
+        depth as f64 / frames,
+        twin as f64 / frames,
+        bytes as f64 / frames / 1e6,
+        cleared as f64 / frames,
+        skipped as f64 / frames,
+        unchanged as f64 / frames,
+    );
+}
+
 pub(crate) struct Twin {
     /// The colour texture of each plane the depth texture has (depth, then
     /// stencil), shader-writable.
     pub(crate) planes: Vec<Arc<HostTexture>>,
     /// Which side is newer as of the lists submitted so far.
     pub(crate) newer: AtomicU8,
+    /// With the twin newer: whether a shader stored to it since the two
+    /// were last the same, as of the lists submitted so far.
+    stored: AtomicBool,
     /// Per plane and subresource: how its bytes go through `scratch`.
     routes: Vec<Route>,
     /// A shader-writable buffer the copies go through, in the common state
@@ -83,6 +175,12 @@ struct Route {
 pub(crate) struct Use {
     first: u8,
     last: Option<u8>,
+    /// The first use overwrites the whole depth texture (`Use::new`).
+    whole: bool,
+    /// A shader stored to the twin in this list since its last copy (or
+    /// its start), and whether a copy was recorded in it.
+    stored: bool,
+    synced: bool,
     depth: Arc<HostTexture>,
 }
 
@@ -180,7 +278,7 @@ fn make(console: u32, depth: &ID3D12Resource) -> Option<Twin> {
     }
     let scratch = shared_scratch(at)?;
     tracing::debug!(console, width = dd.Width, height = dd.Height, planes = planes.len(), "a writable twin for a depth texture");
-    Some(Twin { planes, newer: AtomicU8::new(DEPTH), routes, scratch })
+    Some(Twin { planes, newer: AtomicU8::new(DEPTH), stored: AtomicBool::new(false), routes, scratch })
 }
 
 /// Scratch buffers shared by the twins, one per power-of-two size: a
@@ -320,7 +418,11 @@ fn integer(format: u32) -> bool {
 pub(crate) fn route(list: &HostList, depth: &Arc<HostTexture>, twin: &Twin, wanted: u32) -> bool {
     let side = if wanted & UNORDERED_ACCESS != 0 { TWIN } else { DEPTH };
     let writes = side == TWIN || wanted & (DEPTH_WRITE | RENDER_TARGET | COPY_DEST | RESOLVE_DEST) != 0;
-    if let Some(to_depth) = list.twin_use(depth, side, writes)
+    // A whole clear: one subresource per plane, so its view covers it all.
+    let whole = side == DEPTH && writes && covers(WHOLE.with(Cell::get), twin.planes.len(), twin.routes.len());
+    let stores = side == TWIN && !READING.with(Cell::get);
+    let writes = writes && (side == DEPTH || stores || !uav_reads());
+    if let Some(to_depth) = list.twin_use(depth, side, writes, whole, stores)
         && twin.copy(&list.list, depth, to_depth, &mut |t, w| list.move_texture(t, w))
     {
         list.need_rebind();
@@ -337,15 +439,44 @@ pub(crate) fn route(list: &HostList, depth: &Arc<HostTexture>, twin: &Twin, want
 }
 
 impl Use {
-    pub(crate) fn new(depth: &Arc<HostTexture>, side: u8, writes: bool) -> Self {
-        Use { first: side, last: writes.then_some(side), depth: depth.clone() }
+    /// `whole`: the use overwrites every byte of the depth texture (a
+    /// whole clear), so a copy owed into it is pointless.
+    pub(crate) fn new(depth: &Arc<HostTexture>, side: u8, writes: bool, whole: bool) -> Self {
+        Use { first: side, last: writes.then_some(side), whole, stored: false, synced: false, depth: depth.clone() }
     }
 
     /// A later use in the list needing `side`: whether a copy must be
     /// recorded first (true: into the depth texture).
-    pub(crate) fn again(&mut self, side: u8, writes: bool) -> Option<bool> {
-        again(self.first, &mut self.last, side, writes)
+    pub(crate) fn again(&mut self, side: u8, writes: bool, whole: bool) -> Option<bool> {
+        let copy = again(self.first, &mut self.last, side, writes);
+        if copy == Some(true) && self.synced && !self.stored {
+            UNCHANGED.fetch_add(1, Relaxed);
+        }
+        let copy = cleared(copy, whole, clear_skip());
+        if copy.is_some() {
+            self.synced = true;
+            self.stored = false;
+        }
+        copy
     }
+
+    /// A use of the twin by a shader that stores to it.
+    pub(crate) fn store(&mut self) {
+        self.stored = true;
+    }
+}
+
+/// A copy owed before a use: left out (`None`) if the use overwrites it
+/// all and `skip` is on; counted as pointless either way.
+fn cleared(copy: Option<bool>, whole: bool, skip: bool) -> Option<bool> {
+    if copy == Some(true) && whole {
+        CLEARED.fetch_add(1, Relaxed);
+        if skip {
+            SKIPPED.fetch_add(1, Relaxed);
+            return None;
+        }
+    }
+    copy
 }
 
 /// [`Use::again`] on its first side and the side it left newer.
@@ -387,8 +518,14 @@ pub(crate) fn at_submission<'a>(uses: impl Iterator<Item = &'a Use>) -> Vec<(Arc
     for u in uses {
         let Some(Some(twin)) = u.depth.twin.get() else { continue };
         let (to_depth, after) = submitted(u.first, u.last, twin.newer.load(Relaxed));
+        let (prior, stored) = (twin.newer.load(Relaxed), twin.stored.load(Relaxed));
+        if to_depth == Some(true) && !stored {
+            UNCHANGED.fetch_add(1, Relaxed);
+        }
         twin.newer.store(after, Relaxed);
-        if let Some(to_depth) = to_depth {
+        let carried = !u.synced && to_depth.is_none() && prior == TWIN && stored;
+        twin.stored.store(after == TWIN && (u.stored || carried), Relaxed);
+        if let Some(to_depth) = cleared(to_depth, u.whole, clear_skip()) {
             copies.push((u.depth.clone(), to_depth));
         }
     }
@@ -466,6 +603,17 @@ impl Twin {
             l.ResourceBarrier(&[state(COPY_SOURCE as i32, 0)]);
         }
         COPIES.fetch_add(1, Relaxed);
+        if to_depth { &INTO_DEPTH } else { &INTO_TWIN }.fetch_add(1, Relaxed);
+        let moved: u64 = self
+            .routes
+            .iter()
+            .map(|r| {
+                u64::from(r.twin.Footprint.RowPitch)
+                    * u64::from(r.twin.Footprint.Height)
+                    * u64::from(r.twin.Footprint.Depth)
+            })
+            .sum();
+        BYTES.fetch_add(moved, Relaxed);
         #[cfg(feature = "diagnostics")]
         {
             use crate::copystat::{C, add};
@@ -588,6 +736,259 @@ mod tests {
         assert_eq!(again(DEPTH, &mut last, DEPTH, false), None);
         assert_eq!(again(DEPTH, &mut last, TWIN, true), Some(false));
         assert_eq!(last, Some(TWIN));
+    }
+
+    /// Probe: whether a colour texture placed on the same heap bytes as a
+    /// 32-bit depth texture sees what the depth side holds and the other
+    /// way round, under this host (D3D12 leaves it undefined; a twin that
+    /// aliases its depth texture would need no copies). Prints the result;
+    /// fails only if the host cannot run it.
+    #[test]
+    fn probe_aliased_twin_sees_depth() {
+        let Some(host) = host() else { return };
+        let dev = &host.device;
+        const W: u32 = 64;
+        const H: u32 = 64;
+        // SAFETY: plain object creation and recording on our own queue;
+        // every resource outlives the wait below.
+        unsafe {
+            let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, std::ptr::from_mut(&mut opts).cast(), size_of_val(&opts) as u32).unwrap();
+            if opts.ResourceHeapTier.0 < 2 {
+                println!("alias probe: resource heap tier 1, no mixed heap");
+                return;
+            }
+            let ddesc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: u64::from(W),
+                Height: H,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+                ..Default::default()
+            };
+            let cdesc = D3D12_RESOURCE_DESC { Format: DXGI_FORMAT_R32_FLOAT, Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, ..ddesc };
+            let size = dev.GetResourceAllocationInfo(0, &[ddesc]).SizeInBytes.max(dev.GetResourceAllocationInfo(0, &[cdesc]).SizeInBytes);
+            let hdesc = D3D12_HEAP_DESC {
+                SizeInBytes: size,
+                Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                Alignment: 0,
+                Flags: D3D12_HEAP_FLAG_NONE,
+            };
+            let mut heap: Option<ID3D12Heap> = None;
+            dev.CreateHeap(&hdesc, &mut heap).unwrap();
+            let heap = heap.unwrap();
+            let mut depth: Option<ID3D12Resource> = None;
+            let mut colour: Option<ID3D12Resource> = None;
+            dev.CreatePlacedResource(&heap, 0, &ddesc, D3D12_RESOURCE_STATE_DEPTH_WRITE, None, &mut depth).unwrap();
+            dev.CreatePlacedResource(&heap, 0, &cdesc, D3D12_RESOURCE_STATE_COPY_SOURCE, None, &mut colour).unwrap();
+            let (depth, colour) = (depth.unwrap(), colour.unwrap());
+            let rb_heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+            let up_heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() };
+            let bytes = u64::from(W * 4 * H);
+            let bdesc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: bytes,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut rb: Option<ID3D12Resource> = None;
+            let mut up: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&rb_heap, D3D12_HEAP_FLAG_NONE, &bdesc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut rb).unwrap();
+            dev.CreateCommittedResource(&up_heap, D3D12_HEAP_FLAG_NONE, &bdesc, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut up).unwrap();
+            let (rb, up) = (rb.unwrap(), up.unwrap());
+            let mut p = std::ptr::null_mut();
+            up.Map(0, None, Some(&mut p)).unwrap();
+            std::slice::from_raw_parts_mut(p.cast::<f32>(), (W * H) as usize).fill(0.5);
+            let dsv_heap: ID3D12DescriptorHeap = dev
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV, NumDescriptors: 1, ..Default::default() })
+                .unwrap();
+            let dsv = dsv_heap.GetCPUDescriptorHandleForHeapStart();
+            let vdesc = D3D12_DEPTH_STENCIL_VIEW_DESC { Format: DXGI_FORMAT_D32_FLOAT, ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D, ..Default::default() };
+            dev.CreateDepthStencilView(&depth, Some(&vdesc), dsv);
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                Offset: 0,
+                Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: DXGI_FORMAT_R32_FLOAT, Width: W, Height: H, Depth: 1, RowPitch: W * 4 },
+            };
+            let tex = |r: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(r),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            let buf = |r: &ID3D12Resource, f: D3D12_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(r),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: 0, Footprint: f } },
+            };
+            let st = |r: &ID3D12Resource, a: D3D12_RESOURCE_STATES, b: D3D12_RESOURCE_STATES| transition(r, a, b);
+            let aliasing = || D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING, ..Default::default() };
+            let run = |n: u64| {
+                list.Close().unwrap();
+                queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+                queue.Signal(&fence, n).unwrap();
+                while fence.GetCompletedValue() < n {
+                    std::thread::yield_now();
+                }
+            };
+            let read = || {
+                let mut q = std::ptr::null_mut();
+                rb.Map(0, None, Some(&mut q)).unwrap();
+                let v = std::slice::from_raw_parts(q.cast::<f32>(), (W * H) as usize).to_vec();
+                rb.Unmap(0, None);
+                v
+            };
+            use windows::core::Interface;
+            // Depth written by a clear, read through the colour texture.
+            list.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.25, 0, None);
+            list.ResourceBarrier(&[aliasing()]);
+            list.CopyTextureRegion(&buf(&rb, fp.Footprint), 0, 0, 0, &tex(&colour), None);
+            run(1);
+            let v = read();
+            let same = v.iter().filter(|&&x| x == 0.25).count();
+            println!("alias probe: depth clear 0.25 seen through colour in {same} of {} texels (first {:?})", v.len(), &v[..4]);
+            // Colour written by a copy, read through the depth texture.
+            alloc.Reset().unwrap();
+            list.Reset(&alloc, None).unwrap();
+            list.ResourceBarrier(&[st(&colour, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST)]);
+            list.CopyTextureRegion(&tex(&colour), 0, 0, 0, &buf(&up, fp.Footprint), None);
+            list.ResourceBarrier(&[aliasing(), st(&depth, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            list.CopyTextureRegion(&buf(&rb, fp.Footprint), 0, 0, 0, &tex(&depth), None);
+            run(2);
+            let v = read();
+            let same = v.iter().filter(|&&x| x == 0.5).count();
+            println!("alias probe: colour 0.5 seen through depth in {same} of {} texels (first {:?})", v.len(), &v[..4]);
+            // The clear read through the depth texture itself.
+            alloc.Reset().unwrap();
+            list.Reset(&alloc, None).unwrap();
+            list.ResourceBarrier(&[st(&depth, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE)]);
+            list.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.25, 0, None);
+            list.ResourceBarrier(&[st(&depth, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            list.CopyTextureRegion(&buf(&rb, fp.Footprint), 0, 0, 0, &tex(&depth), None);
+            run(3);
+            let v = read();
+            println!("alias probe: depth clear 0.25 seen through depth in {} texels", v.iter().filter(|&&x| x == 0.25).count());
+            // Then the colour side again, after that clear was copied out.
+            alloc.Reset().unwrap();
+            list.Reset(&alloc, None).unwrap();
+            list.ResourceBarrier(&[aliasing(), st(&colour, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            list.CopyTextureRegion(&buf(&rb, fp.Footprint), 0, 0, 0, &tex(&colour), None);
+            run(4);
+            let v = read();
+            println!("alias probe: after it, colour sees 0.25 in {} texels", v.iter().filter(|&&x| x == 0.25).count());
+            // A buffer copy into depth, read through colour.
+            std::slice::from_raw_parts_mut(p.cast::<f32>(), (W * H) as usize).fill(0.75);
+            alloc.Reset().unwrap();
+            list.Reset(&alloc, None).unwrap();
+            list.ResourceBarrier(&[st(&depth, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST)]);
+            list.CopyTextureRegion(&tex(&depth), 0, 0, 0, &buf(&up, fp.Footprint), None);
+            list.ResourceBarrier(&[aliasing()]);
+            list.CopyTextureRegion(&buf(&rb, fp.Footprint), 0, 0, 0, &tex(&colour), None);
+            run(5);
+            let v = read();
+            println!("alias probe: buffer copy 0.75 into depth seen through colour in {} texels", v.iter().filter(|&&x| x == 0.75).count());
+        }
+    }
+
+    /// Probe, run by hand under `xctrace record --attach`: named command
+    /// lists of copies for `VICTORY_LABEL_PROBE_S` seconds (5), to see in a
+    /// Metal System Trace whether D3DMetal labels their command buffers or
+    /// encoders with `SetName`'s text ("victory-label-probe N").
+    #[test]
+    #[ignore = "a probe for a trace recorded by hand"]
+    fn probe_list_names_reach_metal() {
+        use windows::core::{HSTRING, Interface};
+        let Some(host) = host() else { return };
+        let dev = &host.device;
+        let secs: u64 = std::env::var("VICTORY_LABEL_PROBE_S").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
+        // SAFETY: plain creation and recording on our own queue; the
+        // buffers outlive every wait.
+        unsafe {
+            let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 64 << 20,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut a: Option<ID3D12Resource> = None;
+            let mut b: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut a).unwrap();
+            dev.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut b).unwrap();
+            let (a, b) = (a.unwrap(), b.unwrap());
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let _ = queue.SetName(&HSTRING::from("victory-label-probe queue"));
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+            let mut n = 0u64;
+            while std::time::Instant::now() < end {
+                n += 1;
+                alloc.Reset().unwrap();
+                let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+                let _ = list.SetName(&HSTRING::from(format!("victory-label-probe {n}")));
+                list.CopyBufferRegion(&b, 0, &a, 0, 64 << 20);
+                list.Close().unwrap();
+                queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+                queue.Signal(&fence, n).unwrap();
+                while fence.GetCompletedValue() < n {
+                    std::thread::yield_now();
+                }
+            }
+            println!("label probe: {n} named lists");
+        }
+    }
+
+    /// Run H's round trip: depth rendered, then an unordered use, then a
+    /// depth use. Counted as a write, the unordered use makes the twin
+    /// newer and the depth use copies it back; one that stores nothing
+    /// (`VICTORY_TWIN_UAV_READS`) leaves both sides current.
+    #[test]
+    fn unordered_reads_do_not_copy_back() {
+        let mut last = Some(DEPTH);
+        assert_eq!(again(DEPTH, &mut last, TWIN, true), Some(false));
+        assert_eq!(again(DEPTH, &mut last, DEPTH, false), Some(true), "the copy back");
+        let mut last = Some(DEPTH);
+        assert_eq!(again(DEPTH, &mut last, TWIN, false), Some(false));
+        assert_eq!(last, Some(BOTH));
+        assert_eq!(again(DEPTH, &mut last, DEPTH, false), None, "nothing to copy back");
+        // Across lists: a list that only reads the twin leaves the newer
+        // side where it was.
+        assert_eq!(submitted(TWIN, None, DEPTH), (Some(false), BOTH));
+        assert_eq!(submitted(DEPTH, None, BOTH), (None, BOTH));
+    }
+
+    /// A clear overwrites a texture only with every plane it has and one
+    /// subresource per plane; only then is a copy into depth left out, and
+    /// only with the switch on.
+    #[test]
+    fn whole_clears_leave_out_the_copy_into_depth() {
+        assert!(covers(1, 1, 1));
+        assert!(!covers(1, 2, 2), "depth only, stencil kept");
+        assert!(covers(3, 2, 2));
+        assert!(!covers(3, 1, 4), "mips or slices the view may not cover");
+        assert!(!covers(0, 1, 1), "not a clear");
+        assert_eq!(cleared(Some(true), true, false), Some(true));
+        assert_eq!(cleared(Some(true), true, true), None);
+        assert_eq!(cleared(Some(true), false, true), Some(true));
+        assert_eq!(cleared(Some(false), true, true), Some(false), "a copy into the twin stays");
+        assert_eq!(cleared(None, true, true), None);
+        // Left out, the list still leaves the depth side newer.
+        let (copy, after) = submitted(DEPTH, Some(DEPTH), TWIN);
+        assert_eq!((cleared(copy, true, true), after), (None, DEPTH));
     }
 
     /// A list that writes a depth texture through its twin and then reads

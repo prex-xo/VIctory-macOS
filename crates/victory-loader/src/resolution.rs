@@ -253,6 +253,23 @@ pub const OWN_SCALE: Site = Site {
     bytes: &[0xc7, 0x81, 0x90, 0x00, 0x00, 0x00, 0xab, 0xaa, 0x2a, 0x3f],
 };
 
+/// The upscaler's `divl 0x10c(%rdi)` (a round-robin distributor's divisor),
+/// +0x28f03e8. When the resolution patch shrinks the output the divisor can
+/// be zero, which traps (0xc0000094); the patch redirects it to a trampoline
+/// that clamps the divisor to 1.
+pub const DIV_ZERO: Site = Site {
+    at: 0x28f03e8,
+    what: "the upscaler's divide by the bucket count",
+    bytes: &[0xf7, 0xb7, 0x0c, 0x01, 0x00, 0x00],
+};
+
+/// Padding at the end of `.text` that holds the divide-clamp trampoline.
+pub const DIV_TRAMP: Site = Site {
+    at: 0x5f40966,
+    what: "padding for the divide-clamp trampoline",
+    bytes: &[0xcc; 16],
+};
+
 /// The upscaler picker, +0x7e93f0, to its first `ret`.
 pub const PICKER: Site = Site {
     at: 0x7e93f0,
@@ -299,6 +316,28 @@ pub fn output_code(width: u32, height: u32) -> Vec<u8> {
 pub fn own_scale_code(scale: f32) -> Vec<u8> {
     let mut c = OWN_SCALE.bytes[..6].to_vec();
     c.extend(scale.to_le_bytes());
+    c
+}
+
+/// The trampoline written at [`DIV_TRAMP`]: divides `edx:eax` by the
+/// divisor in `[rdi+0x10c]`, clamped to 1 when it is zero (the quotient in
+/// `eax` is discarded by the caller; only the remainder in `edx` matters).
+pub fn div_trampoline_code() -> Vec<u8> {
+    vec![
+        0x8b, 0x8f, 0x0c, 0x01, 0x00, 0x00, // mov ecx, [rdi+0x10c]
+        0x85, 0xc9, // test ecx, ecx
+        0x75, 0x02, // jnz +2
+        0xb1, 0x01, // mov cl, 1
+        0xf7, 0xf1, // div ecx
+        0xc3, // ret
+    ]
+}
+
+/// What goes at [`DIV_ZERO`]: a 5-byte `call` to the trampoline and a NOP.
+pub fn div_call_code() -> Vec<u8> {
+    let mut c = vec![0xe8];
+    c.extend(rel(DIV_TRAMP.at, DIV_ZERO.at + 5));
+    c.push(0x90);
     c
 }
 
@@ -425,6 +464,15 @@ pub unsafe fn apply_asked(base: usize, size: usize) {
             format!("returns {kind}"),
         ));
     }
+    // The divide-clamp: always on, so a small output that zeroes the
+    // distributor's divisor does not trap with 0xc0000094.
+    asked.push((
+        vec![
+            (&DIV_TRAMP, div_trampoline_code()),
+            (&DIV_ZERO, div_call_code()),
+        ],
+        "div-by-zero clamp".into(),
+    ));
     for (group, value) in asked {
         let parts: Vec<(&Site, &[u8])> = group.iter().map(|(s, c)| (*s, c.as_slice())).collect();
         // SAFETY: the caller's promise.

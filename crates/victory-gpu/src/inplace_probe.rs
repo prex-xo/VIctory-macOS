@@ -872,6 +872,10 @@ fn inplace_probe_6_remap_cpu_visible_tiles() {
             D3D12_TILE_MAPPING_FLAG_NONE,
         );
     }
+    // shortcut: under D3DMetal this passes without the null mapping taking
+    // effect: the tile keeps its heap tile, and the copy out of it reads
+    // what the fetch's fresh buffer held anyway, zeros (`crate::tiled` maps
+    // unmapped pages to a tile of zeros instead).
     let bytes = rig.fetch(&reserved, 0, K64).unwrap();
     assert!(bytes.iter().all(|&byte| byte == 0), "null tile reads as zeros");
     // SAFETY: null-mapping the GPU view leaves the CPU heap tile alive.

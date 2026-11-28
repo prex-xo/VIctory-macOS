@@ -117,7 +117,7 @@ fn title_stores(stores: u32) -> Shape {
 
 /// A program that stores `stores` dwords through the buffer view in a
 /// table: a heap view with write marks.
-fn view_stores(stores: u32) -> Shape {
+fn view_stores(stores: u32) -> lower::Lowered {
     let mut w = vec![s_mov_b32(5, ZERO as u8)];
     w.extend(s_load(2, 8, 4, 0));
     w.push(S_WAITCNT_ALL);
@@ -142,7 +142,7 @@ fn view_stores(stores: u32) -> Shape {
     ];
     let l = lower(&w, layout, vec![uav], true);
     assert!(l.view_marks || stores == 0);
-    l.shape
+    l
 }
 
 /// A store to title memory sets its page's bit where a load finds it clear,
@@ -158,15 +158,20 @@ fn title_stores_mark_with_an_atomic_only_behind_a_branch() {
 }
 
 /// A store through a buffer view reads the view's base bit and phase in one
-/// load and the bitmap dword holding its pages' bits in one more (the
-/// store's first and last byte nearly always share it), and takes one branch
-/// for both pages' bits, with the atomic for a write across two dwords
-/// nested in it.
+/// load and, in the wave leader (or any lane targeting a different page or
+/// straddling a 64 KiB boundary), reads the bitmap dword holding its pages'
+/// bits in one more load. Each store adds four branches: active-lane guard,
+/// wave-coalescing guard, bitmap clear/apart guard, and nested cross-dword
+/// atomic guard.
 #[test]
 fn view_stores_read_their_marks_once() {
     let (one, two) = (view_stores(1), view_stores(2));
+    assert!(one.wave_ops && two.wave_ops);
+    let (one, two) = (one.shape, two.shape);
     assert_eq!(two.loads - one.loads, 2, "{one:?} {two:?}");
-    assert_eq!(two.branches - one.branches, 2, "{one:?} {two:?}");
+    assert_eq!(two.branches - one.branches, 4, "{one:?} {two:?}");
     assert_eq!(two.atomics.len() - one.atomics.len(), 2, "{one:?} {two:?}");
     assert!(two.atomics.iter().all(|&b| b != 0), "{two:?}");
+    let per_lane = lower::per_lane_marks(|| view_stores(1));
+    assert!(!per_lane.wave_ops);
 }

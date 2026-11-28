@@ -144,7 +144,11 @@
 //!   access's first and last byte: what the host copies back) and for each
 //!   page with no copy an access reached, or for an address whose 256 MiB
 //!   region has no block, bit `level-1 index` (block 0's bits). Reads there
-//!   give 0, writes are dropped. In such a program (and one with root
+//!   give 0, writes are dropped. A read of more than a dword whose bytes
+//!   reach the next 64 KiB page looks that page up too and reads its
+//!   dwords there through that page's memory, which need not be the first
+//!   page's (added 2026-11-27: through the first page's view they lay past
+//!   its end and read 0). In such a program (and one with root
 //!   parameters past its user SGPRs) root SRVs and UAVs are title memory
 //!   too: no root views; the shader reads their addresses as user data
 //!   (root type [`RootType::Descriptor`] in [`HostShader::user_data`],
@@ -495,22 +499,42 @@ pub struct UserData {
     pub dword: u32,
 }
 
-/// Whether an `s_barrier` that a lane may miss at a capped loop's iteration
-/// limit makes the shader untranslatable (`VICTORY_CAP_BARRIERS=1`). Off by
-/// default: the refusal added with the loop-cap analysis left the tile-list,
-/// lighting and temporal anti-aliasing programs out and the world was drawn
-/// black on M3 Max and M5 Pro Macs (#497), where keeping their barrier, as
-/// before, drew it. Tests always run with the refusal on.
+/// Whether a group barrier that a lane may miss at a capped loop's
+/// iteration limit makes the shader untranslatable (`VICTORY_CAP_BARRIERS=1`):
+/// an `s_barrier`, and the barriers through which the two 32-lane halves of
+/// a console wave64 pass each other values (`lower::halves`), which the
+/// blocks after such a loop then do not get. Off by default: the console
+/// runs a loop to its end, and the limit is the host's guard against data it
+/// has not mirrored yet, so off, a translation is the console's wherever
+/// the limit is not reached. The refusal added with the loop-cap analysis
+/// left the tile-list, lighting and temporal anti-aliasing programs out and
+/// the world was drawn black on M3 Max and M5 Pro Macs (#497), where keeping
+/// their barrier, as before, drew it. Tests run with the refusal on unless
+/// they turn it off ([`with_cap_barriers`]).
 pub fn cap_barriers_refused() -> bool {
     #[cfg(test)]
     {
-        true
+        CAP_BARRIERS.get()
     }
     #[cfg(not(test))]
     {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| cap_barriers_from(std::env::var("VICTORY_CAP_BARRIERS").ok().as_deref()))
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static CAP_BARRIERS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Runs `f` with [`cap_barriers_refused`] answering `on` on this thread.
+#[cfg(test)]
+pub(crate) fn with_cap_barriers<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let was = CAP_BARRIERS.replace(on);
+    let r = f();
+    CAP_BARRIERS.set(was);
+    r
 }
 
 /// `VICTORY_CAP_BARRIERS`'s value as a switch: only `1` turns the refusal on.

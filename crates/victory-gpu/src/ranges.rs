@@ -8,10 +8,12 @@ use std::collections::BinaryHeap;
 #[cfg(any(feature = "diagnostics", test))]
 use std::fmt;
 
+use smallvec::SmallVec;
+
 /// Byte ranges `[from, to)`, in order and apart: ranges that touch or
-/// overlap are one. A few per host copy, so a vector is the cheapest set.
+/// overlap are one. Most host copies need one range, stored inline.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Ranges(Vec<(usize, usize)>);
+pub(crate) struct Ranges(SmallVec<[(usize, usize); 1]>);
 
 impl Ranges {
     /// The ranges, in order.
@@ -55,9 +57,20 @@ impl Ranges {
             return;
         }
         let (s, e) = (self.0[first].0, self.0[last - 1].1);
-        let left = (s < from).then_some((s, from));
-        let right = (to < e).then_some((to, e));
-        self.0.splice(first..last, left.into_iter().chain(right));
+        let mut kept = first;
+        if s < from {
+            self.0[kept] = (s, from);
+            kept += 1;
+        }
+        if to < e {
+            if kept == last {
+                self.0.insert(kept, (to, e));
+                return;
+            }
+            self.0[kept] = (to, e);
+            kept += 1;
+        }
+        self.0.drain(kept..last);
     }
 
     /// The parts of `[from, to)` not in the set, in order.

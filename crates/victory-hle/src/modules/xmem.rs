@@ -177,16 +177,26 @@ pub extern "system" fn XMemVirtualAlloc(
             );
         }
     }
-    if !at.is_null()
-        && victory_gpu::alias_buffers()
-        && kind & MEM_COMMIT != 0
-        && kind & MEM_RESERVE_PLACEHOLDER == 0
-        && protect == PAGE_READWRITE
-        && (at as usize).is_multiple_of(PAGE)
-        && size >= PAGE
-        && size.is_multiple_of(PAGE)
-    {
-        victory_gpu::alias_region(at as usize, size, false);
+    // Committed title memory: aliased zero-copy where it can be, else
+    // counted by why not (the frame report: what host copies refresh).
+    if !at.is_null() && kind & MEM_COMMIT != 0 {
+        use victory_gpu::Unaliased as U;
+        let why = if !victory_gpu::alias_buffers() {
+            Some(U::Off)
+        } else if kind & MEM_RESERVE_PLACEHOLDER != 0 {
+            Some(U::Placeholder)
+        } else if protect != PAGE_READWRITE {
+            Some(U::Protection)
+        } else if !(at as usize).is_multiple_of(PAGE) || size < PAGE || !size.is_multiple_of(PAGE) {
+            Some(U::Unaligned)
+        } else if !victory_gpu::alias_region(at as usize, size, false) {
+            Some(U::Failed)
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            victory_gpu::note_unaliased(size, why);
+        }
     }
     if base.is_null() {
         tracing::debug!(
@@ -434,9 +444,10 @@ unsafe fn map_own_view(section: HANDLE, offset: u64, size: usize) -> MEMORY_MAPP
 struct Section {
     handle: HANDLE,
     size: usize,
-    /// Optional shared CPU/GPU backing. The file still supplies Wine's
-    /// placeholder-view metadata.
-    #[cfg(feature = "diagnostics")]
+    /// The pages as GPU memory (`VICTORY_PHYSICAL_TILES=1`): the title's
+    /// views are remapped onto it, and copies of title buffers on them read
+    /// it in place (`victory_gpu::physical_retiled`). The file still
+    /// supplies Wine's placeholder-view metadata.
     shared: Option<victory_gpu::PhysicalHeap>,
     /// Our own view of the whole section, mapped the first time a
     /// DirectStorage request writes its pages and kept while the section
@@ -500,7 +511,6 @@ impl Section {
         Section {
             handle,
             size,
-            #[cfg(feature = "diagnostics")]
             shared: victory_gpu::physical_heap(size),
             whole: OnceLock::new(),
             committed,
@@ -510,7 +520,6 @@ impl Section {
     /// The address of our view of the whole section, mapped the first time;
     /// `None` if the host would not map it.
     fn whole(&self) -> Option<usize> {
-        #[cfg(feature = "diagnostics")]
         if let Some(shared) = &self.shared {
             return Some(shared.cpu_address());
         }
@@ -706,6 +715,57 @@ fn aliases(at: usize, len: usize, out: &mut Vec<(usize, usize)>) {
             out.extend(addresses.iter().filter(|&&a| a != page).map(|&a| (page, a)));
         }
     }
+}
+
+/// How title memory `[at, at + len)` lies on the title's physical pages,
+/// for the GPU side's frame report (`victory_gpu::on_physical_runs`): the
+/// 64 KiB pages of it shown by physical-page views, the runs they make
+/// (pages one after another in one section, as a GPU buffer over that
+/// memory would need them), and the sections. `None` if none is shown so.
+pub(crate) fn physical_runs(at: usize, len: usize) -> Option<(usize, usize, usize)> {
+    let physical = physical();
+    let end = at.saturating_add(len);
+    let first = physical
+        .views
+        .range(..=at)
+        .next_back()
+        .filter(|(base, (size, _))| *base + size > at)
+        .map(|(base, _)| *base)
+        .unwrap_or(at);
+    let (mut pages, mut runs) = (0, 0);
+    let mut sections = std::collections::HashSet::new();
+    // The (section, index) the next page would continue a run with.
+    let mut next: Option<(usize, usize)> = None;
+    let mut last_end = usize::MAX;
+    for (&base, (size, slice)) in physical.views.range(first..end) {
+        let section = Arc::as_ptr(&slice.section) as usize;
+        sections.insert(section);
+        let (from, to) = (at.max(base), end.min(base + size));
+        for page in (from / PAGE..to.div_ceil(PAGE)).map(|p| p * PAGE) {
+            let here = (section, slice.index + (page - base) / PAGE);
+            if next != Some(here) || last_end != page {
+                runs += 1;
+            }
+            pages += 1;
+            next = Some((here.0, here.1 + 1));
+            last_end = page + PAGE;
+        }
+    }
+    (pages > 0).then_some((pages, runs, sections.len()))
+}
+
+/// The tiles showing title memory `[at, at + len)` (page aligned), one a
+/// page, for the GPU side's copies reading them in place
+/// (`victory_gpu::on_physical_tiles`): `None` where a page shows no section
+/// of GPU memory.
+pub(crate) fn physical_tiles(at: usize, len: usize, out: &mut Vec<Option<victory_gpu::Tile>>) -> bool {
+    let physical = physical();
+    out.clear();
+    out.extend((at / PAGE..at.saturating_add(len).div_ceil(PAGE)).map(|page| {
+        let slice = slice_at(&physical, page * PAGE)?;
+        slice.section.shared.as_ref()?.tile(slice.index * PAGE)
+    }));
+    true
 }
 
 /// The addresses of title views showing `pages` (page numbers): writes into
@@ -1396,7 +1456,6 @@ fn finish_map(
     #[cfg(test)]
     tests::MAPS.with(|m| m.set(m.get() + 1));
     let mapped = slice.section.commit_shown(slice.index, base, len);
-    #[cfg(feature = "diagnostics")]
     let mapped = mapped
         && slice.section.shared.as_ref().is_none_or(|shared| {
             // SAFETY: this live view is ours. The slice will hold the
@@ -1428,6 +1487,13 @@ fn finish_map(
     for (at, others) in aliased {
         // Pages shown elsewhere already: guarded here too if they are there.
         victory_gpu::title_memory_aliased(at, &others);
+    }
+    // Copies of title buffers reading these pages in place map them now.
+    if victory_gpu::physical_tiles() {
+        let tiles: Vec<Option<victory_gpu::Tile>> = (0..len / PAGE)
+            .map(|k| slice.section.shared.as_ref()?.tile((slice.index + k) * PAGE))
+            .collect();
+        victory_gpu::physical_retiled(base, len, &tiles);
     }
     physical.views.insert(base, (len, slice));
     true
@@ -1569,6 +1635,9 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             continue;
         };
         shown_mut().forget(at, size, &slice);
+        if victory_gpu::physical_tiles() {
+            victory_gpu::physical_retiled(at, size, &vec![None; size / PAGE]);
+        }
         let going = victory_gpu::title_memory_unmapping(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         let gone = unsafe {
@@ -1898,6 +1967,52 @@ mod tests {
         }
     }
 
+    /// `VICTORY_PHYSICAL_TILES=1`: mapped physical pages are GPU memory, and
+    /// the lookup names their tiles in the title's order; unmapped, none.
+    #[test]
+    fn physical_tiles_name_the_gpu_tiles_a_view_shows() {
+        let pages = allocate(2);
+        if page_table().pages[&pages[0]].section.shared.is_none() {
+            assert!(!victory_gpu::physical_tiles(), "the switch is on, the pages are not GPU memory");
+            return; // VICTORY_PHYSICAL_TILES off, or not Rosetta and D3DMetal
+        }
+        let at = XMemVirtualAlloc(std::ptr::null_mut(), 2 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!at.is_null());
+        let order = [pages[1], pages[0]];
+        assert_eq!(XMemMapPhysicalPages(at, 2, order.as_ptr()), at);
+        let mut tiles = Vec::new();
+        assert!(physical_tiles(at as usize, 2 * PAGE, &mut tiles));
+        let index = |k: usize| tiles[k].as_ref().map(victory_gpu::Tile::index);
+        let first = page_table().pages[&pages[0]].index as u32;
+        assert_eq!([index(0), index(1)], [Some(first + 1), Some(first)], "in the title's order");
+        // The title's writes land in the GPU heap: its own view shows them.
+        // SAFETY: mapped read-write.
+        unsafe { at.cast::<u32>().write(0x5eed) };
+        let whole = page_table().pages[&pages[1]].section.whole().unwrap();
+        // SAFETY: the section's whole view, the heap's CPU address.
+        assert_eq!(unsafe { ((whole + (first as usize + 1) * PAGE) as *const u32).read() }, 0x5eed);
+        assert_eq!(XMemMapPhysicalPages(at, 2, std::ptr::null()), at);
+        assert!(physical_tiles(at as usize, 2 * PAGE, &mut tiles));
+        assert!(tiles.iter().all(Option::is_none), "unmapped");
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn physical_runs_count_pages_one_after_another_in_a_section() {
+        let pages = allocate(4);
+        let at = XMemVirtualAlloc(std::ptr::null_mut(), 4 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!at.is_null());
+        // Pages 0, 1, then 3, 2: a run of two, then two runs of one.
+        let order = [pages[0], pages[1], pages[3], pages[2]];
+        assert_eq!(XMemMapPhysicalPages(at, 4, order.as_ptr()), at);
+        assert_eq!(physical_runs(at as usize, 4 * PAGE), Some((4, 3, 1)));
+        assert_eq!(physical_runs(at as usize, 2 * PAGE), Some((2, 1, 1)), "the first two in order");
+        assert_eq!(physical_runs(at as usize + 3 * PAGE + 100, 8), Some((1, 1, 1)));
+        // Not physical memory.
+        let plain = XMemVirtualAlloc(std::ptr::null_mut(), PAGE, MEM_RESERVE | MEM_COMMIT, 0, PAGE_READWRITE);
+        assert_eq!(physical_runs(plain as usize, PAGE), None);
+    }
+
     #[test]
     fn mapping_what_shows_already_maps_nothing() {
         let pages = allocate(2);
@@ -1985,8 +2100,7 @@ mod tests {
         let mut n = 3;
         assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
         assert_eq!(n, 3);
-        #[cfg(feature = "diagnostics")]
-        if std::env::var("VICTORY_PHYSICAL_TILES").as_deref() == Ok("1") {
+        if victory_gpu::physical_tiles() {
             let table = page_table();
             assert!(
                 table.pages[&pages[0]].section.shared.is_some(),
@@ -2746,7 +2860,9 @@ mod tests {
         // the per-slice `View::map` fallback path as well.
         let fallback = unsafe { map_own_view(slice.section.handle, PAGE as u64, PAGE) };
         assert!(!fallback.Value.is_null());
-        if on_wine() {
+        // With `VICTORY_PHYSICAL_TILES=1` the whole view is the section's
+        // GPU heap, not a view of ours: no floor.
+        if on_wine() && slice.section.shared.is_none() {
             assert!(
                 whole >= OWN_VIEW_FLOOR,
                 "whole view {whole:#x} below {OWN_VIEW_FLOOR:#x}"

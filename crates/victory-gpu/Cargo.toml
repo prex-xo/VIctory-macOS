@@ -11,6 +11,7 @@ publish.workspace = true
 blake3.workspace = true
 sha2.workspace = true
 miniz_oxide.workspace = true
+smallvec = { version = "1.16", features = ["union"] }
 tracing.workspace = true
 anyhow.workspace = true
 victory-formats.workspace = true
@@ -19,6 +20,9 @@ victory-shader = { workspace = true, features = ["host"] }
 [dev-dependencies]
 tracing-subscriber.workspace = true
 tempfile.workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
+victory-game.workspace = true
 
 [features]
 # Debugging switches (frame capture, the host debug layer, per-draw data).

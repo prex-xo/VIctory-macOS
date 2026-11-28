@@ -210,16 +210,27 @@ fn heap_unmap(apu: u32) -> Option<*mut u8> {
         .then(|| (host + (apu - start) as usize) as *mut u8)
 }
 
-/// `len` bytes of title memory at a device address, if one heap block holds
-/// them all.
-fn heap_bytes<'a>(apu: u32, len: usize) -> Option<&'a mut [u8]> {
+/// Runs `f` on `len` bytes of title memory at a device address, if one heap
+/// block holds them all, with the heap locked throughout.
+///
+/// The blocks are host memory: the title's `ApuFree` on another thread
+/// gives one back to the host allocator at once, and what the decoder
+/// wrote there after that would land in whatever the allocator put there
+/// next. With the heap locked, a block is either still the title's for the
+/// whole of `f`, or already gone and not touched (`None`). `f` must not
+/// call back into the heap.
+fn with_heap_bytes<R>(apu: u32, len: usize, f: impl FnOnce(&mut [u8]) -> R) -> Option<R> {
     let heap = lock(&HEAP);
     let (&start, &host) = heap.by_apu.range(..=apu).next_back()?;
     let offset = (apu - start) as usize;
-    (offset + len <= heap.blocks[&host].size)
-        // SAFETY: inside a live heap block, which the title and the audio
-        // hardware share like on the console.
-        .then(|| unsafe { std::slice::from_raw_parts_mut((host + offset) as *mut u8, len) })
+    if offset.checked_add(len)? > heap.blocks[&host].size {
+        return None;
+    }
+    // SAFETY: inside a live heap block, which the title and the audio
+    // hardware share like on the console; the lock keeps it allocated
+    // until `f` returns.
+    let bytes = unsafe { std::slice::from_raw_parts_mut((host + offset) as *mut u8, len) };
+    Some(f(bytes))
 }
 
 pub extern "system" fn ApuAlloc(
@@ -596,13 +607,15 @@ fn pump(context: Context, voice: &mut Voice) {
         // the first write, which would otherwise land past the ring's end.
         let write = context.field(0, 27, 5) % size;
         let address = context.get(7) as usize + write as usize * BLOCK_BYTES;
-        let Some(out) = heap_bytes(address as u32, BLOCK_BYTES) else {
+        let written = with_heap_bytes(address as u32, BLOCK_BYTES, |out| {
+            for pair in out.as_chunks_mut::<2>().0 {
+                let sample = voice.pcm.pop_front().unwrap_or(0);
+                voice.trace.peak = voice.trace.peak.max(sample.saturating_abs());
+                pair.copy_from_slice(&sample.to_le_bytes());
+            }
+        });
+        if written.is_none() {
             return;
-        };
-        for pair in out.as_chunks_mut::<2>().0 {
-            let sample = voice.pcm.pop_front().unwrap_or(0);
-            voice.trace.peak = voice.trace.peak.max(sample.saturating_abs());
-            pair.copy_from_slice(&sample.to_le_bytes());
         }
         voice.trace.produced += SAMPLES_PER_BLOCK / context.channels();
         let write = (write + 1) % size;
@@ -649,15 +662,24 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
         0 => (context.get(5), context.field(0, 0, 12)),
         _ => (context.get(6), context.field(1, 0, 12)),
     };
-    let Some(data) = heap_bytes(address & !0x7ff, packets as usize * xma::PACKET_BYTES) else {
+    let read = context.field(2, 0, 26) as usize;
+    // The frame is copied out with the heap locked and decoded after.
+    let Some((at, frame)) = with_heap_bytes(
+        address & !0x7ff,
+        packets as usize * xma::PACKET_BYTES,
+        |data| {
+            let at = if read < 32 {
+                32 + xma::packet(data, 0).map_or(0, |p| p.first_frame_bit as usize)
+            } else {
+                read
+            };
+            (at, xma::read_frame(data, at))
+        },
+    ) else {
         context.set_field(0, 20 + current, 1, 0);
         return true;
     };
-    let mut at = context.field(2, 0, 26) as usize;
-    if at < 32 {
-        at = 32 + xma::packet(data, 0).map_or(0, |p| p.first_frame_bit as usize);
-    }
-    let Some(frame) = xma::read_frame(data, at) else {
+    let Some(frame) = frame else {
         // This input is used up.
         context.set_field(0, 20 + current, 1, 0);
         return true;
@@ -727,9 +749,10 @@ fn dump_input(index: u32, context: Context) {
     }
     let dir = std::path::PathBuf::from(dir);
     let words: Vec<u8> = (0..16).flat_map(|w| context.get(w).to_le_bytes()).collect();
-    let input = heap_bytes(
+    let input = with_heap_bytes(
         context.get(5) & !0x7ff,
         context.field(0, 0, 12) as usize * xma::PACKET_BYTES,
+        |data| data.to_vec(),
     );
     let _ = std::fs::create_dir_all(&dir);
     let _ = std::fs::write(dir.join(format!("{n:02}-{index}.ctx")), words);
@@ -950,11 +973,13 @@ extern "system" fn submit(
         done[12..].copy_from_slice(&state.frame().to_le_bytes());
         state.post(COMMAND_COMPLETED, &done);
     }
-    if notification != 0
-        && let Some(word) = heap_unmap(notification)
-    {
-        // SAFETY: a u32 in a heap block, which the title reads as volatile.
-        unsafe { word.cast::<u32>().write_volatile(1) };
+    if notification != 0 {
+        // A block freed meanwhile is left alone (`with_heap_bytes`).
+        with_heap_bytes(notification, 4, |word| {
+            // SAFETY: a u32 in a live heap block, which the title reads as
+            // volatile.
+            unsafe { word.as_mut_ptr().cast::<u32>().write_volatile(1) };
+        });
     }
     S_OK
 }
@@ -1035,6 +1060,43 @@ mod tests {
         ApuFree(ptr);
         assert_eq!(ApuMapVirtualAddress(ptr), 0);
         assert_eq!(ApuAlloc(&mut ptr, &mut apu, 0x100, 6, 1), E_INVALIDARG);
+    }
+
+    /// A block the title freed is not touched: the decoder's write to an
+    /// output ring (or a notification word) freed meanwhile is skipped,
+    /// rather than landing in host memory the allocator has handed on.
+    #[test]
+    fn a_freed_block_is_not_written() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let (mut ptr, mut apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut ptr, &mut apu, 0x100, 256, 1), S_OK);
+        assert_eq!(with_heap_bytes(apu, 0x100, |b| b.len()), Some(0x100));
+        assert_eq!(
+            with_heap_bytes(apu + 0xfc, 8, |_| ()),
+            None,
+            "past the block"
+        );
+        ApuFree(ptr);
+        assert_eq!(
+            with_heap_bytes(apu, 4, |_| unreachable!("a freed block's bytes")),
+            None
+        );
+    }
+
+    /// While the decoder uses a block's bytes the heap stays locked, so the
+    /// title's `ApuFree` (which takes the same lock) waits until it is done:
+    /// the free cannot fall between the lookup and the write.
+    #[test]
+    fn a_block_cannot_be_freed_while_its_bytes_are_used() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let (mut ptr, mut apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut ptr, &mut apu, 0x100, 256, 1), S_OK);
+        let held = with_heap_bytes(apu, BLOCK_BYTES, |out| {
+            out.fill(0x7f);
+            HEAP.try_lock().is_err()
+        });
+        assert_eq!(held, Some(true));
+        ApuFree(ptr);
     }
 
     /// The context arrays and the heap exist once per process: tests that

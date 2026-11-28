@@ -117,6 +117,8 @@ tools/macos/victory.sh run --execute <the game's executable>
 
 For now this gets as far as VIctory does on Windows, as the note at the top explains.
 
+To warm the pipelines a previous run requested, or recover a large D3DMetal cache, see [Prewarm a recorded working set](docs/macos.md#prewarm-a-recorded-working-set).
+
 Set `VICTORY_WINDOW_SECONDARY=1` to open the game window on the only non-primary
 display. This requires two extended displays. If VIctory cannot select a single
 secondary display, it leaves the game window hidden. With more than one extra display,
@@ -158,6 +160,7 @@ A diagnostics build also logs one bounded line per submission that refreshes tit
 | `VICTORY_STACKS_FILE=<path>` | Writes those dumps to a file without taking locks, for freezes. |
 | `VICTORY_SKIP_TITLE_INT3=<rva>,...` | Steps over the game's own `int3` asserts at those hex RVAs and logs each one. Every other assert still stops the run. |
 | `VICTORY_GPU_TIMING=1` | Submits and times each GPU list on its own. |
+| `VICTORY_GPU_TIMING_CUTS=sweep` | GPU time per pipeline on a Mac, where GPU timestamps read 0: a few pipelines at a time get host lists of their own, timed by the clock, round all of them in a few minutes. `=<hash>,...` times the pipelines of those shaders only. Diagnostics builds. |
 
 ### Every variable
 
@@ -184,6 +187,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | skip host pipeline creation and omit draws and dispatches, including indirect ones, when the pipeline contains a listed 16-digit shader hash |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands; a device removal names the list it happened in and lists all its commands |
+| `VICTORY_GPU_TIMING_CUTS=sweep` | GPU time per pipeline without GPU timestamps (D3DMetal reads them all as 0): turns `VICTORY_GPU_TIMING` on, and a title list goes on in a fresh host list around the draws and dispatches of a few pipelines at a time, so each such list runs one pipeline and its wall time is that pipeline's; everything else stays together and the frame keeps its shape. `sweep` (or `sweep:<n>`, 16 by default) takes `n` at a time of the pipelines the title is drawing with, in the order it first drew with them, and moves on after every frame-rate line, so standing still for a few minutes times every pipeline of the scene; `<hash>,...` (16-digit shader hashes) takes the pipelines with a listed shader, for as long as the run lasts. Every frame-rate line is followed by `GPU wall time by pipeline`: lists and ms a frame, the lists' floor (tenth percentile, what an empty list costs), how far the sweep is, then the pipelines, each per frame it had lists in: ms, ms above the floor, lists, commands, and those frames |
 | `VICTORY_TRACE_SHADERS=<hash>,...` | with `VICTORY_D3D12_DRED`, every draw and dispatch of a listed shader logged with what it binds (user data, heap slots, root views and their first dwords; the first 500, and all of them in listed capture frames); the records of its indirect executions are read back and logged in every frame (records with work, the first four, the frame) |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `VICTORY_PIPELINE_LOG=<file>` | a line per title pipeline created (key, shaders, state), first used, and made or loaded (library name); `translate --cache --pipelines` writes the last kind too |

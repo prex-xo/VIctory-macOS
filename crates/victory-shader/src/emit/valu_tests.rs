@@ -2227,7 +2227,7 @@ fn image_atomics_of_64_bits_in_rounds_match_the_turns() {
 /// the wave folds each texel's lanes to one representative before
 /// anything locks. As one group and as 8 groups of the same lanes: row
 /// 0 holds each texel's largest key with and without the reduction, and
-/// no lock is left taken.
+/// no lock is left taken. The last case gives each lane its own texel.
 #[test]
 fn image_atomics_of_64_bits_umax_matches_the_locks() {
     let (v0, v1, v2, v6) = (vgpr(0), vgpr(1), vgpr(2), vgpr(6));
@@ -2239,7 +2239,8 @@ fn image_atomics_of_64_bits_umax_matches_the_locks() {
         (state >> 32) as u32
     };
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    for _ in 0..6 {
+    for trial in 0..7 {
+        let distinct = trial == 6;
         let [a, b, c, d, e] = [random() | 1, random(), random(), random(), random()];
         let mut words = atomics64_prologue();
         for (s, x) in [(16, a), (17, b), (18, c), (19, d), (20, e)] {
@@ -2249,7 +2250,11 @@ fn image_atomics_of_64_bits_umax_matches_the_locks() {
         words.extend(vop3(0x169, 1, sgpr(17), v0, 0)); // v_mul_lo_u32 v1, s17, v0
         words.extend(vop3(0x169, 2, sgpr(19), v0, 0)); // v_mul_lo_u32 v2, s19, v0
         words.extend([
-            0x16 << 25 | 6 << 17 | (v6 as u32 & 0xFF) << 9 | 157, // v_lshrrev_b32 v6, 29, v6
+            if distinct {
+                vop1(0x001, 6, v0) // one texel per lane
+            } else {
+                0x16 << 25 | 6 << 17 | (v6 as u32 & 0xFF) << 9 | 157 // v_lshrrev_b32 v6, 29, v6
+            },
             vop1(0x001, 7, 128),                                  // v_mov_b32 v7, 0
             0x25 << 25 | 1 << 17 | (v1 as u32 & 0xFF) << 9 | 18,  // v_add_nc_u32 v1, s18, v1
             0x25 << 25 | 2 << 17 | (v2 as u32 & 0xFF) << 9 | 20,  // v_add_nc_u32 v2, s20, v2
@@ -2258,7 +2263,7 @@ fn image_atomics_of_64_bits_umax_matches_the_locks() {
         // umax v[1:2] into (x, 0): glc clear, the reduction's gate.
         words.extend(image_atomic(0x17, 1, 6, 8, 3, false));
         words.push(S_ENDPGM);
-        let texel = |l: u32| (l.wrapping_mul(a) >> 29) as usize;
+        let texel = |l: u32| if distinct { l } else { l.wrapping_mul(a) >> 29 } as usize;
         let key = |l: u32| {
             let hi = l.wrapping_mul(d).wrapping_add(e) >> 30;
             u64::from(l.wrapping_mul(b).wrapping_add(c)) | u64::from(hi) << 32

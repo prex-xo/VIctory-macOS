@@ -295,7 +295,6 @@ impl Lower<'_> {
         let Some(meet) = &self.meet else {
             return;
         };
-        let p = self.x.p;
         let mut sites: Vec<(usize, usize, MeetSite)> = Vec::new();
         for &site in self.meet_plan {
             let MeetSite::Mask(lo) = site;
@@ -306,11 +305,7 @@ impl Lower<'_> {
                 continue;
             };
             // Right after the instruction writing it (a phi: at the start).
-            let at = p.blocks[b]
-                .insts
-                .iter()
-                .position(|i| i.writes.iter().any(|w| w.1 == lo))
-                .map_or(0, |i| i + 1);
+            let at = self.def_index.get(&lo).map_or(0, |&i| i + 1);
             sites.push((b, at, site));
         }
         sites.sort_unstable();

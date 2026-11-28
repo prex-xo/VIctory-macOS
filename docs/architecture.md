@@ -29,6 +29,9 @@ only a warm-up: it fills the same cache, under the same key. With
 into the pipeline library, from the creation streams the engine would pass
 (`victory-game` builds them, `victory-gpu` reads them as it reads the
 title's), so a run finds them under the names it gives them itself.
+`--cache --pipeline-selection <file>` warms a recorded set of full pipeline
+keys and translates only its shaders as needed. The [macOS guide](macos.md#prewarm-a-recorded-working-set)
+covers recording usage and recovering the driver cache.
 
 ## Crates
 

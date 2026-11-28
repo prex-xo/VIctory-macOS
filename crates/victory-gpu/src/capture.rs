@@ -471,13 +471,35 @@ pub(crate) fn read_indirect(
             return;
         }
         let Some(buffer) = buffer else { return };
-        l.ResourceBarrier(&[transition(args.0, arg_state, copy)]);
-        l.CopyBufferRegion(&buffer, 0, args.0, args.1, len);
-        if let Some((c, at)) = count {
-            // A title buffer's copy: never transitioned, the read promotes it.
-            l.CopyBufferRegion(&buffer, len, c, at, 4);
+        if let Some(cmd7) = list.narrow_clamp_sync_list() {
+            crate::host::global_barrier(
+                cmd7,
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING | D3D12_BARRIER_SYNC_EXECUTE_INDIRECT,
+                D3D12_BARRIER_SYNC_COPY,
+                D3D12_BARRIER_ACCESS_UNORDERED_ACCESS | D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT,
+                D3D12_BARRIER_ACCESS_COPY_SOURCE,
+            );
+            l.CopyBufferRegion(&buffer, 0, args.0, args.1, len);
+            if let Some((c, at)) = count {
+                // A title buffer's copy: never transitioned, the read promotes it.
+                l.CopyBufferRegion(&buffer, len, c, at, 4);
+            }
+            crate::host::global_barrier(
+                cmd7,
+                D3D12_BARRIER_SYNC_COPY,
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING | D3D12_BARRIER_SYNC_EXECUTE_INDIRECT,
+                D3D12_BARRIER_ACCESS_COPY_SOURCE,
+                D3D12_BARRIER_ACCESS_UNORDERED_ACCESS | D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT,
+            );
+        } else {
+            l.ResourceBarrier(&[transition(args.0, arg_state, copy)]);
+            l.CopyBufferRegion(&buffer, 0, args.0, args.1, len);
+            if let Some((c, at)) = count {
+                // A title buffer's copy: never transitioned, the read promotes it.
+                l.CopyBufferRegion(&buffer, len, c, at, 4);
+            }
+            l.ResourceBarrier(&[transition(args.0, copy, arg_state)]);
         }
-        l.ResourceBarrier(&[transition(args.0, copy, arg_state)]);
         list.keep(&buffer);
         let buffer = Readback(buffer);
         let counted = count.is_some();

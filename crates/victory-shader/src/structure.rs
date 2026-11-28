@@ -594,6 +594,55 @@ struct Lanes<'a> {
     kills: HashSet<(usize, usize)>,
 }
 
+/// SCC value `scc` in block `at`, where the program shows it: SCC that a
+/// lane-mask operation writing EXEC set to whether its result (the new
+/// EXEC) has a lane, read in a block reached only through the edge of an
+/// `s_cbranch_execz` or `s_cbranch_execnz` on that same EXEC (a chain of
+/// blocks of one predecessor each). That edge says whether the console
+/// wave's EXEC had a lane, so it says SCC too. The console compiler leaves
+/// such reads after a waterfall loop, whose last `s_andn2_wrexec` sets SCC
+/// to whether lanes remain and whose exit is taken when none do.
+fn exec_scc(p: &Program, defs: &Map<Value, (usize, usize)>, scc: Value, at: usize) -> Option<bool> {
+    let &(b, i) = defs.get(&scc)?;
+    let def = &p.blocks[b].insts[i];
+    let width = if p.wave64 { "_b64" } else { "_b32" };
+    let op = def.name().strip_prefix("s_")?.strip_suffix(width)?;
+    let op = op
+        .strip_suffix("_saveexec")
+        .or_else(|| op.strip_suffix("_wrexec"))
+        .unwrap_or(op);
+    let logical = [
+        "and", "or", "xor", "andn2", "orn2", "andn1", "orn1", "nand", "nor", "xnor", "not",
+    ];
+    if !logical.contains(&op) || def.write(Reg::Scc) != Some(scc) {
+        return None;
+    }
+    let exec = (def.write(Reg::S(EXEC))?, def.write(Reg::S(EXEC + 1)));
+    let mut block = at;
+    for _ in 0..p.blocks.len() {
+        let &[q] = &p.blocks[block].preds[..] else {
+            return None;
+        };
+        if let Exit::Branch { taken, not_taken } = p.blocks[q].exit
+            && taken != not_taken
+            && let Some(branch) = p.blocks[q].insts.last()
+            && (
+                branch.read(Reg::S(EXEC)),
+                branch.read(Reg::S(EXEC + 1)).filter(|_| p.wave64),
+            ) == (Some(exec.0), exec.1.filter(|_| p.wave64))
+        {
+            let none = match branch.name() {
+                "s_cbranch_execz" => taken,
+                "s_cbranch_execnz" => not_taken,
+                _ => return None,
+            };
+            return Some(block != none);
+        }
+        block = q;
+    }
+    None
+}
+
 /// A mask join taken as `value` in every lane that reaches `block`: each
 /// incoming mask held (or failed) on its edge.
 struct Join {
@@ -1209,11 +1258,17 @@ impl<'a> Lanes<'a> {
                 let (a, c) = (arg(0, self)?, arg(1, self)?);
                 let scc = inst.read(Reg::Scc)?;
                 let born = self.born(scc);
-                let u = self
-                    .scc_votes
-                    .get(&scc)
-                    .copied()
-                    .unwrap_or_else(|| self.b.atom(Atom::Uniform(scc), born));
+                let at = inst.writes.first().and_then(|w| self.defs.get(&w.1));
+                let known = at.and_then(|&(b, _)| exec_scc(self.p, &self.defs, scc, b));
+                let u = match known {
+                    Some(true) => Bool::TRUE,
+                    Some(false) => Bool::FALSE,
+                    None => self
+                        .scc_votes
+                        .get(&scc)
+                        .copied()
+                        .unwrap_or_else(|| self.b.atom(Atom::Uniform(scc), born)),
+                };
                 (self.b.ite(u, a, c), None)
             }
             _ => {

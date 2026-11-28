@@ -1,7 +1,5 @@
-//! The pipeline pre-build, the warm-up's second half: every pipeline of the
-//! title's shader pack made ahead of a run into the host pipeline library
-//! the run reads (`<cache>/pipelines`), so that a first run, and a first
-//! visit to any place, compiles nothing the pack lists.
+//! Make all or a selection of the title's shader-pack pipelines ahead of a
+//! run into the host pipeline library the run reads (`<cache>/pipelines`).
 //!
 //! Each pack record becomes the creation stream the engine would hand the
 //! device for that pipeline (`victory_game::pipelines`), which goes through
@@ -12,13 +10,13 @@
 //! interrupted pre-build keeps its work, and the next one finds those
 //! pipelines there.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result, ensure};
 use victory_game::pipelines::{self, Named, Unnamed};
 use victory_game::{sgd5, shaderpack};
 use victory_gpu::pipeline::{self, Prebuild};
@@ -37,9 +35,33 @@ enum Job {
     Compute(usize),
 }
 
-pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
+/// The format of early-pipelines.txt: full title keys, one per line.
+pub fn read_selection(file: &Path) -> Result<BTreeSet<String>> {
+    let contents = std::fs::read_to_string(file)
+        .with_context(|| format!("reading pipeline selection {}", file.display()))?;
+    parse_selection(&contents)
+        .with_context(|| format!("invalid pipeline selection {}", file.display()))
+}
+
+fn parse_selection(contents: &str) -> Result<BTreeSet<String>> {
+    let mut keys = BTreeSet::new();
+    for (i, line) in contents.lines().enumerate() {
+        let key = line.trim();
+        if key.is_empty() {
+            continue;
+        }
+        ensure!(
+            key.len() == 32 && key.bytes().all(|c| c.is_ascii_hexdigit()),
+            "line {}: expected one 32-digit hexadecimal pipeline key",
+            i + 1
+        );
+        keys.insert(key.to_ascii_lowercase());
+    }
+    Ok(keys)
+}
+
+pub fn run(paths: &[PathBuf], threads: usize, selection: Option<&BTreeSet<String>>) -> Result<()> {
     let started = Instant::now();
-    pipeline::use_pipeline_cache(victory_core::Config::load()?.cache_subdir("pipelines")?);
     // The files that hold shaders (or the pack itself).
     let files: Vec<(PathBuf, Vec<u8>)> = paths
         .iter()
@@ -57,6 +79,10 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
         .filter(|(_, d)| d.starts_with(shaderpack::MAGIC) || sgd5::is_sgd5(d))
         .find_map(|(p, d)| Some((p, shaderpack::find(d)?)));
     let Some((pack_path, pack)) = found else {
+        ensure!(
+            selection.is_none(),
+            "no shader pack found for pipeline selection"
+        );
         println!("pipelines    no shader pack among the files: nothing to pre-build");
         return Ok(());
     };
@@ -196,18 +222,24 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
     }
     let skipped: Mutex<BTreeMap<String, usize>> = Mutex::new(BTreeMap::new());
     let skip = |why: String| *lock(&skipped).entry(why).or_default() += 1;
-    // First every record's key, which needs no translation: what a
-    // pre-build put in the library is skipped, what an earlier run drew
-    // with is made first.
+    // Keys need no translation or host device. Filter and deduplicate
+    // before even the prebuilt-index lookup, which opens the host library.
     let lines: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    let todo: Mutex<Vec<(bool, Job)>> = Mutex::new(Vec::new());
-    let listed = AtomicUsize::new(0);
+    let matched: Mutex<HashMap<String, Job>> = Mutex::new(HashMap::new());
+    let excluded = AtomicUsize::new(0);
+    let duplicates = AtomicUsize::new(0);
     each(&jobs, threads, |job| match prepare(job) {
         Ok(p) if keys_only.is_some() => {
             lock(&lines).push(format!("{}\t{job:?}\t{}", p.key(), p.describe()))
         }
-        Ok(p) if pipeline::prebuilt(&p.key()) => drop(listed.fetch_add(1, Ordering::Relaxed)),
-        Ok(p) => lock(&todo).push((!pipeline::wanted_early(&p.key()), job)),
+        Ok(p) => {
+            let key = p.key();
+            if selection.is_some_and(|keys| !keys.contains(&key)) {
+                excluded.fetch_add(1, Ordering::Relaxed);
+            } else if lock(&matched).insert(key, job).is_some() {
+                duplicates.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         Err(why) => {
             if keys_only.is_some() {
                 lock(&lines).push(format!("-\t{job:?}\t{}\t{why}", shaders_of(job)));
@@ -215,27 +247,60 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
             skip(why);
         }
     });
-    let listed = listed.into_inner();
+    let unkeyable: usize = lock(&skipped).values().sum();
     if let Some(file) = keys_only {
         // The listing is game-derived (rule #1): only outside the repo.
         crate::write_prebuild_keys(Path::new(&file), &lock(&lines).join("\n"))?;
+        println!(
+            "pipelines    {} records listed, {unkeyable} without a key",
+            jobs.len()
+        );
+        print_skips(&skipped);
+        return Ok(());
     }
-    let mut todo = todo.into_inner().unwrap_or_else(|e| e.into_inner());
+    let matched = matched.into_inner().unwrap_or_else(|e| e.into_inner());
+    let matched_count = matched.len();
+    if let Some(keys) = selection {
+        println!(
+            "selection    {} requested keys, {matched_count} matched keys, {} unmatched keys",
+            keys.len(),
+            keys.len() - matched_count
+        );
+        for key in keys.iter().filter(|key| !matched.contains_key(*key)) {
+            println!("  unmatched: {key}");
+        }
+    }
+
+    let mut listed = 0;
+    let mut todo = Vec::new();
+    if !matched.is_empty() {
+        pipeline::use_pipeline_cache(victory_core::Config::load()?.cache_subdir("pipelines")?);
+        if selection.is_some() {
+            crate::translate::open_shader_cache()?;
+        }
+        for (key, job) in matched {
+            if pipeline::prebuilt(&key) {
+                listed += 1;
+            } else {
+                todo.push((!pipeline::wanted_early(&key), job));
+            }
+        }
+    }
+    // Keep the earlier run's working set first in full-pack mode.
     todo.sort_by_key(|&(later, _)| later);
     let todo: Vec<Job> = todo.into_iter().map(|(_, job)| job).collect();
 
     let next = AtomicUsize::new(0);
-    let (made0, loaded0) = pipeline::pipeline_counts();
-    let counts = || {
-        let (made, loaded) = pipeline::pipeline_counts();
-        (made - made0, loaded - loaded0)
-    };
+    let (_, loaded0) = pipeline::pipeline_counts();
+    let loaded = || (pipeline::pipeline_counts().1 - loaded0) as usize;
+    let refused = AtomicUsize::new(0);
     std::thread::scope(|s| {
         let workers: Vec<_> = (0..threads.min(todo.len()))
             .map(|_| {
                 s.spawn(|| {
                     while let Some(&job) = todo.get(next.fetch_add(1, Ordering::Relaxed)) {
                         if let Err(why) = prepare(job).and_then(|p| p.make()) {
+                            refused.fetch_add(1, Ordering::Relaxed);
                             skip(why);
                         }
                     }
@@ -244,22 +309,33 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
             .collect();
         let (n, what) = (todo.len(), "pipelines to make");
         crate::translate::report(pack_path, n, what, &next, started, &workers, || {
-            let (made, loaded) = counts();
-            format!("; {made} made, {loaded} found in the library")
+            format!("; {} found in the library", loaded())
         });
     });
-    pipeline::save_pipeline_cache();
-    let (made, loaded) = counts();
+    if !todo.is_empty() {
+        pipeline::save_pipeline_cache();
+    }
+    let loaded = loaded();
+    let refused = refused.into_inner();
+    // The library's creation counter can also count a failed call when
+    // there is no library. Count only jobs that produced a pipeline here.
+    let made = todo.len() - loaded - refused;
     println!(
-        "pipelines    {} in the pack, {:.1} s: {made} made, {} already in the library",
+        "pipelines    {} records, {:.1} s: {} excluded, {} duplicates, {unkeyable} without a key; \
+         {listed} already prebuilt, {loaded} loaded, {made} newly built, {refused} refused",
         jobs.len(),
         started.elapsed().as_secs_f64(),
-        listed + loaded as usize,
+        excluded.into_inner(),
+        duplicates.into_inner(),
     );
-    for (why, n) in lock(&skipped).iter() {
+    print_skips(&skipped);
+    Ok(())
+}
+
+fn print_skips(skipped: &Mutex<BTreeMap<String, usize>>) {
+    for (why, n) in lock(skipped).iter() {
         println!("  {n:>7}  skipped: {why}");
     }
-    Ok(())
 }
 
 /// Runs `f` on every job, on `threads` threads.
@@ -291,4 +367,36 @@ fn program_ids(bytes: &[u8]) -> Vec<([u8; 24], HwStage)> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selection_uses_full_keys_and_deduplicates_lines() {
+        let key = "0123456789abcdef0123456789abcdef";
+        let text = format!("\r\n  {}  \r\n{key}\n", key.to_ascii_uppercase());
+        assert_eq!(
+            parse_selection(&text).unwrap(),
+            BTreeSet::from([key.into()])
+        );
+        assert!(parse_selection(" \n\r\n").unwrap().is_empty());
+        for line in [
+            "0123456789abcdef",
+            "z123456789abcdef0123456789abcdef",
+            "key data",
+        ] {
+            let err = parse_selection(&format!("{key}\n{line}")).unwrap_err();
+            assert!(err.to_string().contains("line 2"));
+        }
+    }
+
+    #[test]
+    fn a_missing_selection_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.txt");
+        let err = read_selection(&path).unwrap_err();
+        assert!(err.to_string().contains("missing.txt"));
+    }
 }

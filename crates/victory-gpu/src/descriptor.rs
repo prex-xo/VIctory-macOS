@@ -224,6 +224,129 @@ fn mirror(handle: u64) {
     }
 }
 
+/// Where [`sync_heaps`] spends its time, since the last frame report:
+/// [`SyncStat`]'s slots. Always counted (a few clock reads a page): the
+/// frame report's "heap views synced" phase is the largest of preparing.
+pub(crate) static SYNC_STATS: [std::sync::atomic::AtomicU64; 20] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 20];
+
+/// [`SYNC_STATS`]'s slots.
+#[derive(Clone, Copy)]
+pub(crate) enum SyncStat {
+    /// Calls (one a submission).
+    Syncs,
+    /// Microseconds taking the heaps' written ranges (their pages guarded again).
+    TakeUs,
+    /// 64 KiB pages (or parts) read.
+    Pages,
+    /// Microseconds reading them through the kernel.
+    ReadUs,
+    /// Microseconds checking their slots, making them included.
+    CheckUs,
+    /// Slots checked.
+    Slots,
+    /// Microseconds making slots again (`HostHeap::mirror_synced_batch`).
+    MakeUs,
+    /// Slots made again.
+    Made,
+    /// Of them: already holding that view (nothing done).
+    Unchanged,
+    /// Views created (`make`).
+    Created,
+    /// Microseconds creating them.
+    CreateUs,
+    /// Copied from a view created for another slot in the same sync.
+    FromTemplate,
+    /// Left null until a draw reads them (placed textures).
+    Deferred,
+    /// Made null (no view of ours any more).
+    Nulled,
+    /// Created views whose descriptor an earlier sync created already
+    /// (`VICTORY_VIEW_PROBE=1`): what a cache across syncs would save.
+    SeenBefore,
+    /// Microseconds copying descriptors (`CopyDescriptors`).
+    CopyUs,
+    /// Microseconds looking the views up and preparing them (`prepare`).
+    PrepareUs,
+    /// Microseconds of the loop over the slots, creating included.
+    LoopUs,
+    /// Microseconds keeping what the slots view (`keep_batch`).
+    KeepUs,
+    /// Microseconds noting what the slots view (`viewed.set_batch`).
+    ViewedUs,
+}
+
+/// Adds `n` to `stat`.
+pub(crate) fn sync_stat(stat: SyncStat, n: u64) {
+    SYNC_STATS[stat as usize].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The frame report's line for [`sync_heaps`], per frame over `frames`.
+pub(crate) fn log_sync(frames: f64) {
+    let s = SYNC_STATS.each_ref().map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed));
+    let per = |n: u64| n as f64 / frames;
+    let ms = |us: u64| us as f64 / 1e3 / frames;
+    tracing::info!(
+        "heap views synced per frame: {:.1} syncs, {:.0} pages, {:.0} slots checked, {:.0} made again; ms: taking \
+         written ranges {:.1}, reading pages {:.1}, checking slots {:.1} (of it making them {:.1})",
+        per(s[0]),
+        per(s[2]),
+        per(s[5]),
+        per(s[7]),
+        ms(s[1]),
+        ms(s[3]),
+        ms(s[4]),
+        ms(s[6]),
+    );
+    tracing::info!(
+        "heap slots made again per frame: holding that view already {:.0}, views created {:.0} ({:.1} ms{}), \
+         copied from one created in the same sync {:.0}, left null for draws {:.0}, made null {:.0}; ms: looking \
+         the views up and preparing them {:.1}, the slots' loop {:.1}, copying descriptors {:.1}, keeping what they \
+         view {:.1}, noting it {:.1}, the rest {:.1}",
+        per(s[8]),
+        per(s[9]),
+        ms(s[10]),
+        if view_probe() {
+            format!(", {:.0} of them created by an earlier sync", per(s[14]))
+        } else {
+            String::new()
+        },
+        per(s[11]),
+        per(s[12]),
+        per(s[13]),
+        ms(s[16]),
+        ms(s[17]),
+        ms(s[15]),
+        ms(s[18]),
+        ms(s[19]),
+        ms(s[6].saturating_sub(s[15] + s[16] + s[17] + s[18] + s[19])),
+    );
+}
+
+/// `VICTORY_VIEW_PROBE=1` (off by default): counts views a heap sync
+/// creates whose descriptor (view and generation) an earlier sync created
+/// already, the ceiling of a cache of views across syncs.
+pub(crate) fn view_probe() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_VIEW_PROBE"))
+}
+
+/// The descriptors earlier syncs created (`VICTORY_VIEW_PROBE=1`), bounded:
+/// cleared once it holds [`SEEN_MAX`].
+static SEEN: std::sync::Mutex<Option<std::collections::HashSet<u64>>> = std::sync::Mutex::new(None);
+const SEEN_MAX: usize = 1 << 20;
+
+/// Notes the descriptors a sync created (`keys`); returns how many an
+/// earlier sync created already.
+pub(crate) fn seen_before(keys: &[u64]) -> u64 {
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let seen = seen.get_or_insert_with(Default::default);
+    if seen.len() > SEEN_MAX {
+        seen.clear();
+    }
+    keys.iter().filter(|&&k| !seen.insert(k)).count() as u64
+}
+
 /// Mirrors what the title wrote into its shader-visible heaps without a
 /// call: Grand Theft Auto VI copies descriptors (our records) into its heap
 /// as bytes, so only a change of its memory shows them. Each slot of a page
@@ -236,6 +359,8 @@ pub(crate) fn sync_heaps() {
     /// A heap's start, its address, and the ranges written since the last sync.
     type Written = (u64, usize, Vec<(usize, usize)>);
     // The written ranges of every heap, taken in one short hold of the lock.
+    let taking = std::time::Instant::now();
+    sync_stat(SyncStat::Syncs, 1);
     let work: Vec<Written> = {
         let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
         heaps
@@ -281,6 +406,8 @@ pub(crate) fn sync_heaps() {
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::SyncSlots, last.saturating_sub(first));
+        sync_stat(SyncStat::Slots, last.saturating_sub(first));
+        let checking = std::time::Instant::now();
         host.sync_slots_bytes(
             first as u32,
             last as u32,
@@ -289,10 +416,12 @@ pub(crate) fn sync_heaps() {
             range_from as u64,
             bytes,
         );
+        sync_stat(SyncStat::CheckUs, checking.elapsed().as_micros() as u64);
     };
 
     const SUB_PAGE: usize = 4 << 10;
     let page_size = crate::watch::PAGE;
+    sync_stat(SyncStat::TakeUs, taking.elapsed().as_micros() as u64);
     let mut page_buf = SYNC_PAGE_BUF.with(|b| std::mem::take(&mut *b.borrow_mut()));
     if page_buf.len() < page_size {
         page_buf.resize(page_size, 0);
@@ -320,10 +449,14 @@ pub(crate) fn sync_heaps() {
                     continue;
                 }
                 let len = end - page;
+                sync_stat(SyncStat::Pages, 1);
                 // By page: read the whole mapped range once; if part of a 64 KiB
                 // page is unmapped, fall back to 4 KiB OS pages so mapped slots
                 // are never skipped.
-                if crate::host::read_into(page as *const u8, &mut page_buf[..len]) {
+                let reading = std::time::Instant::now();
+                let read = crate::host::read_into(page as *const u8, &mut page_buf[..len]);
+                sync_stat(SyncStat::ReadUs, reading.elapsed().as_micros() as u64);
+                if read {
                     sync_range(host, heap.desc.count, start, step, page, end, &page_buf[..len]);
                 } else {
                     for sub in (page & !(SUB_PAGE - 1)..end).step_by(SUB_PAGE) {
@@ -438,6 +571,28 @@ pub(crate) fn make_read(slots: &[u32]) {
         for &i in slots.iter().filter(|&&i| i < heap.desc.count) {
             host.mirror(i, start + u64::from(i) * u64::from(step), true);
             host.stamp_read(i);
+        }
+    }
+}
+
+/// Makes the slots of every shader-visible view heap that were left as they
+/// were while a submission ran (`VICTORY_SHOW_AFTER`,
+/// [`host::HostHeap::show_held`]). Called while a submission is prepared,
+/// when none runs.
+#[cfg(windows)]
+pub(crate) fn show_held() {
+    if !host::show_after() {
+        return;
+    }
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        if heap.desc.kind != VIEWS_KIND {
+            continue;
+        }
+        if let Some(host) = heap.made_host() {
+            host.show_held();
         }
     }
 }

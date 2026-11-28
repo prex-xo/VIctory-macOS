@@ -230,6 +230,19 @@ impl Shader {
                         *container = crate::read_file(&spill_path(dir, full)).unwrap_or_default();
                     }
                     let done = translate(&container);
+                    // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title
+                    // gave it (`.cdxil`) and as translated (`.dxil`), by the
+                    // hash the log names it with; `victory translate` with
+                    // `VICTORY_TRANSLATE_ONLY` takes the same hash.
+                    if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
+                        let dir = std::path::PathBuf::from(dir);
+                        let _ = std::fs::create_dir_all(&dir);
+                        let stem = format!("{}.{}", self.hash, self.stage);
+                        let _ = std::fs::write(dir.join(format!("{stem}.cdxil")), &container[..]);
+                        if let Ok(t) = &done.0 {
+                            let _ = std::fs::write(dir.join(format!("{stem}.dxil")), &t.host.dxil);
+                        }
+                    }
                     // After the translation, not before: if it panics, the
                     // bytes are still there for the next try.
                     let keep = (link_mesh_outputs()
@@ -1296,6 +1309,8 @@ mod schedule;
 mod placed_uav_tests;
 #[cfg(all(test, windows))]
 mod thread_dispatch_tests;
+#[cfg(all(test, windows))]
+mod prewarm_cache_test;
 
 /// Keeps compiled host pipelines, and the list of title pipelines to start
 /// early, in `dir` (a folder of the cache) across runs.

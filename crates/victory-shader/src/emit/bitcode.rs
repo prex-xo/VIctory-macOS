@@ -211,6 +211,11 @@ pub(crate) struct Module {
     /// Structures chosen between by a condition: `(cond, other)` by the
     /// one taken where `cond` holds. [`Module::extract`] chooses the field.
     pub chosen: Map<V, (V, V)>,
+    /// Loads whose first four fields may lie on the next page of title
+    /// memory: per field, the condition under which it does and the load
+    /// (of that one dword, through that page's view) whose first field is
+    /// then taken instead. [`Module::extract`] chooses.
+    pub tails: Map<V, [Option<(V, V)>; 4]>,
 }
 
 impl Module {
@@ -424,10 +429,18 @@ impl Module {
             t => panic!("extractvalue from {t:?}"),
         };
         let x = self.push(block, ty, Op::Extract(agg, index));
-        match self.chosen.get(&agg).copied() {
+        let x = match self.chosen.get(&agg).copied() {
             Some((cond, other)) => {
                 let y = self.push(block, ty, Op::Extract(other, index));
                 self.select(block, cond, x, y)
+            }
+            None => x,
+        };
+        let tail = self.tails.get(&agg).and_then(|fields| *fields.get(index as usize)?);
+        match tail {
+            Some((cond, other)) => {
+                let y = self.push(block, ty, Op::Extract(other, 0));
+                self.select(block, cond, y, x)
             }
             None => x,
         }

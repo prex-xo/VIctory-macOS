@@ -434,9 +434,10 @@ impl BenchRecorder {
     ) -> (u64, u64) {
         let frame_draws = drawn.saturating_sub(self.prev_drawn);
         self.prev_drawn = drawn;
+        let is_world_frame = frame_draws >= WORLD_DRAW_THRESHOLD;
 
         if self.world_frame == 0 {
-            if frame_draws >= WORLD_DRAW_THRESHOLD {
+            if is_world_frame {
                 self.world_frame = 1;
             } else {
                 return (0, self.draws.len() as u64);
@@ -445,12 +446,11 @@ impl BenchRecorder {
             self.world_frame += 1;
         }
 
-        // The warm-up ends once it has counted `warmup_target` frames of the
-        // world; frames below the threshold do not count, and a loading
-        // phase starts it again.
-        self.measuring |= self.warmup_world >= self.warmup_target;
+        // Start measuring on a world frame after the warm-up target. The
+        // next frame could be back in loading, where the warm-up may reset.
+        self.measuring |= is_world_frame && self.warmup_world >= self.warmup_target;
         if !self.measuring {
-            if frame_draws >= WORLD_DRAW_THRESHOLD {
+            if is_world_frame {
                 self.low_run = 0;
                 self.warmup_world += 1;
             } else {
@@ -791,6 +791,26 @@ mod tests {
         let rep = rec.report(None);
         assert_eq!(rep.warmup_frames, LOADING_RUN + 3);
         assert_eq!(rep.zero_draw_world_frames, LOADING_RUN);
+    }
+
+    #[test]
+    fn a_loading_phase_immediately_after_the_warmup_target_restarts_warmup() {
+        let mut rec = BenchRecorder::new(1);
+        let mut drawn = 0;
+        assert_eq!(feed(&mut rec, &mut drawn, 2000, 1), (1, 0));
+        assert_eq!(
+            feed(&mut rec, &mut drawn, 6, LOADING_RUN),
+            (LOADING_RUN + 1, 0)
+        );
+
+        // The brief first glimpse of the world did not spend the warm-up.
+        assert_eq!(feed(&mut rec, &mut drawn, 4800, 1), (LOADING_RUN + 2, 0));
+        assert_eq!(feed(&mut rec, &mut drawn, 6, 1), (LOADING_RUN + 3, 0));
+        assert_eq!(feed(&mut rec, &mut drawn, 4800, 1), (LOADING_RUN + 4, 1));
+        assert_eq!(feed(&mut rec, &mut drawn, 0, 1), (LOADING_RUN + 5, 2));
+        let report = rec.report(None);
+        assert_eq!(report.warmup_frames, LOADING_RUN + 3);
+        assert_eq!(report.zero_draw_world_frames, 1);
     }
 
     #[test]

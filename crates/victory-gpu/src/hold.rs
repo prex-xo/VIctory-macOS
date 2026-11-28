@@ -135,7 +135,15 @@ pub(crate) enum Item<S> {
     Signal(usize, u64),
     /// A fence Wait: until the fence reaches the value.
     FenceWait(usize, u64),
+    /// Work of ours in the queue's order (a page mapping batch): it runs once
+    /// everything before it on its queue was handed to the host GPU, and
+    /// nothing after it on its queue is taken before it ran. Other queues
+    /// are not ordered with it.
+    Action(Action),
 }
+
+/// What an [`Item::Action`] runs.
+pub(crate) type Action = Box<dyn FnOnce() + Send>;
 
 /// What a pump did, for the frame's accounting.
 #[derive(Default, Debug, PartialEq, Eq)]
@@ -178,6 +186,9 @@ pub(crate) enum Ready<S> {
     },
     /// A fence signal ready at the head of a queue with no preceding segments.
     Signal { fence: usize, value: u64 },
+    /// An [`Item::Action`] at the head of a queue, nothing taken before it in
+    /// this call: the caller runs it before taking anything else.
+    Action(Action),
 }
 
 /// Every queue's held work.
@@ -285,7 +296,7 @@ impl<S> Held<S> {
                         }
                         // A Signal or Wait keeps its place: the piece before
                         // it runs first.
-                        Some((Item::Signal(..), ..)) => {
+                        Some((Item::Signal(..) | Item::Action(_), ..)) => {
                             if !piece.is_empty() {
                                 (w.run)(std::mem::take(&mut piece));
                                 done.pieces += 1;
@@ -310,6 +321,7 @@ impl<S> Held<S> {
                             done.segments += 1;
                         }
                         Some(Item::Signal(fence, value)) => (w.signal)(fence, value),
+                        Some(Item::Action(act)) => act(),
                         Some(Item::FenceWait(..)) | None => {}
                     }
                 }
@@ -338,6 +350,7 @@ impl<S> Held<S> {
             TakeSegment(bool),
             TakeSignal,
             TakeFenceWait(bool),
+            TakeAction,
         }
 
         let flush = |piece: &mut Vec<(S, bool)>,
@@ -408,6 +421,7 @@ impl<S> Held<S> {
                             }
                         }
                         Some((Item::Signal(..), ..)) => Decision::TakeSignal,
+                        Some((Item::Action(_), ..)) => Decision::TakeAction,
                         Some((Item::FenceWait(fence, value), _, fresh)) => {
                             let mem_ok = (w.fence)(*fence) >= *value;
                             let pending_ok = !mem_ok
@@ -455,6 +469,16 @@ impl<S> Held<S> {
                                 pending_fence_barrier = true;
                             }
                             items.pop_front();
+                        }
+                        Decision::TakeAction => {
+                            // What was taken before it runs first, its
+                            // signals included; nothing joins across it.
+                            moved = true;
+                            flush(&mut piece, &mut pending_signals, &mut last_queue, w, &mut done);
+                            pending_fence_barrier = false;
+                            if let Some((Item::Action(act), ..)) = items.pop_front() {
+                                act();
+                            }
                         }
                     }
                 }
@@ -549,6 +573,22 @@ impl<S> Held<S> {
                                 }
                                 moved = true;
                             }
+                        }
+                        Some((Item::Action(_), ..)) => {
+                            // Only at an empty piece: what this queue put in
+                            // the piece goes to the host GPU first, and the
+                            // queue takes nothing more in this call.
+                            if piece.is_empty()
+                                && signals.is_empty()
+                                && let Some((Item::Action(act), ..)) = items.pop_front()
+                            {
+                                self.queues.retain(|(_, q)| !q.is_empty());
+                                return Some(Ready::Action(act));
+                            }
+                            for entry in popped_pending_waits.drain(..).rev() {
+                                items.push_front(entry);
+                            }
+                            break;
                         }
                         Some((Item::Signal(..), ..)) => {
                             if piece.is_empty() && signals.is_empty() {
@@ -685,6 +725,16 @@ impl<S> Held<S> {
                         if let Some((Item::Signal(f, v), ..)) = items.pop_front() {
                             self.queues.retain(|(_, q)| !q.is_empty());
                             return Some(Ready::Signal { fence: f, value: v });
+                        }
+                        break;
+                    }
+                    Some((Item::Action(_), ..)) => {
+                        if !segments.is_empty() {
+                            break;
+                        }
+                        if let Some((Item::Action(act), ..)) = items.pop_front() {
+                            self.queues.retain(|(_, q)| !q.is_empty());
+                            return Some(Ready::Action(act));
                         }
                         break;
                     }
@@ -1220,6 +1270,124 @@ mod tests {
         assert!(!can_join_batch(title_copy, tex, 1, 64), "title copy -> texture upload splits");
         assert!(!can_join_batch(after, tex, 1, 64), "defer_after -> texture upload splits");
         assert!(!can_join_batch(clean, clean, 64, 64), "cap reached splits");
+    }
+
+    thread_local! {
+        /// What ran, in order, for tests whose actions log too (an action
+        /// is `Send + 'static`, so it cannot borrow a test's `Fake`).
+        static ORDER: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    fn logged(what: &str) {
+        ORDER.with(|o| o.borrow_mut().push(what.to_owned()));
+    }
+
+    fn act(name: &'static str) -> Item<&'static str> {
+        Item::Action(Box::new(move || logged(&format!("act {name}"))))
+    }
+
+    /// Pumps with no waits, logging pieces and actions to [`ORDER`].
+    fn pump_ordered(held: &mut Held<&'static str>, coalesce: bool) -> Vec<String> {
+        ORDER.with(|o| o.borrow_mut().clear());
+        let read = |_: u64, _| Some(0u64);
+        let fence = |_: usize| 0u64;
+        let no_write = |_: &&'static str, _: &ValueWait| false;
+        let join = |_: &[(&'static str, bool)], _: &&'static str| true;
+        let mut run = |segments: Vec<(&'static str, bool)>| {
+            let names: Vec<&str> = segments.iter().map(|(s, _)| *s).collect();
+            logged(&format!("run: {}", names.join(" ")));
+        };
+        let mut signal = |f: usize, v: u64| logged(&format!("signal {f} {v}"));
+        held.pump(&mut World {
+            read: &read,
+            fence: &fence,
+            will_write: &no_write,
+            can_join: &join,
+            coalesce,
+            run: &mut run,
+            signal: &mut signal,
+        });
+        ORDER.with(|o| o.borrow().clone())
+    }
+
+    /// An action keeps its place in its queue in both pumps: the work before
+    /// it runs first, and nothing after it joins that work. Other queues
+    /// still join.
+    #[test]
+    fn an_action_runs_between_its_queues_work() {
+        for coalesce in [false, true] {
+            let mut held = Held::default();
+            held.push(1, Item::Segment("a", vec![]));
+            held.push(1, act("map"));
+            held.push(1, Item::Segment("b", vec![]));
+            let order = pump_ordered(&mut held, coalesce);
+            assert_eq!(order, ["run: a", "act map", "run: b"], "coalesce {coalesce}");
+            assert!(held.is_empty());
+        }
+        // A signal before the action is delivered before it.
+        let mut held = Held::default();
+        held.push(1, Item::Segment("a", vec![]));
+        held.push(1, Item::Signal(9, 1));
+        held.push(1, act("map"));
+        held.push(1, Item::Segment("b", vec![]));
+        assert_eq!(
+            pump_ordered(&mut held, true),
+            ["run: a", "signal 9 1", "act map", "run: b"]
+        );
+    }
+
+    /// Taken for the submit worker, an action ends its queue's part of a
+    /// piece and comes out on its own once that piece was handed over;
+    /// coalescing, another queue's ready work still joins the piece. The
+    /// work after the action comes next.
+    #[test]
+    fn take_ready_hands_out_an_action_after_its_queues_work() {
+        let read = |_: u64, _| Some(0u64);
+        let fence = |_: usize| 0u64;
+        let no_write = |_: &&str, _: &ValueWait| false;
+        let join = |_: &[(&str, bool)], _: &&str| true;
+        for coalesce in [true, false] {
+            let mut held = Held::default();
+            held.push(1, Item::Segment("a", vec![]));
+            held.push(1, act("map"));
+            held.push(1, Item::Segment("b", vec![]));
+            held.push(2, Item::Segment("c", vec![]));
+            let take = |held: &mut Held<&'static str>| {
+                held.take_ready_with(&read, &fence, &no_write, &join, coalesce)
+            };
+
+            let Some(Ready::Segments { queues, segments, .. }) = take(&mut held) else {
+                panic!("expected segments first (coalesce {coalesce})");
+            };
+            let expected: &[(&str, bool)] = if coalesce { &[("a", false), ("c", false)] } else { &[("a", false)] };
+            assert_eq!(segments, expected);
+            assert!(held.holds_work(1), "running until finished");
+            // While queue 1 is handed over, its action stays; per queue,
+            // queue 2's work comes out on its own.
+            match take(&mut held) {
+                None => assert!(coalesce),
+                Some(Ready::Segments { queues, segments, .. }) => {
+                    assert!(!coalesce);
+                    assert_eq!(segments, [("c", false)]);
+                    held.finish_running(&queues);
+                }
+                Some(_) => panic!("the action came out while its queue's work was being handed over"),
+            }
+            held.finish_running(&queues);
+            let Some(Ready::Action(action)) = take(&mut held) else {
+                panic!("expected the action (coalesce {coalesce})");
+            };
+            ORDER.with(|o| o.borrow_mut().clear());
+            action();
+            assert_eq!(ORDER.with(|o| o.borrow().clone()), ["act map"]);
+            let mut rest = Vec::new();
+            while let Some(Ready::Segments { queues, segments, .. }) = take(&mut held) {
+                rest.extend(segments.into_iter().map(|(s, _)| s));
+                held.finish_running(&queues);
+            }
+            assert_eq!(rest, ["b"], "coalesce {coalesce}");
+            assert!(held.is_empty(), "coalesce {coalesce}");
+        }
     }
 
     #[test]

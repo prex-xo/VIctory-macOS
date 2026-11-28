@@ -14,8 +14,15 @@ use crate::{io, ir, resource, structure};
 
 /// Lowers a wave32 compute program of 32 threads with the table of views at
 /// s0 (textures, or with `buffers` structured buffers of dwords, at entries
-/// 0 and 1, a raw UAV at entry 2) and the table of samplers at s1.
+/// 0 and 1, a raw UAV at entry 2) and the table of samplers at s1, with one
+/// access by each lane's own heap index.
 fn build(words: &[u32], buffers: bool) -> HostShader {
+    build_with(words, buffers, 1)
+}
+
+/// `build` for a program with `nonuniform` accesses by each lane's own heap
+/// index: 0 where every lane's descriptor is the same.
+fn build_with(words: &[u32], buffers: bool, nonuniform: u32) -> HostShader {
     let table = |user_data: u8| RootParam {
         root: RootType::Table,
         table_offset_dwords: 0,
@@ -80,8 +87,8 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         view_marks: false,
     })
     .expect("lower");
-    // One access with each lane's own heap index, no wave operation.
-    assert_eq!(lowered.nonuniform_handles, 1);
+    // No wave operation.
+    assert_eq!(lowered.nonuniform_handles, nonuniform);
     assert!(!lowered.wave_ops);
     let shader = HostShader {
         stage: HwStage::Cs,
@@ -267,5 +274,77 @@ fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
         for (label, red) in sampled(&shader) {
             assert_eq!(red, want, "{label}, folded {folded}");
         }
+    }
+}
+
+#[test]
+fn lanes_sample_a_descriptor_moved_under_the_exec_their_waterfall_starts_with() {
+    let words = crate::resource::tests::waterfall_narrowed_wave32();
+    // Every lane's descriptor is the first texture's, so the waterfall is
+    // one uniform access.
+    let shader = build_with(&words, false, 0);
+    for (label, red) in sampled(&shader) {
+        // Lanes below 16 moved the first texture's descriptor and sample
+        // it; the others keep v12's 0.
+        let want: Vec<f32> = (0..32).map(|l| if l < 16 { 1.0 } else { 0.0 }).collect();
+        assert_eq!(red, want, "{label}");
+    }
+}
+
+/// A buffer descriptor (table entry 0, a structured buffer of dwords) loaded
+/// only for its record count, dword 2, which every lane stores at lane * 4
+/// of the buffer at dword 16: no instruction accesses the buffer.
+const RECORDS_ONLY_WAVE32: &[u32] = &[
+    0xBE84_0300, // s_mov_b32 s4, s0
+    0xBE85_0380, // s_mov_b32 s5, 0
+    0xF408_0602,
+    0xFA00_0000, // s_load_dwordx4 s[24:27], s[4:5], null
+    0xF408_0A02,
+    0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+    0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x7E02_021A, // v_mov_b32 v1, s26
+    0xE070_1000,
+    0x800A_0110, // buffer_store_dword v1, v16, s[40:43], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+#[test]
+fn a_buffer_descriptor_read_only_for_its_record_count_gives_the_views_elements() {
+    let code: Vec<u8> = RECORDS_ONLY_WAVE32
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+    let all = crate::gfx10::decode(&code)
+        .expect("decodes")
+        .iter()
+        .map(|i| i.text(false))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for want in [
+        "s_load_dwordx4 s[24:27], s[4:5], null",
+        "s_load_dwordx4 s[40:43], s[4:5], 0x000040",
+        "v_mov_b32 v1, s26",
+        "buffer_store_dword v1, v16, s[40:43], 0 offen",
+    ] {
+        assert!(all.contains(want), "{want:?} not in:\n{all}");
+    }
+    let shader = build_with(RECORDS_ONLY_WAVE32, true, 0);
+    let first: Vec<u32> = (0..24).collect();
+    let second = [0u32; 4];
+    let views = [
+        View::Buffer {
+            data: &first,
+            stride: Stride::Structured(4),
+        },
+        View::Buffer {
+            data: &second,
+            stride: Stride::Structured(4),
+        },
+        View::RawUav(32),
+    ];
+    for (label, got) in run(&shader, &views) {
+        // The console's record count of a structured buffer: its elements.
+        assert_eq!(got, vec![24; 32], "{label}");
     }
 }

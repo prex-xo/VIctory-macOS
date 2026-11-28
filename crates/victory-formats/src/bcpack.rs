@@ -159,9 +159,10 @@ impl Tables {
                 return Err(Error("a model does not tile 65536"));
             }
             start[m][used..].fill(1 << 16);
-            for (window, b) in bucket[m].iter_mut().enumerate() {
-                let first = (window as u32) << 8;
-                *b = start[m][1..].iter().filter(|&&s| s <= first).count() as u8;
+            for b in 0..used {
+                let from = start[m][b].div_ceil(256) as usize;
+                let to = start[m][b + 1].div_ceil(256) as usize;
+                bucket[m][from..to].fill(b as u8);
             }
         }
         let rank1 = r.bytes();
@@ -1713,5 +1714,21 @@ mod tests {
             n += 1;
         }
         assert!(n > 0);
+    }
+}
+
+#[cfg(test)]
+mod bucket_build_regression {
+    use super::*;
+    #[test]
+    fn ordered_windows_match_independent_start_scans() {
+        let t = Tables::builtin().unwrap();
+        for m in 0..MODELS {
+            for window in 0..256 {
+                let first = (window as u32) << 8;
+                let expected = t.start[m][1..].iter().filter(|&&s| s <= first).count();
+                assert_eq!(usize::from(t.bucket[m][window]), expected);
+            }
+        }
     }
 }

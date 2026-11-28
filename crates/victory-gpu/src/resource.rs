@@ -956,6 +956,9 @@ pub(crate) struct HostTexture {
     /// When the title last used it: presented frame and milliseconds since
     /// the first stamp ([`HostTexture::stamp`]).
     last: [std::sync::atomic::AtomicU64; 2],
+    /// Host submissions handed to the queue when it was made
+    /// (`crate::host::submissions_begun`): see [`HostTexture::fresh`].
+    made_in: u64,
 }
 
 #[cfg(windows)]
@@ -991,7 +994,16 @@ impl HostTexture {
             key: None,
             placement: None,
             last: [crate::queue::presented().into(), now_ms().into()],
+            made_in: crate::host::submissions_begun(),
         }
+    }
+
+    /// Whether a submission handed to the queue before it was made may
+    /// still run (`VICTORY_SHOW_AFTER`, `crate::descriptor::host`): lists
+    /// already on the GPU read heap slots by index, and a slot changed to
+    /// this texture now would be read by them.
+    pub(crate) fn fresh(&self) -> bool {
+        self.made_in > crate::host::submissions_done()
     }
 
     /// Whether its contents come from title memory: the host GPU does not
@@ -1376,7 +1388,7 @@ const UNORDERED: u32 = 4;
 #[cfg(windows)]
 const DENY_SHADER_RESOURCE: u32 = 8;
 /// Render target, depth, unordered access: what a host texture allows.
-#[cfg(windows)]
+#[cfg_attr(not(windows), allow(dead_code))]
 const USES: u32 = 0x7;
 
 /// What a texture memory is, for the one host texture it gets: its address
@@ -1894,6 +1906,16 @@ pub(crate) fn evict_heap_uav() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_EVICT_HEAP_UAV").is_some_and(|v| v != "0"))
 }
 
+/// The frame [`evict_unused`] last ran in.
+#[cfg(windows)]
+static EVICTED_IN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Whether [`evict_unused`] would run now (once per presented frame).
+#[cfg(windows)]
+pub(crate) fn evict_due() -> bool {
+    EVICTED_IN.load(std::sync::atomic::Ordering::Relaxed) != crate::queue::presented()
+}
+
 /// Once per presented frame, before a submission (`Host::execute`, one at a
 /// time, the last one has run): gives up host textures fed from title memory
 /// that the title has not used for [`IDLE_MS`], and past [`BUDGET_HIGH`] of
@@ -1903,9 +1925,8 @@ pub(crate) fn evict_heap_uav() -> bool {
 #[cfg(windows)]
 pub(crate) fn evict_unused() {
     use std::sync::atomic::Ordering::Relaxed;
-    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
     let frame = crate::queue::presented();
-    if LAST.swap(frame, Relaxed) == frame {
+    if EVICTED_IN.swap(frame, Relaxed) == frame {
         return;
     }
     let over = crate::host::video_memory().map_or(0, |[(used, budget), _]| {
@@ -1917,6 +1938,7 @@ pub(crate) fn evict_unused() {
     });
     let ram = ram_over();
     evict(frame, now_ms(), over.max(ram));
+    empty_sparse_heap(frame);
     // Host copies of title memory take the same memory and textures give
     // back only part of it: the idle ones go too.
     crate::shadow::release_idle(frame, ram);
@@ -1925,6 +1947,53 @@ pub(crate) fn evict_unused() {
         crate::texback::trim_idle();
     }
 }
+
+/// Presented frames between two [`empty_sparse_heap`] passes.
+#[cfg(windows)]
+const EMPTY_FRAMES: u64 = 30;
+
+/// Every [`EMPTY_FRAMES`] presented frames where the card's memory is the
+/// computer's own ([`unified`]), unless `VICTORY_EMPTY_HEAPS=0`: gives up
+/// the textures of one sparse heap of textures, so that it empties and is
+/// released (`crate::placement::choose_to_empty`). A heap goes back whole
+/// or not at all, and in world runs on a 32 GB Mac the heaps held 0.8 to
+/// 1.9 GB of free space. Only a heap whose textures may all be given up
+/// and were not used in the last [`SOON_FRAMES`] frames is emptied, as
+/// [`choose`] spares those past the budget. Returns how many textures were
+/// given up and their bytes.
+#[cfg(windows)]
+fn empty_sparse_heap(frame: u64) -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_EMPTY_HEAPS").is_none_or(|v| v != "0"));
+    if !on || !frame.is_multiple_of(EMPTY_FRAMES) || !unified() {
+        return (0, 0);
+    }
+    let candidates = candidates();
+    let quiet = |t: &HostTexture| frame.saturating_sub(t.last[0].load(Relaxed)) > SOON_FRAMES;
+    let mut may_go: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    for (t, _) in &candidates {
+        if let Some(p) = t.placement.filter(|_| quiet(t)) {
+            *may_go.entry(p.heap()).or_default() += p.size();
+        }
+    }
+    let Some(heap) = crate::placement::choose_to_empty(|id| may_go.get(&id).copied().unwrap_or(0)) else {
+        return (0, 0);
+    };
+    let gone: Vec<Owned> =
+        candidates.into_iter().filter(|(t, _)| t.placement.is_some_and(|p| p.heap() == heap)).collect();
+    let (n, bytes) = give_up(&gone, frame);
+    HEAPS_EMPTIED[0].fetch_add(1, Relaxed);
+    HEAPS_EMPTIED[1].fetch_add(bytes, Relaxed);
+    tracing::debug!(heap, textures = n, mb = bytes as f64 / 1e6, "emptying a sparse heap of textures");
+    (n, bytes)
+}
+
+/// Heaps of textures [`empty_sparse_heap`] emptied, and the bytes of the
+/// textures it gave up for them, for the statistics line.
+#[cfg(windows)]
+pub(crate) static HEAPS_EMPTIED: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Where the card's memory is the computer's own (unified: Apple silicon
 /// under D3DMetal, integrated GPUs), host textures also go while less than
@@ -2104,9 +2173,10 @@ fn one_memory(uma: bool, local: f64, non_local: f64) -> bool {
 /// The card's budget in MB that [`evict_unused`] keeps host textures under:
 /// `VICTORY_GPU_BUDGET_MB` when set, else the device's (`device`). Under
 /// D3DMetal the device's is about four fifths of the Mac's memory, which the
-/// title's own memory shares, and memory freed through D3DMetal stays with
-/// the process for its next resources: on a Mac with 8 GB, unused textures
-/// filled memory into swap long before the pass would start (#135).
+/// title's own memory shares: on a Mac with 8 GB, unused textures filled
+/// memory into swap long before the pass would start (#135). Memory freed
+/// through D3DMetal leaves the process at the next submission, and the
+/// device's use follows it (`footprint_probe`).
 #[cfg(windows)]
 fn budget_mb(device: f64) -> f64 {
     static SET: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
@@ -2638,12 +2708,140 @@ pub(crate) fn placed_size(desc: &[u32; 14]) -> Option<u64> {
     (d.dimension != BUFFER).then(|| footprint(&d).map(|f| f.size)).flatten()
 }
 
+#[cfg(all(windows, test))]
+thread_local! {
+    static TEST_PLACED_TWIN: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `VICTORY_PLACED_TWIN=1`: let a placed texture view with automatic layout
+/// (`layout == 0`) share a live writable title texture at the same address
+/// whose flags resolved to a different automatic layout.
+#[cfg(windows)]
+fn placed_twin_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_PLACED_TWIN.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = crate::switch::on("VICTORY_PLACED_TWIN");
+        if on {
+            tracing::info!(
+                "VICTORY_PLACED_TWIN=1: placed views with automatic layout share matching live writable textures at the same address"
+            );
+        }
+        on
+    })
+}
+
+/// Whether a placed view `desc` at `address` with automatic layout (`layout == 0`)
+/// matches a live writable title texture `candidate` at the same address whose
+/// layout or mip chain gave it a different [`MemoryKey`].
+#[cfg_attr(not(windows), allow(dead_code))]
+fn placed_twin_matches(address: u64, desc: &ResourceDesc, candidate: &ResourceDesc) -> bool {
+    if desc.dimension == BUFFER || desc.layout != 0 {
+        return false;
+    }
+    let Some(key) = memory_key(address, desc) else {
+        return false;
+    };
+    candidate.flags & USES != 0
+        && candidate.dimension == desc.dimension
+        && candidate.width == desc.width
+        && candidate.height == desc.height
+        && candidate.depth_or_array_size == desc.depth_or_array_size
+        && candidate.sample_count.max(1) == desc.sample_count.max(1)
+        && element(candidate.format) == Some(key.element)
+        && mip_count(desc) <= mip_count(candidate)
+        && memory_key(address, candidate) != Some(key)
+}
+
+/// Finds a live writable title texture at `address` matching a placed view
+/// `desc` with automatic layout (`layout == 0`) whose resolved [`MemoryKey`]
+/// differs (`VICTORY_PLACED_TWIN=1`).
+#[cfg(windows)]
+fn written_twin(address: u64, desc: &ResourceDesc) -> Option<Held> {
+    if !placed_twin_enabled() || desc.dimension == BUFFER || desc.layout != 0 {
+        return None;
+    }
+    // Collect matching candidates under `TEXTURES_AT`, then drop the lock
+    // before calling `current` (which acquires `MEMORY`; lock order is
+    // `MEMORY` -> `TEXTURES_AT`).
+    let candidates: Vec<Held> = {
+        let map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
+        let list = map.get(&address)?;
+        let mut found = Vec::new();
+        for &raw in list {
+            let r = raw as This;
+            if placed_twin_matches(address, desc, &resource(r).desc)
+                && crate::object::try_add_ref(r)
+            {
+                found.push(Held(r));
+            }
+        }
+        found
+    };
+    if candidates.is_empty() {
+        return None;
+    }
+    // Prefer a current candidate whose host texture already exists.
+    let mut fallback = None;
+    for held in candidates {
+        if !current(held.get()) {
+            continue;
+        }
+        if made_copy(held.get()).is_some() {
+            return Some(held);
+        }
+        if fallback.is_none() {
+            fallback = Some(held);
+        }
+    }
+    fallback
+}
+
+/// Logs once per unique address (up to 64 addresses) when `VICTORY_PLACED_TWIN`
+/// matches a placed automatic-layout view to a live writable title texture.
+#[cfg(windows)]
+fn log_placed_twin(address: u64, placed: &ResourceDesc, twin: &ResourceDesc) {
+    const MAX_LOGGED: usize = 64;
+    static LOGGED: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+    let mut logged = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
+    if logged.len() >= MAX_LOGGED || logged.contains(&address) {
+        return;
+    }
+    logged.push(address);
+    let count = logged.len();
+    drop(logged);
+    tracing::info!(
+        count,
+        address = format_args!("{address:#x}"),
+        width = placed.width,
+        height = placed.height,
+        depth_or_array = placed.depth_or_array_size,
+        placed_format = placed.format,
+        placed_layout = format_args!("{:#x}", placed.layout),
+        placed_flags = format_args!("{:#x}", placed.flags),
+        placed_mips = mip_count(placed),
+        twin_format = twin.format,
+        twin_layout = format_args!("{:#x}", twin.layout),
+        twin_flags = format_args!("{:#x}", twin.flags),
+        twin_mips = mip_count(twin),
+        "VICTORY_PLACED_TWIN: sharing live writable texture for automatic-layout placed view"
+    );
+}
+
 /// Whether a placed texture at `address` with resource description `desc`
 /// already has a live host texture, without creating one.
 #[cfg(windows)]
 pub(crate) fn placed_made(address: u64, desc: &[u32; 14]) -> bool {
     let mut desc = *desc;
     (desc[1], desc[13]) = (0, 0);
+    // SAFETY: 56 bytes in the description's layout.
+    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    if let Some(twin) = written_twin(address, &d) {
+        return made_copy(twin.get()).is_some();
+    }
     let existing = PLACED_TEXTURES
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -2656,11 +2854,21 @@ pub(crate) fn placed_made(address: u64, desc: &[u32; 14]) -> bool {
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
 pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
-    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     // Words 1 and 13 are padding (stack bytes in the title's records).
     let mut desc = *desc;
     (desc[1], desc[13]) = (0, 0);
     let desc = &desc;
+    // SAFETY: 56 bytes in the description's layout.
+    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    if d.dimension == BUFFER {
+        return None;
+    }
+    if let Some(twin) = written_twin(address, &d) {
+        let raw = twin.get();
+        log_placed_twin(address, &d, &resource(raw).desc);
+        return resource(raw).host().is_some().then_some(raw);
+    }
+    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     // A resource whose memory's host texture was replaced since (one with
     // more uses) is made again, sharing the new one.
     // shortcut: the old one is kept (view heap slots made from it view its
@@ -2669,11 +2877,6 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         && current(r as This)
     {
         return Some(r as This);
-    }
-    // SAFETY: 56 bytes in the description's layout.
-    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
-    if d.dimension == BUFFER {
-        return None;
     }
     let mut out = std::ptr::null();
     let made = create_at_address(
@@ -3991,6 +4194,9 @@ mod tests {
         if crate::host::host().is_none() {
             return; // no host GPU here
         }
+        // Synchronous, and not while another test runs Flight-1: what it
+        // checks right after submitting assumes the submission has run.
+        let _mode = crate::host::ModeGuard::new(false, false);
         let null = std::ptr::null();
         let iid = &RESOURCE_IIDS[0];
         const COPY_DEST: u32 = 0x400;
@@ -4063,6 +4269,9 @@ mod tests {
         if crate::host::host().is_none() {
             return; // no host GPU here
         }
+        // Synchronous, and not while another test runs Flight-1: what it
+        // checks right after submitting assumes the submission has run.
+        let _mode = crate::host::ModeGuard::new(false, false);
         let null = std::ptr::null();
         let iid = &RESOURCE_IIDS[0];
         const COPY_DEST: u32 = 0x400;
@@ -4393,5 +4602,210 @@ mod tests {
             actual, second_light,
             "sampled alias view did not reflect the latest GPU-written atlas"
         );
+    }
+
+    /// An RT+UAV texture with automatic layout (`layout == 0`, `flags = 5`)
+    /// resolves to `SW_64KB_R_X`, whereas a read-only placed view with
+    /// automatic layout (`layout == 0`, `flags = 0`) resolves to `SW_4KB_S`,
+    /// splitting their `MemoryKey`. `placed_twin_matches` bridges matching
+    /// shapes/elements/mips while rejecting mismatched ones.
+    #[test]
+    fn placed_twin_matches_automatic_layout_split() {
+        let addr = 0x10_0000;
+        let written = ResourceDesc {
+            flags: 5, // RENDER_TARGET | UNORDERED
+            ..texture(256, 128, 42, 4) // R32_UINT
+        };
+        let placed = ResourceDesc {
+            flags: 0,
+            ..texture(256, 128, 67, 4) // R9G9B9E5_SHAREDEXP
+        };
+        assert_ne!(
+            memory_key(addr, &written),
+            memory_key(addr, &placed),
+            "automatic layout splits RT+UAV and read-only views into distinct memory keys"
+        );
+        assert!(placed_twin_matches(addr, &placed, &written));
+        // Fewer mips on the placed view still matches.
+        let one_mip = ResourceDesc { mip_levels: 1, ..placed };
+        assert!(placed_twin_matches(addr, &one_mip, &written));
+        // sample_count 0 and 1 normalize to 1.
+        let zero_samples = ResourceDesc { sample_count: 0, ..placed };
+        assert!(placed_twin_matches(addr, &zero_samples, &written));
+        // Depth texture with automatic layout (SW_64KB_Z_X) vs read-only R32_FLOAT view.
+        let depth = ResourceDesc {
+            flags: DEPTH,
+            ..texture(256, 128, 40, 1) // D32_FLOAT
+        };
+        let depth_srv = ResourceDesc {
+            flags: 0,
+            ..texture(256, 128, 41, 1) // R32_FLOAT
+        };
+        assert_ne!(memory_key(addr, &depth), memory_key(addr, &depth_srv));
+        assert!(placed_twin_matches(addr, &depth_srv, &depth));
+        // UAV-only with identical mips shares the same memory key already.
+        let uav_only = ResourceDesc {
+            flags: 4, // UNORDERED
+            ..texture(256, 128, 42, 4)
+        };
+        assert_eq!(memory_key(addr, &uav_only), memory_key(addr, &placed));
+        assert!(!placed_twin_matches(addr, &placed, &uav_only));
+        // Rejections: non-automatic layout on placed view, read-only candidate,
+        // mismatched dimensions/array/samples/element size, too many mips,
+        // unknown format, or buffer.
+        assert!(!placed_twin_matches(addr, &ResourceDesc { layout: 1, ..placed }, &written));
+        assert!(!placed_twin_matches(addr, &ResourceDesc { layout: 0x105, ..placed }, &written));
+        assert!(!placed_twin_matches(addr, &placed, &ResourceDesc { flags: 0, ..written }));
+        assert!(!placed_twin_matches(addr, &ResourceDesc { width: 128, ..placed }, &written));
+        assert!(!placed_twin_matches(addr, &ResourceDesc { height: 64, ..placed }, &written));
+        assert!(!placed_twin_matches(addr, &ResourceDesc { depth_or_array_size: 2, ..placed }, &written));
+        assert!(!placed_twin_matches(addr, &ResourceDesc { sample_count: 4, ..placed }, &written));
+        assert!(!placed_twin_matches(addr, &ResourceDesc { format: 10, ..placed }, &written)); // 8B vs 4B
+        assert!(!placed_twin_matches(addr, &ResourceDesc { format: 66, ..placed }, &written)); // unknown element
+        assert!(!placed_twin_matches(addr, &ResourceDesc { mip_levels: 5, ..placed }, &written));
+        assert!(!placed_twin_matches(addr, &ResourceDesc { dimension: TEXTURE_3D, ..placed }, &written));
+        assert!(!placed_twin_matches(addr, &buffer(256), &written));
+    }
+
+    /// With `VICTORY_PLACED_TWIN=1`, `texture_at` returns the live writable
+    /// title texture at the same address (and `placed_made` reports it without
+    /// eager allocation), while with the switch off it returns a distinct
+    /// texture with a separate host copy.
+    #[cfg(windows)]
+    #[test]
+    fn placed_twin_shares_live_writable_texture_when_enabled() {
+        struct TwinGuard(Option<bool>);
+        impl TwinGuard {
+            fn set(on: bool) -> Self {
+                Self(TEST_PLACED_TWIN.replace(Some(on)))
+            }
+        }
+        impl Drop for TwinGuard {
+            fn drop(&mut self) {
+                TEST_PLACED_TWIN.set(self.0);
+            }
+        }
+
+        let Some(host_gpu) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let desc_words = |d: ResourceDesc| -> [u32; 14] {
+            let mut words = [0u32; 14];
+            // SAFETY: 56 bytes in the description's layout.
+            unsafe { words.as_mut_ptr().cast::<ResourceDesc>().write_unaligned(d) };
+            words
+        };
+
+        let null = std::ptr::null();
+        let h = heap(4 << 20);
+        let place = |offset: u64, desc: &ResourceDesc| {
+            let mut out = null;
+            assert_eq!(
+                create_placed(null, h, offset, desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut out),
+                S_OK
+            );
+            out
+        };
+
+        let written_desc = ResourceDesc {
+            flags: RENDER_TARGET | UNORDERED,
+            ..texture(64, 64, 42, 4) // R32_UINT, layout 0 -> SW_64KB_R_X
+        };
+        let placed_desc = ResourceDesc {
+            flags: 0,
+            ..texture(64, 64, 67, 1) // R9G9B9E5_SHAREDEXP, layout 0 -> SW_4KB_S
+        };
+        let placed_words = desc_words(placed_desc);
+
+        // First address: exercise switch-off vs switch-on, including switching
+        // after `PLACED_TEXTURES` already cached a separate read-only texture.
+        let written_a = place(0, &written_desc);
+        let addr_a = resource(written_a).data() as u64;
+        let host_written_a = host_copy(written_a).expect("writable host texture A");
+
+        {
+            let _off = TwinGuard::set(false);
+            assert!(!placed_made(addr_a, &placed_words));
+            let separate = texture_at(addr_a, &placed_words).expect("separate placed texture");
+            assert_ne!(separate, written_a, "switch off creates a separate placed resource");
+            let host_separate = host_copy(separate).expect("separate host texture");
+            assert!(
+                !std::sync::Arc::ptr_eq(&host_separate, &host_written_a),
+                "switch off creates a distinct host texture"
+            );
+        }
+
+        {
+            let _on = TwinGuard::set(true);
+            assert!(
+                placed_made(addr_a, &placed_words),
+                "placed_made recognizes already-materialized writable twin"
+            );
+            let shared = texture_at(addr_a, &placed_words).expect("shared placed twin");
+            assert_eq!(shared, written_a, "switch on returns the live writable texture");
+            let host_shared = host_copy(shared).expect("shared host texture");
+            assert!(
+                std::sync::Arc::ptr_eq(&host_shared, &host_written_a),
+                "switch on shares the writable texture's host copy"
+            );
+
+            // Second address: verify `placed_made` does not eagerly allocate
+            // the twin's host texture before first use.
+            let written_b = place(1 << 20, &written_desc);
+            let addr_b = resource(written_b).data() as u64;
+            assert!(made(resource(written_b)).is_none());
+            assert!(
+                !placed_made(addr_b, &placed_words),
+                "unmaterialized writable twin is not reported as made"
+            );
+            assert!(
+                made(resource(written_b)).is_none(),
+                "placed_made must not materialize the writable twin"
+            );
+            let shared_b = texture_at(addr_b, &placed_words).expect("shared twin B");
+            assert_eq!(shared_b, written_b);
+            assert!(made(resource(written_b)).is_some());
+            assert!(placed_made(addr_b, &placed_words));
+
+            // Verify the host creates an R9G9B9E5 SRV directly on the R32_UINT twin.
+            let mut srv_words = [0u32; 16];
+            // format 67 (R9G9B9E5_SHAREDEXP), dim 4 (TEX2D), default mapping 0x1688, mip 0, count 1
+            srv_words[..6].copy_from_slice(&[67, 4, 0x1688, 0, 0, 1]);
+            (srv_words[10], srv_words[11]) = (addr_b as u32, (addr_b >> 32) as u32);
+            let view = crate::descriptor::View::Placed(false, placed_words, srv_words);
+            let resolved = crate::descriptor::host::placed_texture(&view).expect("resolved placed view");
+            assert!(matches!(resolved, crate::descriptor::View::Shader(r, _) if r == written_b as usize));
+            let heap = crate::descriptor::host::HostHeap::new(false, 8).expect("host view heap");
+            // SAFETY: slot 0 of our live host view heap.
+            let cpu = unsafe { heap.heap.GetCPUDescriptorHandleForHeapStart() };
+            let kept = crate::descriptor::host::make_view(&view, cpu).expect("R9G9B9E5 SRV on R32_UINT twin");
+            let host_b = host_copy(written_b).expect("host copy B");
+            assert_eq!(
+                windows::core::Interface::as_raw(&kept),
+                windows::core::Interface::as_raw(&host_b.texture),
+                "placed SRV views the writable twin's host texture directly"
+            );
+            drop((kept, host_b, heap));
+
+            // Releasing `written_b` unregisters it so `written_twin` and
+            // `placed_made` no longer match it, and `texture_at` creates a
+            // fresh read-only placed resource instead of returning it.
+            assert_eq!(slot::<Release>(written_b, 0x10)(written_b), 0);
+            assert!(written_twin(addr_b, &placed_desc).is_none());
+            assert!(!placed_made(addr_b, &placed_words));
+            let after_release = texture_at(addr_b, &placed_words).expect("fallback after release");
+            assert_eq!(resource(after_release).desc.format, 67);
+            assert_eq!(resource(after_release).desc.flags, 0);
+        }
+
+        // Also verify the real env-var switch path matches `VICTORY_PLACED_TWIN`.
+        assert_eq!(placed_twin_enabled(), crate::switch::on("VICTORY_PLACED_TWIN"));
+
+        // SAFETY: plain device health check.
+        assert!(unsafe { host_gpu.device.GetDeviceRemovedReason() }.is_ok());
+
+        drop(host_written_a);
+        assert_eq!(slot::<Release>(written_a, 0x10)(written_a), 0);
+        assert_eq!(slot::<Release>(h, 0x10)(h), 0);
     }
 }

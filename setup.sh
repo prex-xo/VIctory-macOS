@@ -69,12 +69,12 @@ say "building the x86_64 libraries Wine needs (about 10 minutes the first time)"
 tools/macos/build-deps.sh "$ALIAS/target/deps-x86"
 
 # 5. CrossOver Wine, with the patches in tools/macos/patches and SDL2 for game
-# controllers. A Wine built before a patch was added or changed, or before
-# SDL2, gets only its server, ntdll and HID bus rebuilt.
+# controllers. The builder decides whether it can update just the affected
+# libraries or needs to reinstall the full release.
 if [[ -x $WINE_DIR/bin/wine && -f $WINE_DIR/.victory-patches && -f $WINE_DIR/.victory-patch-paths && "$(cat "$WINE_DIR/.victory-patches" 2> /dev/null)" == "$(tools/macos/build-crossover-wine.sh --stamp)" ]]; then
   say "Wine already built"
 elif [[ -x $WINE_DIR/bin/wine ]]; then
-  say "rebuilding Wine's server, ntdll and HID bus (a few minutes)"
+  say "updating the installed CrossOver Wine"
   DEPS="$ALIAS/target/deps-x86" tools/macos/build-crossover-wine.sh
 else
   say "building CrossOver Wine (about 30 minutes the first time)"

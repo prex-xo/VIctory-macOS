@@ -255,6 +255,71 @@ fn cut_for_clamp(this: This) -> bool {
     true
 }
 
+/// With `VICTORY_GPU_TIMING_CUTS` (diagnostics builds), before a draw or
+/// dispatch (`compute`) is recorded: the title list goes on in a new host
+/// list where a pipeline that gets lists of its own starts or ends, as
+/// [`cut_for_clamp`] moves it on, so that such a timed host list runs one
+/// pipeline and its wall time is that pipeline's (`crate::timing_cuts`).
+/// The command is counted in the list it goes into. Without a new host
+/// list it stays in the current one, under that list's first pipeline.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn cut_for_timing(this: This, compute: bool) {
+    if !crate::host::timing_cuts_on() {
+        return;
+    }
+    let Some(current) = host_list(this) else {
+        return;
+    };
+    // SAFETY: the title passes one of our lists.
+    let list = unsafe { &*this.cast::<List>() };
+    let pipeline = list
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .title_pipeline();
+    let key = crate::timing_cuts::key(pipeline, compute, crate::host::timing_cut_own(pipeline));
+    let mut into = current;
+    if current.timed_cuts(key)
+        && let Some(next) = next_segment(this)
+    {
+        let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.flush_hdr_probe(current);
+        current.close();
+        state.cut(next);
+        into = next;
+    }
+    into.timed_command(key, || crate::pipeline::shaders_of(pipeline as This));
+}
+
+#[cfg(all(windows, not(feature = "diagnostics")))]
+fn cut_for_timing(_: This, _: bool) {}
+
+/// After [`cut_for_clamp`] moved an indirect execution that
+/// [`cut_for_timing`] had counted in `previous` on to a new host list: it
+/// is counted there instead.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn retime_after_clamp_cut(this: This, previous: Option<&crate::host::HostList>, compute: bool) {
+    let (Some(previous), Some(current)) = (previous, host_list(this)) else {
+        return;
+    };
+    if !crate::host::timing_cuts_on() || std::ptr::eq(previous, current) {
+        return;
+    }
+    // SAFETY: the title passes one of our lists.
+    let list = unsafe { &*this.cast::<List>() };
+    let pipeline = list
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .title_pipeline();
+    previous.timed_command_moved();
+    let key = crate::timing_cuts::key(pipeline, compute, crate::host::timing_cut_own(pipeline));
+    current.timed_command(key, || crate::pipeline::shaders_of(pipeline as This));
+}
+
+#[cfg(all(windows, not(feature = "diagnostics")))]
+fn retime_after_clamp_cut(_: This, _: Option<&crate::host::HostList>, _: bool) {}
+
 /// Moves a title list's recording on to its next host list (made, or one
 /// it held since an earlier recording, reset then): that host list.
 #[cfg(windows)]
@@ -1312,7 +1377,13 @@ extern "system" fn clear_dsv(
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const DEPTH_WRITE: u32 = 0x10;
-        ensure_state(list, record.resource, DEPTH_WRITE);
+        // Without rectangles a clear of every plane needs none of the older
+        // contents (`crate::twin`: a newer twin need not be copied in).
+        if rects.is_none() {
+            crate::twin::overwriting(flags, || ensure_state(list, record.resource, DEPTH_WRITE));
+        } else {
+            ensure_state(list, record.resource, DEPTH_WRITE);
+        }
         let dsv = host.dsv(&texture, record.depth_desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
@@ -1747,17 +1818,20 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
+        super::cut_for_timing(this, false);
         with_state(this, |list, s| {
             s.draw(list, vertices, instances, first, first_instance)
         });
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
+        super::cut_for_timing(this, true);
         with_state(this, |list, s| s.dispatch(list, x, y, z));
     }
     /// `DispatchX` with its console flags (`State::dispatch_x`).
     pub(super) fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
         super::count_dispatch();
+        super::cut_for_timing(this, true);
         with_state(this, |list, s| s.dispatch_x(list, x, y, z, flags));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
@@ -1768,6 +1842,7 @@ mod state {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
         }
+        super::cut_for_timing(this, false);
         with_state(this, |list, s| s.dispatch_mesh(list, x));
     }
     /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
@@ -1786,6 +1861,7 @@ mod state {
             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
             return;
         }
+        super::cut_for_timing(this, false);
         with_state(this, |list, s| s.dispatch_mesh(list, x));
     }
     pub(super) extern "system" fn draw_indexed(
@@ -1797,6 +1873,7 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
+        super::cut_for_timing(this, false);
         with_state(this, |list, s| {
             s.draw_indexed(list, indices, instances, first, base, first_instance)
         });
@@ -1882,12 +1959,15 @@ extern "system" fn execute_indirect(
         };
         use crate::draw::Indirect;
         let mut outcome = Indirect::NotRun;
+        cut_for_timing(this, kind == DISPATCH);
         with_state(this, |list, s| {
             outcome = s.execute_indirect(list, (kind, stride, max), address, counter, true);
         });
         if outcome == Indirect::CutFirst {
             // Clamped inline in the same host list if no new one can be had.
+            let previous = host_list(this);
             cut_for_clamp(this);
+            retime_after_clamp_cut(this, previous, kind == DISPATCH);
             with_state(this, |list, s| {
                 outcome = s.execute_indirect(list, (kind, stride, max), address, counter, false);
             });
@@ -2385,6 +2465,9 @@ mod tests {
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
+        // Synchronous, and not while another test runs Flight-1: what it
+        // checks right after submitting assumes the submission has run.
+        let _mode = crate::host::ModeGuard::new(false, false);
         let null = std::ptr::null();
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
 
@@ -2426,6 +2509,7 @@ mod tests {
             unsafe { p1.cast::<u32>().add(i as usize).write_volatile(0xA1B2_0000 + i) };
         }
         let s1 = crate::shadow::find(p1 as u64, 256).expect("upload 1 registered in shadow");
+        let r1 = s1.range();
         wait64(list, flag_addr, GREATER_EQUAL, 1, 0);
         {
             let h1 = host_list(list).expect("host list for batch 1");
@@ -2459,6 +2543,7 @@ mod tests {
             unsafe { p2.cast::<u32>().add(i as usize).write_volatile(0xC3D4_0000 + i) };
         }
         let s2 = crate::shadow::find(p2 as u64, 256).expect("upload 2 registered in shadow");
+        let r2 = s2.range();
         {
             let h2 = host_list(list).expect("host list for batch 2");
             s2.refresh(h2, p2 as u64, 256);
@@ -2492,9 +2577,12 @@ mod tests {
         // The finished batches, uploads included, are dropped on the
         // release thread, behind what other tests retired.
         crate::host::wait_for_releases();
+        // Freed, their addresses can go to a test running beside this one, so
+        // only the uploads' own copies must be gone.
+        let gone =
+            |p: *mut u8, r| crate::shadow::find(p as u64, 256).is_none_or(|s| s.range() != r);
         assert!(
-            crate::shadow::find(p1 as u64, 256).is_none()
-                && crate::shadow::find(p2 as u64, 256).is_none(),
+            gone(p1, r1) && gone(p2, r2),
             "both uploads must be unregistered and freed once held lists finish"
         );
 

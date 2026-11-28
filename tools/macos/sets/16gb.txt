@@ -1,0 +1,21 @@
+# Switches for Macs with 16 GB, as testers on 16 GB Macs ran the world in
+# #554 (an M4 MacBook Pro and an M1 Pro): host textures given up earlier,
+# shader containers kept on disk until translated, and textures viewed for
+# unordered access given up until a shader writes them. Aliasing of title
+# buffers is already off and loose windows already small on these Macs, so
+# they are not set here.
+#
+# Use it with VICTORY_SET=16gb tools/macos/victory.sh run ... A variable
+# already set in the environment wins over its line here. One NAME=value a
+# line; lines starting with # are skipped.
+
+# Store rewriting and fault tracking, which world runs on main need (README).
+VICTORY_PATCH_MASKED=all
+VICTORY_FAULT_TRACKING=1
+# World loads from a 16 GB Mac outlast the title's hang watchdog (#135).
+VICTORY_NO_HANG_WATCHDOG=1
+# Give host textures up below 15 % free memory, until 20 % is free.
+VICTORY_RAM_LOW=0.15
+VICTORY_RAM_FREE=0.20
+VICTORY_EVICT_HEAP_UAV=1
+VICTORY_SPILL_SHADERS=1
