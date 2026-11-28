@@ -49,6 +49,12 @@
 //! (counted on that edge, at the end of the block it leaves: [`Lower::
 //! meet_leave`]), or when it ends. Along a lane's path through the acyclic
 //! `R` what it can still reach only shrinks, so it counts each site once.
+//! Where predication (`lower::predicate`) runs a block in lanes whose path
+//! is elsewhere too, only the lanes whose path is through it count there,
+//! ballot there, and count the lanes at a branch block: the others count on
+//! their own path, and counted twice, a half's `resolved` would pass its
+//! `count` (a wait to the fuse at a site it has left) or reach it while
+//! lanes are still on their way (read as absent).
 //!
 //! # A site
 //!
@@ -455,10 +461,14 @@ impl Lower<'_> {
             let Some(&m) = self.x.st.masks.get(&lo) else {
                 continue;
             };
-            let Ok(bit) = self.boolean(m, self.cur) else {
+            let Ok(mut bit) = self.boolean(m, self.cur) else {
                 continue;
             };
             let c = self.cur;
+            // Predicated, only the lanes the block's code is for.
+            if let Some(active) = self.pred_active(b) {
+                bit = self.s.m.bin(c, Bin::And, bit, active);
+            }
             let i32t = self.s.t.i32;
             let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
             let r = self
@@ -521,10 +531,11 @@ impl Lower<'_> {
         self.meet_fence(c);
         let i32t = self.s.t.i32;
         let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-        let yes = self.s.m.bool(true);
+        let branch = self.meet.as_ref().expect("laid out").regions[r].branch;
+        let here = self.lanes_here(branch);
         let ballot = self
             .s
-            .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[yes]);
+            .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[here]);
         self.s.flags |= flags::WAVE_OPS;
         let lanes = self.s.m.extract(c, ballot, 0);
         let n = self.unary_bits(c, 31, lanes);
@@ -568,6 +579,9 @@ impl Lower<'_> {
         }
         let c = self.cur;
         let (zero, one) = (self.s.m.i32(0), self.s.m.i32(1));
+        // Predicated, only the lanes whose path is through `b` count here.
+        let here = self.lanes_here(b);
+        let one = self.s.m.select(c, here, one, zero);
         let adds: Vec<(u32, V)> = match exit {
             LaneExit::Branch { when, .. } => {
                 let cond = self.boolean(when, c)?;
@@ -594,6 +608,16 @@ impl Lower<'_> {
             self.s.m.atomic(c, Rmw::Add, p, by);
         }
         Ok(())
+    }
+
+    /// The lanes IR block `b`'s code is for: every lane running it, or,
+    /// predicated (`lower::predicate`), those whose path is through it (the
+    /// others run it too, as nothing).
+    fn lanes_here(&mut self, b: usize) -> V {
+        match self.pred_active(b) {
+            Some(active) => active,
+            None => self.s.m.bool(true),
+        }
     }
 
     /// What each half of this lane's console wave gives as `own` at the
@@ -666,9 +690,12 @@ impl Lower<'_> {
         let p = self.meet_word(after, w + 1, true);
         let theirs = self.s.m.load(after, p);
         let theirs = self.s.m.select(after, got, theirs, missing);
-        // This half's lanes here are done with the site.
+        // This half's lanes here are done with the site (predicated, those
+        // whose path is through the block).
         let p = self.meet_word(after, w + 2, false);
-        self.s.m.atomic(after, Rmw::Add, p, one);
+        let here = self.lanes_here(self.cur_ir);
+        let here = self.s.m.select(after, here, one, zero);
+        self.s.m.atomic(after, Rmw::Add, p, here);
         self.cur = after;
         let f = self.relabelled_flat();
         let k5 = self.s.m.i32(5);

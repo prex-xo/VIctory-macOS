@@ -1130,7 +1130,11 @@ impl Lanes {
                 "dstorage: reads held for a Submit start"
             );
         }
-        commands.append(&mut lane.unsubmitted);
+        // Late release only applies to commands the queue already submitted.
+        // New page reads can still point to pages the title has not picked.
+        if by != By::Late {
+            commands.append(&mut lane.unsubmitted);
+        }
         let hold_page_reads = by == By::Auto && hold_delay() > std::time::Duration::ZERO;
         for command in commands {
             let hold = hold_page_reads
@@ -2731,13 +2735,18 @@ mod tests {
         l.release_held(Duration::from_secs(3600));
         assert_eq!(l.lanes[&0].held.len(), 2);
         assert!(l.start().is_none());
-        // The Submit never came: they start anyway.
+        // A second page read queued for the next Submit may still name
+        // the wrong pages. Only the batch that auto-submitted can start.
+        read(&mut l, 0, PAGE_DESTINATION, 32);
         l.release_held(Duration::ZERO);
         assert!(l.lanes[&0].held.is_empty());
         let paged = l.start().unwrap();
-        assert_eq!(paged.request.options, PAGE_DESTINATION);
+        assert_eq!(paged.request.destination_size, 16);
         l.finish(&paged, Ok(()));
         assert!(l.lanes[&0].statuses.is_empty());
+        assert!(l.start().is_none());
+        l.submit(0);
+        assert_eq!(l.start().unwrap().request.destination_size, 32);
     }
 
     #[test]

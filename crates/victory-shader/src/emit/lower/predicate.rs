@@ -244,6 +244,17 @@ impl PredicatePlan {
                         &needs,
                         &plan,
                     )
+                    // A guard nested in the body that skips to the same join
+                    // (`if (a) { if (b) { .. } }`) cannot be a skip guard of
+                    // its own, the join being this one's, so what it guards
+                    // stays out of step. Where that needs to be in step and
+                    // the whole region can be laid out flat instead (shape
+                    // 3), that is done.
+                    && !(guards_to_join(&eff_exits, body, join, &needs)
+                        && match_sese_diamond(
+                            p, &eff_exits, d, taken, not_taken, join, &rpo, &needs, &plan,
+                        )
+                        .is_some())
                 {
                     plan.exits.insert(d, FlatExit::SkipGuard { body });
                     plan.skip_bodies.insert(body, d);
@@ -355,6 +366,47 @@ impl PredicatePlan {
                             barriers::in_step_with(p, st, &eff_exits, &plan.uniform_branches);
                         changed = true;
                         break;
+                    }
+                }
+            }
+
+            if !changed && host_wave32 {
+                // Shape 6: a loop every lane ends together but for a break
+                // lanes take one by one: the break predicated away, the
+                // lanes that broke kept inactive to the loop's own end.
+                let wanted = (0..n).any(|b| needs[b] && !plan.step[b]);
+                'shape6: for &h in &order {
+                    if !wanted || plan.dead_blocks.contains(&h) || plan.in_diamond.contains(&h) {
+                        continue;
+                    }
+                    let Some(two) = two_exits(&eff_exits, h, &rpo, &plan) else {
+                        continue;
+                    };
+                    for (breaking, _) in two.leaving {
+                        let Some(lp) =
+                            match_break_loop(p, st, &eff_exits, &rpo, &plan, &two, breaking)
+                        else {
+                            continue;
+                        };
+                        // Only where the loop is then in step, and the
+                        // block after it.
+                        let mut exits = eff_exits.clone();
+                        exits[lp.breaking] = LaneExit::Jump(lp.stay);
+                        let step = barriers::in_step_with(p, st, &exits, &plan.uniform_branches);
+                        if !(lp.body.iter().all(|&b| step[b]) && step[lp.exit]) {
+                            continue;
+                        }
+                        plan.exits
+                            .insert(lp.breaking, FlatExit::EarlyOut { cont: lp.stay });
+                        plan.early_conts.insert(lp.stay, lp.breaking);
+                        plan.skipped_edges.insert((lp.breaking, lp.exit));
+                        plan.lockstep_headers.insert(h, lp.latch);
+                        plan.lockstep_exits.insert(lp.exit, h);
+                        plan.in_lockstep_loop.extend(lp.body);
+                        eff_exits = exits;
+                        plan.step = step;
+                        changed = true;
+                        break 'shape6;
                     }
                 }
             }
@@ -682,6 +734,56 @@ fn match_skip_guard(
     Some(body)
 }
 
+/// Whether a block reached from `body` before `join` branches one way to
+/// `join` itself, with a block that needs to be in step (`needs`) on its
+/// other way: a guard nested in a skip guard's body, skipping to the same
+/// join, around such a block.
+fn guards_to_join(exits: &[LaneExit], body: usize, join: usize, needs: &[bool]) -> bool {
+    // Whether a block reached from `from` before `join` needs to be in step.
+    let needed = |from: usize| {
+        let mut seen = Set::default();
+        let mut stack = vec![from];
+        while let Some(b) = stack.pop() {
+            if b == join || !seen.insert(b) {
+                continue;
+            }
+            if needs[b] {
+                return true;
+            }
+            match exits[b] {
+                LaneExit::Jump(t) => stack.push(t),
+                LaneExit::Branch {
+                    taken, not_taken, ..
+                } => stack.extend([taken, not_taken]),
+                LaneExit::End | LaneExit::Indirect => {}
+            }
+        }
+        false
+    };
+    let mut seen = Set::default();
+    let mut stack = vec![body];
+    while let Some(b) = stack.pop() {
+        if b == join || !seen.insert(b) {
+            continue;
+        }
+        match exits[b] {
+            LaneExit::Jump(t) => stack.push(t),
+            LaneExit::Branch {
+                taken, not_taken, ..
+            } => {
+                if taken == join && not_taken != join && needed(not_taken)
+                    || not_taken == join && taken != join && needed(taken)
+                {
+                    return true;
+                }
+                stack.extend([taken, not_taken]);
+            }
+            LaneExit::End | LaneExit::Indirect => {}
+        }
+    }
+    false
+}
+
 #[allow(clippy::too_many_arguments)]
 fn match_sese_diamond(
     p: &Program,
@@ -930,6 +1032,24 @@ fn match_lockstep_loop(
     Some((latch, exit, stay_when_true, body))
 }
 
+/// Whether a block outside the loop `body` reads one of `values` (the
+/// scalars the body writes), in an instruction or a phi.
+fn read_outside(p: &Program, plan: &PredicatePlan, body: &Set<usize>, values: &Set<Value>) -> bool {
+    !values.is_empty()
+        && p.blocks.iter().enumerate().any(|(b, block)| {
+            !body.contains(&b)
+                && !plan.dead_blocks.contains(&b)
+                && (block
+                    .phis
+                    .iter()
+                    .any(|phi| phi.args.iter().any(|v| values.contains(v)))
+                    || block
+                        .insts
+                        .iter()
+                        .any(|i| i.reads.iter().any(|(_, v)| values.contains(v))))
+        })
+}
+
 /// A while-shaped loop [`match_lockstep_while_loop`] found.
 struct WhileLoop {
     /// The block jumping back to the header, unconditionally.
@@ -1086,6 +1206,268 @@ fn match_lockstep_while_loop(
         exit,
         stay_when_true,
         body,
+    })
+}
+
+/// A loop [`match_break_loop`] found.
+struct BreakLoop {
+    /// The block whose branch lanes leave the loop by, one by one.
+    breaking: usize,
+    /// Its successor inside the loop, and the one outside.
+    stay: usize,
+    exit: usize,
+    /// The block jumping (or branching) back to the header.
+    latch: usize,
+    body: Set<usize>,
+}
+
+/// A loop two edges leave ([`two_exits`]).
+struct TwoExits {
+    header: usize,
+    /// The block jumping (or branching) back to the header.
+    latch: usize,
+    body: Set<usize>,
+    /// The two edges, each (from, to).
+    leaving: [(usize, usize); 2],
+}
+
+/// The loop of header `h`, if it has one latch, is entered only at `h`
+/// from blocks in step, holds no cycle of its own and nothing predicated
+/// yet, and exactly two edges leave it.
+fn two_exits(
+    exits: &[LaneExit],
+    h: usize,
+    rpo: &[usize],
+    plan: &PredicatePlan,
+) -> Option<TwoExits> {
+    let preds = eff_preds(exits, &plan.dead_blocks, h);
+    let (back, out): (Vec<usize>, Vec<usize>) = preds.into_iter().partition(|&q| rpo[q] >= rpo[h]);
+    let [latch] = back[..] else {
+        return None;
+    };
+    if out.is_empty()
+        || !out.iter().all(|&q| plan.step[q])
+        || plan.lockstep_headers.contains_key(&h)
+    {
+        return None;
+    }
+    // The natural loop body, by reverse DFS from `latch` stopping at `h`.
+    let mut body = Set::default();
+    body.insert(h);
+    let mut stack = vec![latch];
+    while let Some(b) = stack.pop() {
+        if b == h || !body.insert(b) {
+            continue;
+        }
+        if body.len() > MAX_LOCKSTEP_LOOP_BLOCKS {
+            return None;
+        }
+        for q in eff_preds(exits, &plan.dead_blocks, b) {
+            if !body.contains(&q) {
+                if rpo[q] < rpo[h] {
+                    return None; // side entry into loop body
+                }
+                stack.push(q);
+            }
+        }
+    }
+    if body.iter().any(|b| {
+        plan.in_diamond.contains(b)
+            || plan.in_lockstep_loop.contains(b)
+            || plan.dead_blocks.contains(b)
+            || plan.exits.contains_key(b)
+            || plan.early_conts.contains_key(b)
+    }) {
+        return None;
+    }
+    // Two edges leave the body: the break's and the loop's own end's. No
+    // cycle inside the body but the latch's.
+    let mut leaving = Vec::new();
+    for &b in &body {
+        let succs: Vec<usize> = match exits[b] {
+            LaneExit::Jump(t) => vec![t],
+            LaneExit::Branch {
+                taken, not_taken, ..
+            } => vec![taken, not_taken],
+            LaneExit::End | LaneExit::Indirect => return None,
+        };
+        for t in succs {
+            if !body.contains(&t) {
+                leaving.push((b, t));
+            } else if rpo[t] <= rpo[b] && !(b == latch && t == h) {
+                return None; // nested cycle inside loop
+            }
+        }
+    }
+    let [e0, e1] = leaving[..] else {
+        return None;
+    };
+    Some(TwoExits {
+        header: h,
+        latch,
+        body,
+        leaving: [e0, e1],
+    })
+}
+
+/// A loop with two exits to one block `exit`: a branch lanes leave by one
+/// by one (a `break`: `breaking -> exit`), and the loop's own end, taken
+/// by every lane left (`ending -> exit`, directly or through one block of
+/// its own). The break is predicated away like an early-out: the lanes that
+/// break stay in the loop, inactive, to its own end, and reach `exit` with
+/// the others. Every vector write is guarded by the lanes still active, so
+/// a lane that broke holds at `exit` what it held when it broke: what the
+/// edge it would have taken carries.
+///
+/// The caller checks that the loop's own end is then one every lane of the
+/// group takes together ([`barriers::in_step_with`]).
+fn match_break_loop(
+    p: &Program,
+    st: &Structured,
+    exits: &[LaneExit],
+    rpo: &[usize],
+    plan: &PredicatePlan,
+    lp: &TwoExits,
+    breaking: usize,
+) -> Option<BreakLoop> {
+    let TwoExits {
+        header: h,
+        latch,
+        ref body,
+        leaving: [(b0, t0), (b1, t1)],
+    } = *lp;
+    let (exit, (ending, after)) = if b0 == breaking {
+        (t0, (b1, t1))
+    } else if b1 == breaking {
+        (t1, (b0, t0))
+    } else {
+        return None;
+    };
+    if ending == breaking {
+        return None;
+    }
+    let LaneExit::Branch {
+        taken, not_taken, ..
+    } = exits[breaking]
+    else {
+        return None;
+    };
+    let stay = if taken == exit { not_taken } else { taken };
+    if !body.contains(&stay) || eff_preds(exits, &plan.dead_blocks, stay) != [breaking] {
+        return None;
+    }
+    // `stay` dominates the latch and the loop's own end: a lane there came
+    // past the break in that pass, so the lanes active there (each block's
+    // are its immediate dominator's, or fewer) are among those that stayed.
+    let below_stay = |mut b: usize| loop {
+        if b == stay {
+            break true;
+        }
+        let up = plan.idom.get(b).copied().unwrap_or(usize::MAX);
+        if b == h || up == b || up == usize::MAX {
+            break false;
+        }
+        b = up;
+    };
+    if !below_stay(latch) || !below_stay(ending) {
+        return None;
+    }
+    // The loop's own end reaches `exit` directly, or through one block
+    // only it enters.
+    let mut exit_preds = eff_preds(exits, &plan.dead_blocks, exit);
+    exit_preds.sort_unstable();
+    let through = if after == exit {
+        ending
+    } else {
+        if exits[after] != LaneExit::Jump(exit)
+            || eff_preds(exits, &plan.dead_blocks, after) != [ending]
+            || !p.blocks[after].phis.is_empty()
+            || plan.exits.contains_key(&after)
+            || plan.in_diamond.contains(&after)
+            || plan.skip_joins.contains_key(&after)
+            || plan.diamond_joins.contains_key(&after)
+            || plan.lockstep_exits.contains_key(&after)
+        {
+            return None;
+        }
+        after
+    };
+    let mut want = vec![breaking, through];
+    want.sort_unstable();
+    if exit_preds != want
+        || rpo[exit] <= rpo[h]
+        || plan.lockstep_exits.contains_key(&exit)
+        || plan.diamond_joins.contains_key(&exit)
+        || plan.skip_joins.contains_key(&exit)
+        || plan.skip_bodies.contains_key(&exit)
+        || plan.early_conts.contains_key(&exit)
+    {
+        return None;
+    }
+    // A lane that broke keeps its vector registers, each write being
+    // guarded by the lanes still active. It keeps nothing else the loop
+    // makes: so none of that may be seen past the loop.
+    //
+    // No lane mask is joined at `exit` (a mask is a function of what each
+    // edge carries, and the lanes that broke would read the other edge's),
+    // and none written in the loop is read after it (a compare there is made
+    // again in every pass, of scalars that change).
+    let is_mask = |v: &Value| st.masks.contains_key(v) || st.highs.contains_key(v);
+    let is_mask_reg =
+        |r: Reg| matches!(r, Reg::S(k) if [EXEC, EXEC + 1, VCC, VCC + 1].contains(&k));
+    if p.blocks[exit]
+        .phis
+        .iter()
+        .any(|phi| is_mask(&phi.value) || is_mask_reg(phi.reg))
+    {
+        return None;
+    }
+    // No scalar the loop writes is read after it, as for
+    // `match_lockstep_loop`: the console wave leaves once its every lane
+    // broke, and here it runs the loop to its own end. The block the loop's
+    // own end leaves through is run by the lanes that never broke, as on
+    // the console: it may read them.
+    let mut inside = body.clone();
+    inside.insert(through);
+    let mut written: Set<Value> = Set::default();
+    for &b in &inside {
+        let block = &p.blocks[b];
+        written.extend(
+            block
+                .phis
+                .iter()
+                .filter(|phi| matches!(phi.reg, Reg::S(_) | Reg::Scc) || is_mask(&phi.value))
+                .map(|phi| phi.value),
+        );
+        for inst in &block.insts {
+            // Scalar code runs whatever lanes are active: no scalar effect
+            // may be in a pass the console wave does not make.
+            let name = inst.name();
+            if name.starts_with("s_store")
+                || name.starts_with("s_atomic")
+                || name.starts_with("s_buffer_store")
+                || name.starts_with("s_buffer_atomic")
+                || name.starts_with("s_sendmsg")
+            {
+                return None;
+            }
+            written.extend(
+                inst.writes
+                    .iter()
+                    .filter(|(r, v)| matches!(r, Reg::S(_) | Reg::Scc) || is_mask(v))
+                    .map(|w| w.1),
+            );
+        }
+    }
+    if read_outside(p, plan, &inside, &written) {
+        return None;
+    }
+    Some(BreakLoop {
+        breaking,
+        stay,
+        exit,
+        latch,
+        body: body.clone(),
     })
 }
 

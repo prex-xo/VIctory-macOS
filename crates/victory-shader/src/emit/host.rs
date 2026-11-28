@@ -860,12 +860,7 @@ impl Host {
             queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
             queue.Signal(&fence, 1).map_err(err)?;
-            while fence.GetCompletedValue() < 1 {
-                if let Err(e) = dev.GetDeviceRemovedReason() {
-                    return Err(format!("device removed: {}", err(e)));
-                }
-                std::thread::yield_now();
-            }
+            wait_done(dev, &fence)?;
             let mut p = std::ptr::null_mut();
             readback.Map(0, None, Some(&mut p)).map_err(err)?;
             let bits = p.cast::<u32>().read();
@@ -943,6 +938,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         atomic_locks: false,
         atomic_lock_rounds: false,
         atomic_umax: false,
+        racy_minmax: false,
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
@@ -1406,15 +1402,7 @@ impl Host {
             queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
             queue.Signal(&fence, 1).map_err(err)?;
-            while fence.GetCompletedValue() < 1 {
-                if dev.GetDeviceRemovedReason().is_err() {
-                    return Err(format!(
-                        "device removed: {}",
-                        err(dev.GetDeviceRemovedReason().unwrap_err())
-                    ));
-                }
-                std::thread::yield_now();
-            }
+            wait_done(dev, &fence)?;
             if let Err(e) = dev.GetDeviceRemovedReason() {
                 return Err(format!("device removed: {}", err(e)));
             }
@@ -2177,12 +2165,7 @@ impl Host {
             queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
             queue.Signal(&fence, 1).map_err(err)?;
-            while fence.GetCompletedValue() < 1 {
-                if let Err(e) = dev.GetDeviceRemovedReason() {
-                    return Err(format!("device removed: {}", err(e)));
-                }
-                std::thread::yield_now();
-            }
+            wait_done(dev, &fence)?;
             let mut out = Vec::new();
             for (_, size, n, rb) in &uavs {
                 let mut p = std::ptr::null_mut();
@@ -2210,6 +2193,34 @@ impl Host {
             Ok(out)
         }
     }
+}
+
+/// How long a test's GPU work may take before it counts as never done.
+const GPU_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Waits until `fence` reaches 1: an error if the device is removed or the
+/// work is not done by [`GPU_DEADLINE`] (D3DMetal makes a pipeline Metal
+/// refuses a no-op whose work never completes, as a mesh pipeline over
+/// 32 KiB of outputs: the test then fails instead of hanging).
+#[cfg(windows)]
+fn wait_done(dev: &ID3D12Device, fence: &ID3D12Fence) -> Result<(), String> {
+    let start = std::time::Instant::now();
+    // SAFETY: plain queries on live objects.
+    unsafe {
+        while fence.GetCompletedValue() < 1 {
+            if let Err(e) = dev.GetDeviceRemovedReason() {
+                return Err(format!("device removed: {e}"));
+            }
+            if start.elapsed() > GPU_DEADLINE {
+                return Err(format!(
+                    "the GPU did not finish in {} s: a pipeline the host refused (made a no-op)?",
+                    GPU_DEADLINE.as_secs()
+                ));
+            }
+            std::thread::yield_now();
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

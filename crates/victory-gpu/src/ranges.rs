@@ -10,6 +10,76 @@ use std::fmt;
 
 use smallvec::SmallVec;
 
+/// Maximum gap between adjacent heap buffer views of the same host copy that
+/// are coalesced into one refresh sub-interval (256 KiB, 4 × 64 KiB pages).
+/// Larger gaps are kept disjoint so sparse endpoint views on large buffers
+/// never flatten into one envelope across untouched or unmapped holes.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub(crate) const MERGE_GAP_BYTES: u64 = 256 * 1024;
+
+/// Maximum number of disjoint sub-intervals kept per `(host copy, uav)` pair.
+/// When exceeded, the two adjacent intervals separated by the smallest gap are
+/// merged first so the widest holes always stay excluded.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub(crate) const MAX_INTERVALS_PER_COPY: usize = 16;
+
+/// Parses `VICTORY_DISJOINT_SPANS` (opt-in, off by default; `"1"` keeps >256 KiB
+/// gaps disjoint instead of collapsing to a single `(min, max)` envelope).
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub(crate) fn disjoint_spans_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+/// Whether disjoint heap buffer refresh sub-intervals are enabled
+/// (`VICTORY_DISJOINT_SPANS=1`, off by default).
+#[cfg(windows)]
+pub(crate) fn disjoint_spans_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        disjoint_spans_value(std::env::var_os("VICTORY_DISJOINT_SPANS").as_deref())
+    })
+}
+
+/// Coalesces an ascending sequence of half-open `[from, to)` intervals whose
+/// gaps are within `gap_threshold`, capping the output to `max_intervals` by
+/// merging the smallest adjacent gaps first.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub(crate) fn coalesce_intervals(
+    sorted: impl Iterator<Item = (u64, u64)>,
+    gap_threshold: u64,
+    max_intervals: usize,
+) -> Vec<(u64, u64)> {
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for (from, to) in sorted {
+        if from >= to {
+            continue;
+        }
+        if let Some(last) = out.last_mut()
+            && from <= last.1.saturating_add(gap_threshold)
+        {
+            last.1 = last.1.max(to);
+            continue;
+        }
+        out.push((from, to));
+    }
+    let cap = max_intervals.max(1);
+    while out.len() > cap {
+        let mut best_i = 0usize;
+        let mut best_gap = u64::MAX;
+        for i in 0..out.len() - 1 {
+            let gap = out[i + 1].0.saturating_sub(out[i].1);
+            if gap < best_gap {
+                best_gap = gap;
+                best_i = i;
+            }
+        }
+        let next_to = out[best_i + 1].1;
+        out[best_i].1 = out[best_i].1.max(next_to);
+        out.remove(best_i + 1);
+    }
+    out
+}
+
 /// Byte ranges `[from, to)`, in order and apart: ranges that touch or
 /// overlap are one. Most host copies need one range, stored inline.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -364,5 +434,89 @@ mod tests {
             }
             assert_eq!(rebuilt, bits, "step {step}");
         }
+    }
+
+    #[test]
+    fn coalesce_intervals_skips_large_hole_and_respects_gap_and_cap() {
+        use super::{
+            MAX_INTERVALS_PER_COPY, MERGE_GAP_BYTES, coalesce_intervals, disjoint_spans_value,
+        };
+        use std::ffi::OsStr;
+
+        assert!(!disjoint_spans_value(None));
+        assert!(disjoint_spans_value(Some(OsStr::new("1"))));
+        assert!(!disjoint_spans_value(Some(OsStr::new("0"))));
+
+        const BASE: u64 = 0x1000_0000;
+        const SIZE: u64 = 160 << 20; // 160 MiB
+        let spans = coalesce_intervals(
+            [
+                (BASE, BASE + 4096),
+                (BASE + 32 * 1024, BASE + 36 * 1024),
+                (BASE + SIZE - 4096, BASE + SIZE),
+            ]
+            .into_iter(),
+            MERGE_GAP_BYTES,
+            MAX_INTERVALS_PER_COPY,
+        );
+        assert_eq!(
+            spans,
+            vec![(BASE, BASE + 36 * 1024), (BASE + SIZE - 4096, BASE + SIZE)]
+        );
+
+        // Single-envelope fallback (`VICTORY_DISJOINT_SPANS=0` mode).
+        let envelope = coalesce_intervals(
+            [
+                (BASE, BASE + 4096),
+                (BASE + 32 * 1024, BASE + 36 * 1024),
+                (BASE + SIZE - 4096, BASE + SIZE),
+            ]
+            .into_iter(),
+            u64::MAX,
+            1,
+        );
+        assert_eq!(envelope, vec![(BASE, BASE + SIZE)]);
+
+        // Exact threshold boundary: `MERGE_GAP_BYTES` merges, `MERGE_GAP_BYTES + 1` splits.
+        let at_limit = coalesce_intervals(
+            [(0, 4096), (4096 + MERGE_GAP_BYTES, 8192 + MERGE_GAP_BYTES)].into_iter(),
+            MERGE_GAP_BYTES,
+            MAX_INTERVALS_PER_COPY,
+        );
+        assert_eq!(at_limit, vec![(0, 8192 + MERGE_GAP_BYTES)]);
+
+        let over_limit = coalesce_intervals(
+            [
+                (0, 4096),
+                (4096 + MERGE_GAP_BYTES + 1, 8192 + MERGE_GAP_BYTES + 1),
+            ]
+            .into_iter(),
+            MERGE_GAP_BYTES,
+            MAX_INTERVALS_PER_COPY,
+        );
+        assert_eq!(
+            over_limit,
+            vec![
+                (0, 4096),
+                (4096 + MERGE_GAP_BYTES + 1, 8192 + MERGE_GAP_BYTES + 1),
+            ]
+        );
+
+        // When capped to 2 intervals, the smallest adjacent gap is merged while
+        // the giant 100 MiB hole stays excluded.
+        let capped = coalesce_intervals(
+            [
+                (0, 4096),
+                (1 << 20, (1 << 20) + 4096),
+                (101 << 20, (101 << 20) + 4096),
+            ]
+            .into_iter(),
+            MERGE_GAP_BYTES,
+            2,
+        );
+        assert_eq!(
+            capped,
+            vec![(0, (1 << 20) + 4096), (101 << 20, (101 << 20) + 4096)]
+        );
     }
 }

@@ -353,6 +353,66 @@ fn trampoline(
     Some(c)
 }
 
+/// The folder of site lists used when no variable names one: set by the
+/// runner (`<cache_dir>/wide`) when fault tracking runs under Rosetta,
+/// where an unsplit store in any title image can stop the process.
+static DEFAULT_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Looks for site lists in `dir` (`<dir>/<first 16 hex digits of the
+/// image's hash>.txt`, as `cargo xtask wide-stores --cache` writes them)
+/// for images no variable gives a list for, and warns about an image with
+/// none.
+pub fn use_default_dir(dir: std::path::PathBuf) {
+    let _ = DEFAULT_DIR.set(dir);
+}
+
+/// The site list for the image whose original hash is `hash` (hex): in
+/// `VICTORY_PATCH_WIDE_DIR` if set, else in the default folder
+/// ([`use_default_dir`]). `None` if neither has one; with the default
+/// folder in use, that is said, with the command that makes it: an M1 Max
+/// froze in the world on the BVH builder DLL's first 256-bit store into a
+/// guarded page, with only the executable's list given.
+pub fn list_for(hash: &str, image: &std::path::Path) -> Option<std::path::PathBuf> {
+    let asked = std::env::var_os("VICTORY_PATCH_WIDE_DIR").filter(|v| !v.is_empty());
+    let asked = asked.as_deref().map(std::path::Path::new);
+    let missing = match find_list(hash, asked, DEFAULT_DIR.get().map(|d| d.as_path())) {
+        Ok(list) => return Some(list),
+        Err(missing) => missing?,
+    };
+    let dir = missing.parent()?;
+    let cache = dir.parent().unwrap_or(dir);
+    tracing::warn!(
+        image = %image.display(),
+        missing = %missing.display(),
+        "no list of this image's 256-bit stores: with fault tracking on, Rosetta stops \
+         if one of them writes across into a guarded page. Make the lists of every cached \
+         image with `cargo xtask wide-stores --cache <{}, as a Mac path>`",
+        cache.display()
+    );
+    None
+}
+
+/// [`list_for`] without the environment: the list of the image with hash
+/// `hash` in `asked` (`VICTORY_PATCH_WIDE_DIR`) if given, else in `default`.
+/// `Err(Some(path))`: the default folder has no list where it would be.
+fn find_list(
+    hash: &str,
+    asked: Option<&std::path::Path>,
+    default: Option<&std::path::Path>,
+) -> Result<std::path::PathBuf, Option<std::path::PathBuf>> {
+    let name = format!("{}.txt", &hash[..hash.len().min(16)]);
+    if let Some(dir) = asked {
+        let list = dir.join(name);
+        return if list.is_file() { Ok(list) } else { Err(None) };
+    }
+    let list = default.ok_or(None)?.join(name);
+    if list.is_file() {
+        Ok(list)
+    } else {
+        Err(Some(list))
+    }
+}
+
 #[cfg(windows)]
 pub fn patch(base: u64, list: &std::path::Path) -> (usize, usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
@@ -519,6 +579,40 @@ pub fn patch(base: u64, list: &std::path::Path) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A list is the image's first 16 hex digits plus `.txt`; the folder a
+    /// variable names wins over the cache's, and only a list missing from
+    /// the cache's folder is named for the warning.
+    #[test]
+    fn each_image_finds_its_list_by_hash() {
+        let asked = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let hash = "2d3fbea0ca5034e7aa55";
+        std::fs::write(
+            cache.path().join("2d3fbea0ca5034e7.txt"),
+            "14b2f 10 s4 c6\n",
+        )
+        .unwrap();
+        let (a, c) = (Some(asked.path()), Some(cache.path()));
+        assert_eq!(
+            find_list(hash, None, c),
+            Ok(cache.path().join("2d3fbea0ca5034e7.txt"))
+        );
+        // A folder named by the variable is the only one looked in.
+        assert_eq!(find_list(hash, a, c), Err(None));
+        std::fs::write(asked.path().join("2d3fbea0ca5034e7.txt"), "").unwrap();
+        assert_eq!(
+            find_list(hash, a, c),
+            Ok(asked.path().join("2d3fbea0ca5034e7.txt"))
+        );
+        let other = "45d7eba75627fecc0011";
+        assert_eq!(
+            find_list(other, None, c),
+            Err(Some(cache.path().join("45d7eba75627fecc.txt")))
+        );
+        // No folder at all: nothing to find, nothing to say.
+        assert_eq!(find_list(hash, None, None), Err(None));
+    }
 
     #[test]
     fn a_list_whose_piece_sizes_overflow_is_rejected() {

@@ -322,11 +322,65 @@ fn start_held_timer() {
     TIMER.call_once(|| {
         let _ = std::thread::Builder::new()
             .name("victory held work".into())
-            .spawn(|| loop {
-                std::thread::sleep(std::time::Duration::from_millis(2));
-                pump_held_if_free(Why::Timer);
+            .spawn(|| {
+                let tick = HeldTick::new();
+                loop {
+                    tick.wait();
+                    pump_held_if_free(Why::Timer);
+                }
             });
     });
+}
+
+/// The held-work timer's 2 ms tick. `std::thread::sleep` makes a waitable
+/// timer for every call and closes it after (on Windows, a high-resolution
+/// one): under Wine each of those is a wineserver round trip, about 500 a
+/// second, beside the title's own server calls (a profile of the prison
+/// cell on a 24 GB M5 Pro saw `NtCreateTimer` and `NtClose` from this loop
+/// at ~11 ms a frame). One periodic timer made once and waited on does the
+/// same with one wait a tick; `sleep` stays where it cannot be made.
+#[cfg(windows)]
+struct HeldTick(Option<windows_sys::Win32::Foundation::HANDLE>);
+
+#[cfg(windows)]
+impl HeldTick {
+    const MS: u32 = 2;
+
+    fn new() -> Self {
+        use windows_sys::Win32::System::Threading::{
+            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW, SetWaitableTimer, TIMER_ALL_ACCESS,
+        };
+        let make = |flags| {
+            // SAFETY: no name, default security; the handle is checked.
+            let t = unsafe { CreateWaitableTimerExW(std::ptr::null(), std::ptr::null(), flags, TIMER_ALL_ACCESS) };
+            (!t.is_null()).then_some(t)
+        };
+        let Some(timer) = make(CREATE_WAITABLE_TIMER_HIGH_RESOLUTION).or_else(|| make(0)) else {
+            return Self(None);
+        };
+        // First due in one tick (relative, in 100 ns units), then every tick.
+        let due: i64 = -(i64::from(Self::MS) * 10_000);
+        // SAFETY: a timer handle of ours; no completion routine.
+        let set = unsafe { SetWaitableTimer(timer, &due, Self::MS as i32, None, std::ptr::null(), 0) };
+        if set == 0 {
+            // SAFETY: the handle made above, closed once.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(timer) };
+            return Self(None);
+        }
+        Self(Some(timer))
+    }
+
+    fn wait(&self) {
+        use windows_sys::Win32::System::Threading::{INFINITE, WaitForSingleObject};
+        match self.0 {
+            // SAFETY: the periodic timer made in `new`, never closed (the
+            // thread runs for the process's life).
+            Some(timer) => unsafe {
+                WaitForSingleObject(timer, INFINITE);
+            },
+            None => std::thread::sleep(std::time::Duration::from_millis(u64::from(Self::MS))),
+        }
+    }
 }
 
 /// Pumps all currently ready segments/signals from `HELD` while holding
@@ -794,8 +848,15 @@ pub(crate) fn pump_held_if_free(why: Why) {
 // shortcut: a safety valve against a wait nothing satisfies (a write we do
 // not make), which would hold the title's fences until its 30 s watchdog
 // ends the run; counted and logged, remove once runs show it never fires.
-#[cfg(windows)]
+#[cfg(all(windows, not(test)))]
 const VALVE: std::time::Duration = std::time::Duration::from_secs(10);
+/// Tests share one process and its held work, and a suite under load stalls
+/// a test's thread (or the held-work timer, on a lock a slow submission of
+/// another test holds) past ten seconds: a held segment then ran without the
+/// wait that orders it after another queue's write. No test depends on the
+/// valve (the `hold` tests give `force_older_than` a limit of their own).
+#[cfg(all(windows, test))]
+const VALVE: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// Whether ready segments across queues and chained bottom-of-pipe waits are
 /// coalesced into one host submission (`VICTORY_COALESCE_PIECES`, on by default
@@ -1367,6 +1428,14 @@ extern "system" fn present(
     }
     #[cfg(windows)]
     crate::hdr_probe::on_present(frame);
+    // Draws on the host so far, for the frame recorder's world frames
+    // (`VICTORY_RECORD_AT=w<n>`) and the benchmark: read where
+    // `capture::presented` reads them, so that both tell the same frame as
+    // the world's first.
+    #[cfg(windows)]
+    let drawn = crate::draw::drawn();
+    #[cfg(not(windows))]
+    let drawn = 0;
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         crate::capture::presented(frame);
@@ -1410,17 +1479,18 @@ extern "system" fn present(
             crate::resource::host_transition(*o, s);
         }
         crate::resource::host_transition(resource, state);
+        // The frame recorder's end of a frame (`VICTORY_RECORD`): the picture
+        // is in `state` again.
+        crate::replay::record::present(frame, Some((&texture, state)), drawn);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
         #[cfg(not(feature = "diagnostics"))]
         let _ = shown;
+    } else {
+        crate::replay::record::present(frame, None, drawn);
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
-    #[cfg(windows)]
-    let drawn = crate::draw::drawn();
-    #[cfg(not(windows))]
-    let drawn = 0;
     crate::bench::on_present(drawn, black_frame);
     S_OK
 }

@@ -302,11 +302,15 @@ static COPY_KINDS: [std::sync::atomic::AtomicU64; 6] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 /// Of the preparing's list steps (`HostList::run_deferred`), since the last
-/// frame-rate line, by [`STEP_NAMES`]: how many ran, and the microseconds
-/// of the kinds timed (one clock read each: the many refreshes and slots
-/// are only counted, their time is the rest of the phase).
+/// frame-rate line, by [`STEP_NAMES`]: how many ran, and their nanoseconds
+/// (each step timed alone, but the many refreshes and slots one in
+/// [`SAMPLE_EVERY`], their time scaled up from those).
 static STEPS: [std::sync::atomic::AtomicU64; 2 * STEP_NAMES.len()] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 2 * STEP_NAMES.len()];
+
+/// One refresh or slot in this many is timed (two clock reads each; a world
+/// frame has ~75,000 of them).
+const SAMPLE_EVERY: u64 = 16;
 
 const STEP_NAMES: [&str; 8] = [
     "title copies and fills",
@@ -319,8 +323,20 @@ const STEP_NAMES: [&str; 8] = [
     "page tables (title memory)",
 ];
 
+/// Whether list-step kind `kind` is one of the many sampled ones.
+fn sampled(kind: usize) -> bool {
+    kind == 1 || kind == 2
+}
+
 /// Notes a list step when dropped (each arm of `run_deferred` ends its own way).
 struct StepTimer(usize, Option<std::time::Instant>);
+
+impl StepTimer {
+    fn start(kind: usize) -> Self {
+        let timed = !sampled(kind) || STEPS[kind].load(Ordering::Relaxed).is_multiple_of(SAMPLE_EVERY);
+        Self(kind, timed.then(std::time::Instant::now))
+    }
+}
 
 impl Drop for StepTimer {
     fn drop(&mut self) {
@@ -328,15 +344,19 @@ impl Drop for StepTimer {
     }
 }
 
-/// Counts a list step of kind `kind`, and its microseconds if timed.
+/// Counts a list step of kind `kind`, and its nanoseconds if timed (in
+/// nanoseconds: most steps take less than a microsecond, which a count in
+/// microseconds rounded to nothing).
 fn note_step(kind: usize, started: Option<std::time::Instant>) {
     STEPS[kind].fetch_add(1, Ordering::Relaxed);
     if let Some(started) = started {
-        STEPS[STEP_NAMES.len() + kind].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let ns = started.elapsed().as_nanos() as u64;
+        let ns = if sampled(kind) { ns * SAMPLE_EVERY } else { ns };
+        STEPS[STEP_NAMES.len() + kind].fetch_add(ns, Ordering::Relaxed);
     }
 }
 
-/// Of the preparing, by phase ([`Phase`]), in microseconds since the last
+/// Of the preparing, by phase ([`Phase`]), in nanoseconds since the last
 /// frame-rate line: where a submission's CPU time goes, so a frame report
 /// says which part to make faster. Read with [`take_phases`].
 static PREP_PHASES: [std::sync::atomic::AtomicU64; PHASE_NAMES.len()] =
@@ -383,14 +403,15 @@ impl PhaseClock {
     fn lap(&mut self, phase: Phase) {
         let now = std::time::Instant::now();
         PREP_PHASES[phase as usize]
-            .fetch_add((now - self.0).as_micros() as u64, Ordering::Relaxed);
+            .fetch_add((now - self.0).as_nanos() as u64, Ordering::Relaxed);
         self.0 = now;
     }
 }
 
-/// The phases' microseconds since the last call, by [`PHASE_NAMES`].
+/// The phases' microseconds since the last call, by [`PHASE_NAMES`]
+/// (counted in nanoseconds: a phase between two lists is often less than one).
 fn take_phases() -> [u64; PHASE_NAMES.len()] {
-    PREP_PHASES.each_ref().map(|c| c.swap(0, Ordering::Relaxed))
+    PREP_PHASES.each_ref().map(|c| c.swap(0, Ordering::Relaxed) / 1000)
 }
 
 /// What the runtime does when the host GPU fails for good: report it like a
@@ -497,6 +518,9 @@ fn create() -> windows::core::Result<Host> {
             crate::tdr::log();
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        // The frame recorder (`VICTORY_RECORD`, docs/replay.md), before
+        // anything is made with the device: it sees what the device makes.
+        crate::replay::record::from_env(&device);
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
         let depth_bounds_supported = device
             .CheckFeatureSupport(
@@ -1994,8 +2018,20 @@ pub(crate) fn markers() -> bool {
 }
 
 /// Names a host object for the device-removed report, which names the
-/// allocations a page fault hit (only with device-removed data on).
+/// allocations a page fault hit (only with device-removed data on), and for
+/// the frame recorder (`VICTORY_RECORD`), whose reports name pipelines and
+/// resources by it.
 pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
+    if crate::replay::record::on() {
+        let text = text();
+        crate::replay::record::name(object, &text);
+        return name_it(object, || text);
+    }
+    name_it(object, text);
+}
+
+/// [`name`] for the device-removed report alone.
+fn name_it(object: &impl Interface, text: impl FnOnce() -> String) {
     if dred_on()
         && let Ok(object) = object.cast::<ID3D12Object>()
     {
@@ -2417,6 +2453,21 @@ impl MeshSupport {
 /// VIctory could not initialise its D3D12 host.
 pub fn host_mesh_support() -> Option<MeshSupport> {
     Some(host()?.mesh_support())
+}
+
+impl Host {
+    /// The driver's version, as the system counts it (0: not known).
+    ///
+    /// Warming keeps this beside the pipelines it made, so that a new driver
+    /// makes them stale. Under Wine the number the adapter gives would
+    /// describe the Windows-side stub rather than the D3DMetal build that
+    /// actually compiles the pipelines, so it answers "not known" until there
+    /// is something here worth comparing. That costs a stale warm cache
+    /// across a Game Porting Toolkit update: clear the folder by hand after
+    /// one.
+    pub(crate) fn driver(&self) -> i64 {
+        0
+    }
 }
 
 impl HostGpu for Host {
@@ -2904,7 +2955,9 @@ impl Host {
             clock.lap(Phase::Evicting);
             flight::land_ahead(flight::Early::Remake);
             clock.lap(Phase::LandingEarly);
+            let mut part = crate::resource::EvictClock(std::time::Instant::now());
             crate::descriptor::remake_unordered();
+            part.lap(crate::resource::EvictPart::Remake);
         }
         clock.lap(Phase::Evicting);
         // Descriptors the title copied into its heaps itself, before the
@@ -3984,6 +4037,7 @@ impl HostList {
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
                 if before != wanted {
+                    copy.bump_transition_gen();
                     self.changed_something();
                     Some(before)
                 } else {
@@ -4031,11 +4085,13 @@ impl HostList {
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
+                let before = o.get().last();
                 let copy = o.get_mut().again(side, writes, whole);
                 if stores {
                     o.get_mut().store();
                 }
-                if copy.is_some() || writes {
+                if copy.is_some() || o.get().last() != before {
+                    depth.bump_transition_gen();
                     self.changed_something();
                 }
                 copy
@@ -5294,7 +5350,7 @@ impl HostList {
                 Step::Heap(_) => 6,
                 Step::Memory(_) => 7,
             };
-            let _step = StepTimer(step_kind, (step_kind > 2).then(std::time::Instant::now));
+            let _step = StepTimer::start(step_kind);
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(
                 started,
@@ -5361,7 +5417,9 @@ impl HostList {
                     continue;
                 }
                 Step::Slot(viewed, index) => {
-                    crate::bindless::refresh_slot(viewed, *index, |s, a, l| batch.add(s, a, l));
+                    if batch.need_slot(viewed, *index) {
+                        crate::bindless::refresh_slot(viewed, *index, |s, a, l| batch.add(s, a, l));
+                    }
                     continue;
                 }
                 Step::Host(work) => {
@@ -5449,6 +5507,122 @@ impl std::hash::Hasher for PtrHasher {
 
 type PtrMap<V> = std::collections::HashMap<usize, V, std::hash::BuildHasherDefault<PtrHasher>>;
 
+/// Hashes a table slot's `(viewed_ptr, index)` (both words, unlike
+/// [`PtrHasher`], which keeps the last).
+#[derive(Default)]
+struct SlotHasher(u64);
+
+impl std::hash::Hasher for SlotHasher {
+    fn finish(&self) -> u64 {
+        self.0 ^ (self.0 >> 29)
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(u64::from(b));
+        }
+    }
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0.rotate_left(5) ^ i).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+    fn write_usize(&mut self, i: usize) {
+        self.write_u64(i as u64);
+    }
+    fn write_u32(&mut self, i: u32) {
+        self.write_u64(u64::from(i));
+    }
+}
+
+type SlotSet = std::collections::HashSet<(usize, u32), std::hash::BuildHasherDefault<SlotHasher>>;
+
+/// What `VICTORY_SLOT_ONCE` asks for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SlotOnce {
+    /// Every list's table slots asked (the default).
+    Off,
+    /// Asked again as before, and the asks again counted.
+    Probe,
+    /// A slot asked once per submission until a title write or copy.
+    On,
+}
+
+/// `VICTORY_SLOT_ONCE`: `1` (or `on`) or `probe`.
+///
+/// Each list asks each table slot its draws read once (`defer_slot`), and
+/// a world submission's lists ask the same slots again and again: ~52,000
+/// asks a frame, each taking the heap's lock and looking the slot up. What
+/// an ask finds changes only with a title write or copy (the heaps were
+/// synced before the lists' steps; what the title's threads write meanwhile
+/// is for later submissions, as for [`Batch`]'s other sets), so with the
+/// switch a submission asks a slot once until then.
+fn slot_once() -> SlotOnce {
+    #[cfg(test)]
+    if let Some(mode) = TEST_SLOT_ONCE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: OnceLock<SlotOnce> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        let mode = match std::env::var("VICTORY_SLOT_ONCE").ok().as_deref() {
+            Some("probe") => SlotOnce::Probe,
+            Some(v) if crate::switch::value_is_on(Some(std::ffi::OsStr::new(v))) => SlotOnce::On,
+            _ => SlotOnce::Off,
+        };
+        if mode != SlotOnce::Off {
+            tracing::info!(?mode, "a submission asks each table slot once until a title write (VICTORY_SLOT_ONCE)");
+        }
+        mode
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`slot_once`] on this test's thread.
+    static TEST_SLOT_ONCE: std::cell::Cell<Option<SlotOnce>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+mod slot_once_tests {
+    use super::{Batch, SlotOnce, TEST_SLOT_ONCE};
+
+    fn with_mode(mode: SlotOnce, test: impl FnOnce()) {
+        TEST_SLOT_ONCE.with(|m| m.set(Some(mode)));
+        test();
+        TEST_SLOT_ONCE.with(|m| m.set(None));
+    }
+
+    #[test]
+    fn a_slot_is_asked_once_until_the_title_writes_or_copies() {
+        with_mode(SlotOnce::On, || {
+            let mut batch = Batch::default();
+            let (a, b) = ((0x1000, 7), (0x1000, 8));
+            assert!(batch.need_slot_at(a));
+            assert!(batch.need_slot_at(b), "another slot of the heap");
+            assert!(!batch.need_slot_at(a), "asked again in the submission");
+            assert!(batch.need_slot_at((0x2000, 7)), "the same index of another heap");
+            batch.title_written();
+            assert!(batch.need_slot_at(a), "a title write may change what it finds");
+            assert!(!batch.need_slot_at(a));
+            // A copy into title memory no copy holds still makes every slot due.
+            let mut bytes = vec![0u8; 2 * crate::watch::PAGE];
+            batch.title_copied(bytes.as_mut_ptr() as usize, 64);
+            assert!(batch.need_slot_at(a), "a title copy may change what it finds");
+        });
+    }
+
+    #[test]
+    fn probe_and_off_ask_every_time() {
+        for mode in [SlotOnce::Probe, SlotOnce::Off] {
+            with_mode(mode, || {
+                let mut batch = Batch::default();
+                assert!(batch.need_slot_at((0x1000, 1)));
+                assert!(batch.need_slot_at((0x1000, 1)), "{mode:?} asks again");
+            });
+        }
+    }
+}
+
+/// Table slots asked again since the last frame report ([`slot_once`]).
+static SLOTS_AGAIN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 struct BatchBuffers {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, crate::ranges::Ranges)>,
     pending: PtrMap<usize>,
@@ -5457,6 +5631,7 @@ struct BatchBuffers {
     pending_extents: victory_formats::extents::Extents,
     heaps_seen: Vec<(usize, u64)>,
     memories_seen: Vec<(usize, u64)>,
+    slots_seen: SlotSet,
 }
 
 static BATCH_POOL: Mutex<Vec<BatchBuffers>> = Mutex::new(Vec::new());
@@ -5488,6 +5663,9 @@ struct Batch {
     /// Title-memory page tables (`(heap_key, shadow_generation)`) already
     /// prepared since the last title write or copy.
     memories_seen: Vec<(usize, u64)>,
+    /// Table slots (`(viewed_ptr, index)`) already asked since the last
+    /// title write or copy ([`slot_once`]).
+    slots_seen: SlotSet,
 }
 
 /// How far apart a copy's pending ranges may be and still be done as one,
@@ -5505,6 +5683,7 @@ impl Drop for Batch {
         self.pending_extents.clear();
         self.heaps_seen.clear();
         self.memories_seen.clear();
+        self.slots_seen.clear();
         if self.current.capacity() == 0
             && self.pending.capacity() == 0
             && self.heaps_seen.capacity() == 0
@@ -5522,6 +5701,7 @@ impl Drop for Batch {
                 pending_extents: std::mem::take(&mut self.pending_extents),
                 heaps_seen: std::mem::take(&mut self.heaps_seen),
                 memories_seen: std::mem::take(&mut self.memories_seen),
+                slots_seen: std::mem::take(&mut self.slots_seen),
             });
         }
     }
@@ -5542,6 +5722,7 @@ impl Batch {
             pending_extents: buffers.pending_extents,
             heaps_seen: buffers.heaps_seen,
             memories_seen: buffers.memories_seen,
+            slots_seen: buffers.slots_seen,
         }
     }
 
@@ -5570,6 +5751,26 @@ impl Batch {
         }
         true
     }
+    /// Whether table slot `index` of `viewed` is to be asked (`false`: it
+    /// was since the last title write or copy, and [`slot_once`] leaves the
+    /// ask out). Counted in [`SLOTS_AGAIN`].
+    fn need_slot(&mut self, viewed: &crate::bindless::Viewed, index: u32) -> bool {
+        self.need_slot_at((std::ptr::from_ref(viewed) as usize, index))
+    }
+
+    /// [`Batch::need_slot`] by the slot's `(viewed_ptr, index)`.
+    fn need_slot_at(&mut self, slot: (usize, u32)) -> bool {
+        let mode = slot_once();
+        if mode == SlotOnce::Off {
+            return true;
+        }
+        if self.slots_seen.insert(slot) {
+            return true;
+        }
+        SLOTS_AGAIN.fetch_add(1, Ordering::Relaxed);
+        mode == SlotOnce::Probe
+    }
+
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         // Nothing to copy: a world submission asks for every copy its heaps'
         // views and page tables reach (~9,000), a few of them written.
@@ -5619,6 +5820,7 @@ impl Batch {
         self.extents.clear();
         self.heaps_seen.clear();
         self.memories_seen.clear();
+        self.slots_seen.clear();
     }
 
     /// As [`Batch::title_written`], before a copy into the title memory
@@ -5643,6 +5845,7 @@ impl Batch {
         // pick up the post-copy bytes.
         self.heaps_seen.clear();
         self.memories_seen.clear();
+        self.slots_seen.clear();
         // Flush only pending refreshes whose ranges overlap the destination
         // window; disjoint copies stay queued so they coalesce across lists.
         // The index reaches the copies whose memory can hold the window's
@@ -6584,6 +6787,7 @@ impl Meter {
                 COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / report_frames
             });
             let dropped = crate::draw::take_dropped() as f64 / report_frames;
+            let held = crate::draw::take_held() as f64 / report_frames;
             let indirect = crate::list::take_indirect() as f64 / report_frames;
             let root_views = crate::draw::take_root_view_slots() as f64 / report_frames;
             let [records, counted] =
@@ -6597,7 +6801,8 @@ impl Meter {
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
-                 dropped {dropped:.0} without a host pipeline ({making} being made) and \
+                 dropped {dropped:.0} without a host pipeline ({making} being made; {held:.0} more \
+                 held back with the BVH builder, on purpose) and \
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame; indirect \
                  max records {records:.0}/frame ({counted:.0} under a count; clamps \
                  {hoisted:.0} hoisted, {inline:.0} inline: {anywhere:.0} after a write \
@@ -6605,6 +6810,10 @@ impl Meter {
                  inline one, {unbatched:.0} unbatched; {clamp_cuts:.1} host lists started \
                  for clamps)",
                 making = crate::pipeline::making()
+            );
+            tracing::info!(
+                "title commands per frame: {}",
+                crate::draw::kinds_line(report_frames)
             );
             crate::ray_skip::log(report_frames);
             crate::ambient_estimate::log(report_frames);
@@ -6651,6 +6860,8 @@ impl Meter {
                 .map(|(name, us)| format!("{name} {:.1}", ms(us)))
                 .collect();
             tracing::info!("host preparing per frame by phase, ms: {}", phases.join(", "));
+            #[cfg(windows)]
+            crate::resource::log_evicting(report_frames);
             {
                 let n = STEPS.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
                 let kinds = STEP_NAMES.len();
@@ -6658,17 +6869,28 @@ impl Meter {
                     .iter()
                     .enumerate()
                     .map(|(k, name)| {
-                        if k == 1 || k == 2 {
-                            format!("{name} {:.0}", n[k] as f64 / report_frames)
+                        let (count, ms) = (n[k] as f64 / report_frames, n[kinds + k] as f64 / 1e6 / report_frames);
+                        if sampled(k) {
+                            format!("{name} {count:.0} (~{ms:.1} ms)")
                         } else {
-                            format!("{name} {:.0} ({:.1} ms)", n[k] as f64 / report_frames, ms(n[kinds + k]))
+                            format!("{name} {count:.0} ({ms:.1} ms)")
                         }
                     })
                     .collect();
                 tracing::info!(
-                    "host list steps per frame (the rest of the phase is the refreshes and slots): {}",
+                    "host list steps per frame (refreshes and slots timed one in {SAMPLE_EVERY}; the rest \
+                     of the phase is the loop and the steps' bookkeeping): {}",
                     parts.join(", ")
                 );
+                let again = SLOTS_AGAIN.swap(0, Ordering::Relaxed);
+                if slot_once() != SlotOnce::Off {
+                    tracing::info!(
+                        "table slots asked again in a submission per frame (VICTORY_SLOT_ONCE {}): {:.0} of {:.0}",
+                        if slot_once() == SlotOnce::On { "leaves them out" } else { "probe" },
+                        again as f64 / report_frames,
+                        n[2] as f64 / report_frames
+                    );
+                }
             }
             #[cfg(windows)]
             crate::descriptor::log_sync(report_frames);
@@ -6737,7 +6959,6 @@ impl Meter {
                     crate::resource::SOON_FRAMES,
                 );
                 // Window caption updates leave the report counters intact.
-                let drops = crate::pipeline::take_drops();
                 crate::frame::log();
                 log_gpu_times(report_frames);
                 log_gpu_walls(report_frames);
@@ -6774,12 +6995,14 @@ impl Meter {
                         shed as f64 / 1e6
                     );
                 }
-                for (why, n) in drops.iter().take(40) {
-                    tracing::info!(
-                        "dropped {:.1}/frame without a host pipeline: {why}",
-                        *n as f64 / report_frames
-                    );
-                }
+            }
+            // By why, with `VICTORY_DROP_WHY=1` (`crate::pipeline::drop_why`).
+            #[cfg(windows)]
+            for (why, n) in crate::pipeline::take_drops().iter().take(40) {
+                tracing::info!(
+                    "dropped {:.1}/frame without a host pipeline: {why}",
+                    *n as f64 / report_frames
+                );
             }
         }
         if self.caption.is_none() {
@@ -7321,8 +7544,8 @@ fn advance_retired(done_submission: u64) {
     release_later(Box::new(ready));
 }
 
-/// Batched [`retire`] under one hold of the retired-resources lock.
-pub(crate) fn retire_all(resources: Vec<ID3D12Resource>) {
+/// Batched [`retire_any`] under one hold of the retired-resources lock.
+pub(crate) fn retire_all<T: Send + 'static>(resources: Vec<T>) {
     if resources.is_empty() {
         return;
     }
@@ -7691,6 +7914,78 @@ mod batch {
         assert_eq!(batch.flush(), PAGE, "after a title write, what changed");
         crate::shadow::unregister(p, p as u64);
         drop(copy);
+        crate::watch::tests::free(p);
+    }
+
+    /// End-to-end: `bindless::refresh` keeps >256 KiB holes disjoint through
+    /// `Batch::add` -> `Batch::flush`, refreshing only the viewed endpoint
+    /// pages and leaving the unrefreshed middle hole absent from
+    /// `Batch::current` so a later draw reading the middle still refreshes it.
+    #[test]
+    fn disjoint_bindless_spans_skip_middle_hole_in_batch_and_preserve_exact_current() {
+        const PAGES: usize = 16; // 1 MiB (> 256 KiB merge gap)
+        let p = crate::watch::tests::pool(PAGES);
+        let len = PAGES * PAGE;
+        crate::shadow::register(p, p as u64, len as u64);
+        let Some(copy) = crate::shadow::find(p as u64, len as u64) else {
+            crate::shadow::unregister(p, p as u64);
+            crate::watch::tests::free(p);
+            return; // no host GPU here
+        };
+        // Initial flush brings the copy clean and arms write-watch guards.
+        let mut init = Batch::default();
+        init.add(&copy, p, len);
+        assert_eq!(init.flush(), len);
+
+        // Dirty every page (head, middle hole, and tail).
+        for page in 0..PAGES {
+            // SAFETY: our committed pool of `PAGES` pages.
+            unsafe { ((p + page * PAGE) as *mut u8).write_volatile(0x40 + page as u8) };
+        }
+
+        let viewed = crate::bindless::Viewed::with_disjoint_spans(true, true);
+        viewed.set_buffer_slot(1, Some((&copy, p as u64, 4096, false)));
+        viewed.set_buffer_slot(2, Some((&copy, p as u64 + 32 * 1024, 4096, false)));
+        viewed.set_buffer_slot(3, Some((&copy, (p + (PAGES - 1) * PAGE) as u64, 4096, false)));
+
+        let mut batch = Batch::default();
+        crate::bindless::refresh(&viewed, |s, a, l| batch.add(s, a, l));
+        assert_eq!(
+            batch.refreshes.len(),
+            1,
+            "all disjoint spans of one Shadow stay grouped into one worker entry"
+        );
+        assert_eq!(
+            batch.refreshes[0].1.as_slice(),
+            &[
+                (p, p + 36 * 1024),
+                (p + (PAGES - 1) * PAGE, p + (PAGES - 1) * PAGE + 4096),
+            ]
+        );
+        // Only the viewed head (36 KiB) and tail (4 KiB) sub-intervals are
+        // copied; the 14 middle pages are completely skipped.
+        assert_eq!(batch.flush(), 36 * 1024 + 4096);
+        assert_eq!(copy.read_host(p as u64, 1)[0] as u8, 0x40);
+        assert_eq!(
+            copy.read_host((p + (PAGES - 1) * PAGE) as u64, 1)[0] as u8,
+            0x40 + (PAGES - 1) as u8
+        );
+
+        // A subsequent request inside the unrefreshed middle hole must NOT be
+        // skipped by `Batch::current` (exact span tracking).
+        let mid = p + 8 * PAGE;
+        assert_ne!(
+            copy.read_host(mid as u64, 1)[0] as u8,
+            0x48,
+            "middle hole was not copied yet"
+        );
+        batch.add(&copy, mid, PAGE);
+        assert_eq!(batch.flush(), PAGE, "middle hole was not marked current");
+        assert_eq!(copy.read_host(mid as u64, 1)[0] as u8, 0x48);
+
+        drop(viewed);
+        drop(copy);
+        crate::shadow::unregister(p, p as u64);
         crate::watch::tests::free(p);
     }
 

@@ -933,6 +933,10 @@ pub(crate) struct HostTexture {
     /// A heap slot views it for unordered access (`VICTORY_EVICT_HEAP_UAV`):
     /// written by the GPU once shaders write through heaps.
     heap_writable: std::sync::atomic::AtomicBool,
+    /// Eviction gave it up ([`give_up`]): its title textures make a new one
+    /// when next asked. Copies of it kept elsewhere (the heaps' cached walk,
+    /// `crate::bindless`) ask for the new one then.
+    given_up: std::sync::atomic::AtomicBool,
     /// Its uploads from title memory (`crate::texture`), made on first use.
     pub(crate) staging: std::sync::Mutex<Option<std::sync::Arc<crate::texture::Staging>>>,
     /// A depth texture's writable twin (`crate::twin`), made with its first
@@ -959,6 +963,10 @@ pub(crate) struct HostTexture {
     /// Host submissions handed to the queue when it was made
     /// (`crate::host::submissions_begun`): see [`HostTexture::fresh`].
     made_in: u64,
+    /// Monotonic counter bumped whenever any list transitions this host
+    /// texture, changes its twin routing, attaches a twin, or adds a writable
+    /// alias at its address (per-texture invalidation for `VICTORY_TABLE_MEMO`).
+    transition_gen: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(windows)]
@@ -985,6 +993,7 @@ impl HostTexture {
             host_written: false.into(),
             gpu_written: false.into(),
             heap_writable: false.into(),
+            given_up: false.into(),
             staging: std::sync::Mutex::new(None),
             twin: std::sync::OnceLock::new(),
             flags: desc.Flags.0 as u32,
@@ -995,7 +1004,20 @@ impl HostTexture {
             placement: None,
             last: [crate::queue::presented().into(), now_ms().into()],
             made_in: crate::host::submissions_begun(),
+            transition_gen: 0.into(),
         }
+    }
+
+    /// Current per-texture transition generation.
+    pub(crate) fn transition_gen(&self) -> u64 {
+        self.transition_gen
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Bumps the per-texture transition generation.
+    pub(crate) fn bump_transition_gen(&self) {
+        self.transition_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether a submission handed to the queue before it was made may
@@ -1015,6 +1037,12 @@ impl HostTexture {
     /// `state` without the bits its flags forbid (`crate::host::legal_state`).
     pub(crate) fn legal_state(&self, state: u32) -> u32 {
         crate::host::legal_for(self.flags, state)
+    }
+
+    /// Whether eviction gave it up (its title textures have another now,
+    /// or none until asked again).
+    pub(crate) fn is_given_up(&self) -> bool {
+        self.given_up.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// The title used it now: a list of the title's names it, or a shader
@@ -1517,6 +1545,13 @@ fn shared_texture(
                 d.flags |= host_desc(&r.desc).map_or(0, |h| h.flags & USES);
             }
         }
+        if d.flags & USES != 0 {
+            for r in at.get(&address).into_iter().flatten().map(|&r| resource(r as This)) {
+                if let Some(copy) = made(r) {
+                    copy.bump_transition_gen();
+                }
+            }
+        }
     }
     // shortcut: title textures of a replaced host texture keep it (placed
     // views move to the new one, `texture_at`); copies (`alias_source`)
@@ -1937,15 +1972,99 @@ pub(crate) fn evict_unused() {
         if used > BUDGET_HIGH * budget { ((used - BUDGET_LOW * budget) * 1e6) as u64 } else { 0 }
     });
     let ram = ram_over();
-    evict(frame, now_ms(), over.max(ram));
+    let mut part = EvictClock(std::time::Instant::now());
+    part.lap(EvictPart::Budget);
+    // Read through the heap since the last pass: used (a slot's read mark is
+    // reported as new only once, so its first read alone stamped it; run
+    // evict1 gave up and made again hundreds of textures a frame).
+    let read = crate::descriptor::read_textures(&crate::shadow::reads_since());
+    part.lap(EvictPart::ReadMarks);
+    let candidates = candidates();
+    part.lap(EvictPart::Candidates);
+    evict_among(&candidates, &read, frame, now_ms(), over.max(ram));
+    drop(candidates);
+    part.lap(EvictPart::GiveUp);
     empty_sparse_heap(frame);
+    part.lap(EvictPart::SparseHeap);
     // Host copies of title memory take the same memory and textures give
     // back only part of it: the idle ones go too.
     crate::shadow::release_idle(frame, ram);
+    part.lap(EvictPart::IdleCopies);
     crate::shadow::release_stale(frame);
+    part.lap(EvictPart::StaleCopies);
     if over > 0 || ram > 0 {
         crate::texback::trim_idle();
     }
+    part.lap(EvictPart::Trim);
+}
+
+#[cfg(windows)]
+/// The parts of [`evict_unused`] (and the unordered views made again after
+/// it), for the frame report's evicting line: which one the phase's time
+/// is.
+#[derive(Clone, Copy)]
+pub(crate) enum EvictPart {
+    /// The card's budget and the computer's free memory asked.
+    Budget,
+    /// The heap's read marks: which host textures shaders read.
+    ReadMarks,
+    /// The host textures that may be given up, gathered.
+    Candidates,
+    /// Those to give up chosen and given up.
+    GiveUp,
+    /// A sparse heap of textures emptied (every 30 frames).
+    SparseHeap,
+    /// Idle host copies of title memory released.
+    IdleCopies,
+    /// Stale host copies released.
+    StaleCopies,
+    /// Texture readbacks trimmed (past a budget).
+    Trim,
+    /// Unordered views left null made again (`descriptor::remake_unordered`).
+    Remake,
+}
+
+#[cfg(windows)]
+const EVICT_NAMES: [&str; 9] = [
+    "budget asked",
+    "read marks",
+    "candidates",
+    "given up",
+    "sparse heap",
+    "idle copies",
+    "stale copies",
+    "readbacks trimmed",
+    "unordered views made again",
+];
+
+#[cfg(windows)]
+/// [`EVICT_NAMES`]' nanoseconds since the last frame report.
+static EVICT_PARTS: [std::sync::atomic::AtomicU64; EVICT_NAMES.len()] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; EVICT_NAMES.len()];
+
+#[cfg(windows)]
+/// Adds each part's time to [`EVICT_PARTS`] as the next one starts.
+pub(crate) struct EvictClock(pub(crate) std::time::Instant);
+
+#[cfg(windows)]
+impl EvictClock {
+    pub(crate) fn lap(&mut self, part: EvictPart) {
+        let now = std::time::Instant::now();
+        EVICT_PARTS[part as usize].fetch_add((now - self.0).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.0 = now;
+    }
+}
+
+#[cfg(windows)]
+/// The frame report's evicting line: each part's milliseconds per frame.
+pub(crate) fn log_evicting(frames: f64) {
+    let ns = EVICT_PARTS.each_ref().map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed));
+    if ns.iter().all(|&n| n == 0) {
+        return;
+    }
+    let parts: Vec<String> =
+        EVICT_NAMES.iter().zip(ns).map(|(name, n)| format!("{name} {:.1}", n as f64 / 1e6 / frames)).collect();
+    tracing::info!("host evicting per frame by part, ms: {}", parts.join(", "));
 }
 
 /// Presented frames between two [`empty_sparse_heap`] passes.
@@ -2207,21 +2326,11 @@ fn budget_setting(value: Option<&str>) -> Option<f64> {
 #[cfg(windows)]
 pub(crate) type Owned = (std::sync::Arc<HostTexture>, Vec<usize>);
 
-/// Gives up the host textures fed from title memory that the title has
-/// not used for [`IDLE_MS`] and [`IDLE_FRAMES`] at (`frame`, `now` ms),
-/// then least recently used ones until `over` bytes are gone
-/// ([`give_up`]). Returns how many and their bytes.
-#[cfg(windows)]
-fn evict(frame: u64, now: u64, over: u64) -> (u64, u64) {
-    // Read through the heap since the last pass: used (a slot's read mark is
-    // reported as new only once, so its first read alone stamped it; run
-    // evict1 gave up and made again hundreds of textures a frame).
-    let read = crate::descriptor::read_textures(&crate::shadow::reads_since());
-    evict_among(&candidates(), &read, frame, now, over)
-}
-
-/// [`evict`] among `candidates`, with `read` (raw pointers) the host
-/// textures shaders read through the heap since the last pass.
+/// Gives up, among `candidates`, the host textures the title has not used
+/// for [`IDLE_MS`] and [`IDLE_FRAMES`] at (`frame`, `now` ms), then least
+/// recently used ones until `over` bytes are gone ([`give_up`]), with
+/// `read` (raw pointers) the host textures shaders read through the heap
+/// since the last pass. Returns how many and their bytes.
 #[cfg(windows)]
 pub(crate) fn evict_among(
     candidates: &[Owned],
@@ -2282,6 +2391,10 @@ fn choose(uses: &[(u64, u64, u64)], frame: u64, now: u64, over: u64) -> Vec<usiz
     gone
 }
 
+/// Times eviction gave host textures up ([`give_up`]).
+#[cfg(windows)]
+pub(crate) static GIVE_UPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Gives up host textures `gone` at `frame`: first every heap slot viewing
 /// one gets a null view (made again when a draw or a shader reads it), then
 /// the title textures let go of it. Lists recorded before hold it until
@@ -2307,6 +2420,14 @@ fn give_up(gone: &[Owned], frame: u64) -> (u64, u64) {
     let given = given.get_or_insert_with(Default::default);
     given.retain(|_, &mut f| frame.saturating_sub(f) <= SOON_FRAMES);
     let bytes = gone.iter().map(|(t, _)| t.bytes).sum();
+    // Before any of them can go: what the heaps' cached walk keeps of them
+    // (their trackers' bits, which a tracker made later may take) is looked
+    // at again (`crate::bindless`). Marked given up first: a walk that sees
+    // the count move sees them given up, and forgets what it kept of them.
+    for (t, _) in gone {
+        t.given_up.store(true, std::sync::atomic::Ordering::Release);
+    }
+    GIVE_UPS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     for (t, owners) in gone {
         for &r in owners.iter().filter(|r| live.contains(r)) {
             let mut h = resource(r as This).host.lock().unwrap_or_else(|e| e.into_inner());
@@ -2380,7 +2501,15 @@ fn hand_out_resource(
         let size = texture_layout(&desc).map_or(0, |t| t.size as usize);
         crate::texback::replaced(data_at, size);
         let mut map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
-        map.entry(data_at as u64).or_default().push(at);
+        let siblings = map.entry(data_at as u64).or_default();
+        if desc.flags & 0x7 != 0 {
+            for &other in siblings.iter() {
+                if let Some(copy) = made(self::resource(other as This)) {
+                    copy.bump_transition_gen();
+                }
+            }
+        }
+        siblings.push(at);
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }

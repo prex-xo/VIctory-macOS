@@ -200,7 +200,14 @@ fn clamp() -> Option<&'static Clamp> {
     static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
     CLAMP
         .get_or_init(|| match make() {
-            Ok(c) => Some(c),
+            Ok(c) => {
+                // By the name a frame replay knows it by (`VICTORY_RECORD`):
+                // `--keep-clamps` leaves its passes out by it. Named here, as
+                // the precompiled and words forms are not made through
+                // `crate::compute::pipeline`.
+                crate::host::name(&c.pso, || "victory: clamp".to_owned());
+                Some(c)
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "no argument clamp: indirect execution dropped");
                 None

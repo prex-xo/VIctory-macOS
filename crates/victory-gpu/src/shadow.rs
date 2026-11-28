@@ -1997,6 +1997,11 @@ pub(crate) fn generation() -> u64 {
 /// `BUFFERS`, `ALIASED`, or `LOOSE` (while holding that table's write lock).
 static LOOKUP_EPOCH: AtomicU64 = AtomicU64::new(1);
 
+/// Validate a pre-resolved view against the same topology as the lookup cache.
+pub(crate) fn lookup_epoch() -> u64 {
+    LOOKUP_EPOCH.load(Ordering::Acquire)
+}
+
 fn lookup_changed() {
     LOOKUP_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
@@ -2027,13 +2032,18 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    let mut map = buffers();
-    if let Some(entry) = map.remove(&(start, resource)) {
-        if entry.shadow.is_some() {
-            changed();
-        } else {
-            lookup_changed();
+    let removed = {
+        let mut map = buffers();
+        let removed = map.remove(&(start, resource));
+        match &removed {
+            Some(Entry { shadow: Some(_), .. }) => changed(),
+            Some(_) => lookup_changed(),
+            None => {}
         }
+        removed
+    };
+    if let Some(shadow) = removed.and_then(|entry| entry.shadow) {
+        crate::bindless::forget_shadow(Arc::as_ptr(&shadow) as usize);
     }
 }
 
@@ -2090,13 +2100,21 @@ pub(crate) fn register_aliased(shadow: Arc<Shadow>) {
 }
 
 pub(crate) fn unregister_aliased(start: u64) -> bool {
-    let mut map = ALIASED.write().unwrap_or_else(|e| e.into_inner());
-    let removed = map.remove(&start).is_some();
-    if removed {
-        ALIASED_COUNT.fetch_sub(1, Ordering::Release);
-        changed();
+    let removed = {
+        let mut map = ALIASED.write().unwrap_or_else(|e| e.into_inner());
+        let removed = map.remove(&start);
+        if removed.is_some() {
+            ALIASED_COUNT.fetch_sub(1, Ordering::Release);
+            changed();
+        }
+        removed
+    };
+    if let Some(shadow) = removed {
+        crate::bindless::forget_shadow(Arc::as_ptr(&shadow) as usize);
+        true
+    } else {
+        false
     }
-    removed
 }
 
 fn find_aliased(address: u64, end: u64) -> Option<Arc<Shadow>> {
@@ -2302,7 +2320,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         shadow.touch();
         return Some(shadow);
     }
-    let epoch = LOOKUP_EPOCH.load(Ordering::Acquire);
+    let epoch = lookup_epoch();
     let hit = LOOKUP_CACHE.with(|cell| {
         let mut guard = cell.borrow_mut();
         guard.as_mut().and_then(|cache| cache.get(epoch, address, end))
@@ -2428,6 +2446,21 @@ fn loose_window_size(asked: Option<bool>, rosetta: bool, total_ram: Option<u64>)
     if small { SMALL_WINDOW } else { LARGE_WINDOW }
 }
 
+/// Opt-in (`VICTORY_ALIAS_LOOSE=1`): a window of title memory outside any
+/// buffer is aliased onto its host buffer (zero copy, `crate::alias`)
+/// instead of being copied every submission, where every page of it is
+/// committed.
+///
+/// Off by default. A window is not an allocation of the title's: it is cut
+/// around whatever address a draw referenced, so nothing tells us when the
+/// title frees or reuses the memory under it, as `XMemFree` does for the
+/// buffers aliased at allocation. The remap also takes the window whole,
+/// so it claims the title's other data sharing those pages.
+fn alias_loose() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_ALIAS_LOOSE"))
+}
+
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
@@ -2472,6 +2505,31 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     }
     if !crate::texture::committed(address as *const u8, 1) {
         return None;
+    }
+    // Zero-copy instead of a copy per submission, where the whole window is
+    // committed: the remap preserves the window's contents by reading every
+    // page of it first, so one uncommitted page would fault. The check above
+    // only vouches for the address asked about.
+    if alias_loose() && crate::texture::committed(start as *const u8, len as usize) {
+        drop(map);
+        if crate::alias::alias_region(start as usize, len as usize, true) {
+            tracing::debug!(
+                start = format_args!("{start:#x}"),
+                len,
+                "loose memory aliased zero-copy"
+            );
+            return find_aliased(address, end);
+        }
+        // Refused: another window aliased over it first, or the remap failed.
+        if let Some(shadow) = find_aliased(address, end) {
+            return Some(shadow);
+        }
+        map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(shadow) =
+            enclosing_window(&map, LOOSE_SPAN.load(Ordering::Relaxed), address, end)
+        {
+            return Some(shadow.clone());
+        }
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
@@ -4381,6 +4439,14 @@ void main(uint3 id : SV_DispatchThreadID) {
         };
         let base = copy.marks.expect("tracked memory gets mark bits") as usize;
         assert_eq!(copy.mark_entry(p as u64 + PAGE as u64 + 8), Some((base as u32 + 1, 8)));
+        // Held as a submission holds it, from the copy taking the pages to
+        // their copy-back: the bitmap is shared, and another test's
+        // submission refreshes every dirty copy its page tables reach,
+        // this one too, which put the title's bytes over the shader's in
+        // page 1 between the title's writes and the copy-back. A real
+        // submission ahead lands first (`flight::before_refresh`); this one
+        // has no flight to land.
+        let quiet = host().and_then(|h| h.quiet());
         copy.update(p, len);
         copy.writing(p, len, true);
         assert_eq!(copy.before.lock().unwrap().len(), 0, "no snapshot");
@@ -4395,10 +4461,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             title(PAGE + 40).write_volatile(0x11);
             title(2 * PAGE + 50).write_volatile(0x22);
         }
-        // The shaders marked pages 0 and 1. The bitmap is shared: held as a
-        // submission holds it, or another test's copy-back (or submission)
-        // can take these bits and put the pages back after the reads below.
-        let quiet = host().and_then(|h| h.quiet());
+        // The shaders marked pages 0 and 1.
         let bits = b.data as *mut u32;
         for n in [base, base + 1] {
             // SAFETY: a dword of the mapped bitmap.

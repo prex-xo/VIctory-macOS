@@ -65,6 +65,11 @@ pub enum Atom {
     OpaquePair(Value, Value),
     /// A constant mask other than all lanes or none.
     Constant(u64),
+    /// The dispatch runs this lane: EXEC on entry in a compute program whose
+    /// dispatch may end in a part of a group ([`structure_limited`]). The
+    /// console starts only the threads the dispatch counts; the other lanes
+    /// of the last wave are there with their EXEC bit clear.
+    Dispatched,
 }
 
 /// Reduced ordered binary decision diagrams over [`Atom`]s.
@@ -452,6 +457,8 @@ pub struct Structured {
     pub bools: Bools,
     /// Every lane follows the console wave through the blocks.
     pub(crate) literal: bool,
+    /// EXEC on entry holds the lanes the dispatch runs ([`structure_limited`]).
+    pub(crate) limited: bool,
     /// The incoming lane predicates of each literal mask join.
     pub(crate) mask_inputs: Map<Key, Vec<Bool>>,
     /// SCC values computed by votes over a mask in literal mode.
@@ -526,6 +533,14 @@ pub fn killing(program: &Program) -> Result<Structured, ShaderError> {
     structure_as(program, false)
 }
 
+/// [`structure`] for a compute program whose dispatch may end in a part of
+/// a group: EXEC on entry holds the lanes the dispatch runs
+/// ([`Atom::Dispatched`]) instead of every lane, and every mask derived from
+/// it carries that.
+pub fn structure_limited(program: &Program) -> Result<Structured, ShaderError> {
+    structure_with(program, true, true)
+}
+
 /// Builds the whole-wave form with the console's EXEC at each vector use.
 pub(crate) fn split_literal(program: &Program) -> Result<Structured, ShaderError> {
     let mut l = Lanes::new(program, true)?;
@@ -535,7 +550,16 @@ pub(crate) fn split_literal(program: &Program) -> Result<Structured, ShaderError
 }
 
 fn structure_as(program: &Program, helpers: bool) -> Result<Structured, ShaderError> {
+    structure_with(program, helpers, false)
+}
+
+fn structure_with(
+    program: &Program,
+    helpers: bool,
+    limited: bool,
+) -> Result<Structured, ShaderError> {
     let mut l = Lanes::new(program, false)?;
+    l.limited = limited;
     if !helpers {
         l.kills.clear();
     }
@@ -558,6 +582,8 @@ type Key = (Value, Value);
 struct Lanes<'a> {
     p: &'a Program,
     literal: bool,
+    /// EXEC on entry holds the lanes the dispatch runs ([`structure_limited`]).
+    limited: bool,
     pair_joins: Map<Key, Vec<Key>>,
     order: Vec<usize>,
     /// Reverse-postorder index per block.
@@ -696,6 +722,7 @@ impl<'a> Lanes<'a> {
         let mut l = Lanes {
             p,
             literal,
+            limited: false,
             pair_joins: Map::default(),
             order,
             index,
@@ -803,7 +830,12 @@ impl<'a> Lanes<'a> {
             } else {
                 lo
             };
-            self.masks.insert((lo, hi), Bool::TRUE);
+            let entry = if self.limited {
+                self.b.atom(Atom::Dispatched, 0)
+            } else {
+                Bool::TRUE
+            };
+            self.masks.insert((lo, hi), entry);
             self.active.insert(lo);
         }
         let mut execs: Vec<Vec<Option<Bool>>> =
@@ -994,6 +1026,7 @@ impl<'a> Lanes<'a> {
         });
         Ok(Structured {
             literal: self.literal,
+            limited: self.limited,
             mask_inputs,
             scc_votes: self.scc_votes,
             masks: words.clone().map(|(&(lo, _), &m)| (lo, m)).collect(),
@@ -1623,6 +1656,53 @@ mod tests {
 
     /// `exp null done vm`: a pixel program's end with no color output.
     const EXP_NULL_DONE: [u32; 2] = [0xF800_1890, 0x0000_0000];
+
+    /// In the limited form EXEC on entry holds the lanes the dispatch runs:
+    /// a vector instruction under it is guarded by that, one under a mask
+    /// the program sets to all lanes is not, and one under the saved EXEC
+    /// again is.
+    #[test]
+    fn exec_on_entry_holds_the_dispatched_lanes_in_the_limited_form() {
+        let words = [
+            0x7E02_0281, // v_mov_b32 v1, 1 (EXEC on entry)
+            0xBE8C_037E, // s_mov_b32 s12, exec_lo
+            0xBEFE_03C1, // s_mov_b32 exec_lo, -1
+            0x7E04_0282, // v_mov_b32 v2, 2 (every lane)
+            0xBEFE_030C, // s_mov_b32 exec_lo, s12
+            0x7E06_0283, // v_mov_b32 v3, 3 (EXEC on entry again)
+            S_ENDPGM,
+        ];
+        let p = build(&words, false);
+        let text: Vec<String> = p.blocks[0]
+            .insts
+            .iter()
+            .map(|i| i.machine.text(false))
+            .collect();
+        assert_eq!(
+            text[..6],
+            [
+                "v_mov_b32 v1, 1",
+                "s_mov_b32 s12, exec_lo",
+                "s_mov_b32 exec_lo, -1",
+                "v_mov_b32 v2, 2",
+                "s_mov_b32 exec_lo, s12",
+                "v_mov_b32 v3, 3",
+            ]
+        );
+        let plain = structure(&p).unwrap();
+        assert_eq!(guarded(&plain), 0, "every lane runs, as EXEC says");
+        let limited = structure_limited(&p).unwrap();
+        let guards = &limited.guards[0];
+        let dispatched = |g: Option<Bool>| {
+            g.is_some_and(|g| {
+                limited.bools.node(g) == Some((Atom::Dispatched, Bool::FALSE, Bool::TRUE))
+            })
+        };
+        assert!(dispatched(guards[0]), "under EXEC on entry");
+        assert_eq!(guards[3], None, "under EXEC set to every lane");
+        assert!(dispatched(guards[5]), "under the saved EXEC");
+        assert_eq!(guarded(&limited), 2);
+    }
 
     /// A loop that leaves through `s_andn2 X, X, exec` and its SCC to a
     /// program end with no output (a pixel program that only writes

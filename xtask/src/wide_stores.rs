@@ -159,6 +159,54 @@ fn noted_target(text: &str) -> Option<u64> {
 }
 
 pub(crate) fn run(image: &Path) -> Result<()> {
+    list(image, &mut std::io::stdout().lock())
+}
+
+/// `cargo xtask wide-stores --cache <cache dir>`: the list of every image in
+/// `<cache dir>/images` (the executable's and each title DLL's) that has
+/// none yet, into `<cache dir>/wide/<the image's 16 hex digits>.txt`, where
+/// VIctory looks for them when fault tracking runs under Rosetta
+/// (`victory_loader::wide::list_for`). An image with no 256-bit store gets
+/// an empty list, so it is not looked at again.
+pub(crate) fn run_cache(cache: &Path, again: bool) -> Result<()> {
+    let images = cache.join("images");
+    let wide = cache.join("wide");
+    std::fs::create_dir_all(&wide).with_context(|| format!("creating {}", wide.display()))?;
+    let mut names: Vec<(String, std::path::PathBuf)> = std::fs::read_dir(&images)
+        .with_context(|| format!("reading {}", images.display()))?
+        .filter_map(|e| {
+            let path = e.ok()?.path();
+            let name = path.file_name()?.to_str()?;
+            let hash = name.strip_prefix("victory-image-")?.strip_suffix(".dll")?;
+            Some((hash.to_owned(), path))
+        })
+        .collect();
+    names.sort();
+    anyhow::ensure!(
+        !names.is_empty(),
+        "no victory-image-*.dll in {}",
+        images.display()
+    );
+    for (hash, image) in names {
+        let done = wide.join(format!("{hash}.txt"));
+        if done.is_file() && !again {
+            eprintln!("{hash}: kept {}", done.display());
+            continue;
+        }
+        eprintln!("{hash}: listing {}", image.display());
+        // Written whole or not at all: a list cut short would patch a part.
+        let partial = wide.join(format!("{hash}.txt.partial"));
+        let mut file = std::fs::File::create(&partial)
+            .with_context(|| format!("creating {}", partial.display()))?;
+        list(&image, &mut file)?;
+        drop(file);
+        std::fs::rename(&partial, &done)
+            .with_context(|| format!("renaming {}", partial.display()))?;
+    }
+    Ok(())
+}
+
+fn list(image: &Path, out: &mut dyn Write) -> Result<()> {
     let objdump = ["llvm-objdump", "/opt/homebrew/opt/llvm/bin/llvm-objdump"]
         .into_iter()
         .find(|o| {
@@ -384,7 +432,7 @@ pub(crate) fn run(image: &Path) -> Result<()> {
             unpatched += 1;
         }
     }
-    let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+    let mut out = std::io::BufWriter::new(out);
     let (mut last, mut listed) = (0u32, 0usize);
     for (&rva, (total, pieces)) in &sites {
         if rva < last {

@@ -1,6 +1,8 @@
 //! A dispatch counted in threads (the console's `DispatchX` with its
 //! thread-dimensions flag): the lanes past the count leave at the start
-//! ([`Lower::leave_past_the_count`]), in the programs that can.
+//! ([`Lower::leave_past_the_count`]), in the programs that can. In the
+//! others they stay, outside EXEC from the entry on
+//! ([`Lower::dispatched`]).
 
 use super::*;
 
@@ -42,6 +44,32 @@ impl Lower<'_> {
     /// their digests.
     pub(super) fn leave_past_the_count(&mut self) {
         let original = self.s.entry;
+        let runs = self.runs_at(original);
+        let (body, done) = (self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(original, Term::CondBr(runs, body, done));
+        self.s.m.terminate(done, Term::Ret);
+        self.s.entry = body;
+    }
+
+    /// Whether the dispatch runs this lane ([`crate::structure::Atom::Dispatched`]):
+    /// made once, in the entry block. In a program that cannot leave the
+    /// lanes past the count at the start (its lanes wait for each other at
+    /// group barriers, or pass values between 32-lane halves), they stay,
+    /// with EXEC on entry clear, as the console has them in its last wave:
+    /// what they do is what the program does with lanes outside EXEC.
+    pub(super) fn dispatched(&mut self) -> V {
+        if let Some(d) = self.dispatched {
+            return d;
+        }
+        let d = self.runs_at(self.s.entry);
+        self.dispatched = Some(d);
+        d
+    }
+
+    /// Whether this lane's thread is below the dispatch's count of threads
+    /// along x ([`super::super::USER_DISPATCH_THREADS_X`]; 0: every lane
+    /// runs), computed in block `original`.
+    fn runs_at(&mut self, original: usize) -> V {
         let width = self.s.threads.expect("compute thread count")[0];
         // A dword past the console's user data.
         let layout = self
@@ -75,10 +103,6 @@ impl Lower<'_> {
         let zero = self.s.m.i32(0);
         let all = self.s.m.cmp(original, pred::EQ, limit, zero);
         let inside = self.s.m.cmp(original, pred::IULT, x, limit);
-        let runs = self.s.m.bin(original, Bin::Or, all, inside);
-        let (body, done) = (self.s.m.new_block(), self.s.m.new_block());
-        self.s.m.terminate(original, Term::CondBr(runs, body, done));
-        self.s.m.terminate(done, Term::Ret);
-        self.s.entry = body;
+        self.s.m.bin(original, Bin::Or, all, inside)
     }
 }

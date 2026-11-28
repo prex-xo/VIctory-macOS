@@ -55,8 +55,16 @@
 //!   reflections when it ran. So `activate` and `resolve` can be left out
 //!   on their own.
 //!
-//! `VICTORY_RAY_SKIP=1` (or `on`, `all`): both; `resolve`: the resolves
-//! only; `activate`: the activation only (`resolve,activate` is both).
+//! - The local lights' shadow rays (`CS_RaytraceShadows_Mixed`,
+//!   `CS_TraceShadowRays_*`): traced against what the structures held,
+//!   they mark whole light tiles lit for a frame now and then. In the
+//!   cell, on an M1 Max, the picture flashed white in radial rays and
+//!   tiles 6.5 to 9.7 times per 100 frames with them, 1.6 without (all
+//!   left in the opening cutscene); the ceiling lights stay.
+//!
+//! `VICTORY_RAY_SKIP=1` (or `on`, `all`): the resolves and the activation;
+//! `resolve`, `activate` or `shadow`: that part only, and parts combine
+//! with commas (`resolve,activate,shadow` is all three).
 //! Unset, empty, `0` or `off`: nothing is left out and nothing here runs
 //! but one check of a stored value per container and per pipeline.
 
@@ -73,12 +81,18 @@ use std::sync::{Mutex, OnceLock};
 pub(crate) const RESOLVE: u8 = 1;
 /// The screen probes' ray activation.
 pub(crate) const ACTIVATE: u8 = 2;
+/// The local lights' shadow rays.
+pub(crate) const SHADOW: u8 = 4;
+/// The parts, in the order the counts below keep them.
+const PARTS: [u8; 3] = [RESOLVE, ACTIVATE, SHADOW];
 
 /// The programs' names, as their shader containers hold them (followed by
 /// a part of their own and `_Wrapped`).
-const NAMES: [(u8, &[u8]); 2] = [
+const NAMES: [(u8, &[u8]); 4] = [
     (RESOLVE, b"CS_RaytracingResolve"),
     (ACTIVATE, b"CS_ScreenProbes_ActivateRays"),
+    (SHADOW, b"CS_RaytraceShadows_Mixed"),
+    (SHADOW, b"CS_TraceShadowRays"),
 ];
 
 /// The parts `value` of `VICTORY_RAY_SKIP` turns on, and whether it was
@@ -94,6 +108,7 @@ fn parts(value: Option<&str>) -> (u8, bool) {
             "1" | "on" | "all" => RESOLVE | ACTIVATE,
             "resolve" => RESOLVE,
             "activate" => ACTIVATE,
+            "shadow" => SHADOW,
             _ => return (0, false),
         };
     }
@@ -109,7 +124,7 @@ pub(crate) fn on() -> u8 {
         if !understood {
             tracing::warn!(
                 value = value.as_deref().unwrap_or_default(),
-                "VICTORY_RAY_SKIP takes 1, resolve or activate: nothing is left out"
+                "VICTORY_RAY_SKIP takes 1, resolve, activate or shadow: nothing is left out"
             );
         }
         on
@@ -118,17 +133,19 @@ pub(crate) fn on() -> u8 {
 
 /// The line said at start when something is left out.
 fn start_line(parts: u8) -> Option<String> {
-    let what = match parts & (RESOLVE | ACTIVATE) {
-        0 => return None,
-        RESOLVE => {
-            "CS_RaytracingResolve (the shading of reflection hits, one program per material)"
-        }
-        ACTIVATE => "CS_ScreenProbes_ActivateRays (the screen probes' choice of rays)",
-        _ => {
-            "CS_RaytracingResolve (the shading of reflection hits, one program per material) \
-             and CS_ScreenProbes_ActivateRays (the screen probes' choice of rays)"
-        }
-    };
+    let what: Vec<&str> = PARTS
+        .into_iter()
+        .filter(|p| parts & p != 0)
+        .map(|p| match p {
+            RESOLVE => "CS_RaytracingResolve (the shading of reflection hits, one program per material)",
+            ACTIVATE => "CS_ScreenProbes_ActivateRays (the screen probes' choice of rays)",
+            _ => "CS_RaytraceShadows_Mixed and CS_TraceShadowRays (the local lights' shadow rays)",
+        })
+        .collect();
+    if what.is_empty() {
+        return None;
+    }
+    let what = what.join(" and ");
     Some(format!(
         "VICTORY_RAY_SKIP: in frames where the BVH builder is held back, dispatches of {what} \
          are left out (their pipelines are still made)"
@@ -155,8 +172,8 @@ fn kind_of(container: &[u8]) -> u8 {
 /// hash as logged.
 static PROGRAMS: Mutex<Option<HashMap<String, u8>>> = Mutex::new(None);
 
-/// Programs known so far, by part (resolves, activation).
-static KNOWN: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// Programs known so far, by part ([`PARTS`]).
+static KNOWN: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
 /// The title passed the shader container `container` of `stage` for the
 /// first time, `hash` as logged: remembered if a part that is on leaves
@@ -170,7 +187,7 @@ pub(crate) fn note_program(stage: &str, hash: &str, container: &[u8]) {
     if kind == 0 {
         return;
     }
-    for (i, part) in [RESOLVE, ACTIVATE].into_iter().enumerate() {
+    for (i, part) in PARTS.into_iter().enumerate() {
         if kind & part != 0 && KNOWN[i].fetch_add(1, Ordering::Relaxed) == 0 {
             tracing::info!(
                 hash,
@@ -187,10 +204,10 @@ pub(crate) fn note_program(stage: &str, hash: &str, container: &[u8]) {
 }
 
 fn name(part: u8) -> &'static str {
-    if part == ACTIVATE {
-        "CS_ScreenProbes_ActivateRays"
-    } else {
-        "CS_RaytracingResolve"
+    match part {
+        ACTIVATE => "CS_ScreenProbes_ActivateRays",
+        SHADOW => "CS_RaytraceShadows_Mixed or CS_TraceShadowRays",
+        _ => "CS_RaytracingResolve",
     }
 }
 
@@ -210,23 +227,25 @@ pub(crate) fn kind<'a>(hashes: impl Iterator<Item = &'a str>) -> u8 {
 }
 
 /// Dispatches left out since the last [`log`], by part.
-static LEFT_OUT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static LEFT_OUT: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
-/// A dispatch of a pipeline of `kind` was left out.
+/// A dispatch of a pipeline of `kind` was left out: counted with its
+/// first part.
 pub(crate) fn left_out(kind: u8) {
-    let i = usize::from(kind & RESOLVE == 0);
-    LEFT_OUT[i].fetch_add(1, Ordering::Relaxed);
+    if let Some(i) = PARTS.iter().position(|p| kind & p != 0) {
+        LEFT_OUT[i].fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// The line logged with the frame line, `left` dispatches left out over
 /// `frames` frames and `known` programs seen, by part.
-fn frame_line(left: [u64; 2], frames: f64, known: [u64; 2]) -> String {
-    let [resolve, activate] = left.map(|n| n as f64 / frames.max(1.0));
+fn frame_line(left: [u64; 3], frames: f64, known: [u64; 3]) -> String {
+    let [resolve, activate, shadow] = left.map(|n| n as f64 / frames.max(1.0));
     format!(
         "ray passes left out while the BVH builder is held back (VICTORY_RAY_SKIP): \
-         {resolve:.1} CS_RaytracingResolve and {activate:.1} CS_ScreenProbes_ActivateRays \
-         dispatches/frame; programs known {} and {}",
-        known[0], known[1]
+         {resolve:.1} CS_RaytracingResolve, {activate:.1} CS_ScreenProbes_ActivateRays and \
+         {shadow:.1} shadow-ray dispatches/frame; programs known {}, {} and {}",
+        known[0], known[1], known[2]
     )
 }
 
@@ -256,6 +275,8 @@ mod tests {
         assert_eq!(parts(Some("resolve")), (RESOLVE, true));
         assert_eq!(parts(Some(" Activate ")), (ACTIVATE, true));
         assert_eq!(parts(Some("resolve, activate")), (RESOLVE | ACTIVATE, true));
+        assert_eq!(parts(Some("shadow")), (SHADOW, true));
+        assert_eq!(parts(Some("1,shadow")), (RESOLVE | ACTIVATE | SHADOW, true));
         assert_eq!(parts(Some("yes")), (0, false));
         assert_eq!(parts(Some("resolve,x")), (0, false));
     }
@@ -287,6 +308,9 @@ mod tests {
             0
         );
         assert_eq!(kind_of(&container("CS_RaytraceVBuffer")), 0);
+        assert_eq!(kind_of(&container("CS_RaytraceShadows_Mixed_22f3acbc")), SHADOW);
+        assert_eq!(kind_of(&container("CS_TraceShadowRays_Checkerboard_c568be8a")), SHADOW);
+        assert_eq!(kind_of(&container("CS_RTDistantShadowTrace32_Tiled")), 0);
         assert_eq!(kind_of(&container("CS_RaytracingResolv")), 0);
         assert_eq!(kind_of(b""), 0);
     }
@@ -324,7 +348,9 @@ mod tests {
         );
         assert!(!start_line(RESOLVE).unwrap().contains("ActivateRays"));
         assert!(!start_line(ACTIVATE).unwrap().contains("RaytracingResolve"));
-        let line = frame_line([3_160, 10], 10.0, [278, 1]);
-        assert!(line.contains(" 316.0 CS_RaytracingResolve and 1.0 CS_ScreenProbes_ActivateRays dispatches/frame; programs known 278 and 1"), "{line}");
+        let shadow = start_line(SHADOW).unwrap();
+        assert!(shadow.contains("shadow rays") && !shadow.contains("Resolve"), "{shadow}");
+        let line = frame_line([3_160, 10, 25], 10.0, [278, 1, 2]);
+        assert!(line.contains(" 316.0 CS_RaytracingResolve, 1.0 CS_ScreenProbes_ActivateRays and 2.5 shadow-ray dispatches/frame; programs known 278, 1 and 2"), "{line}");
     }
 }

@@ -104,7 +104,7 @@ pub(crate) struct State {
     /// the list ([`State::cut`]).
     fixed: Fixed,
     /// Per-list descriptor preparation memo (`VICTORY_TABLE_MEMO`): maps a
-    /// table entry key to `(descriptor_bytes, required_epoch, read_tested_depth, seen)`.
+    /// table entry key to `(descriptor_bytes, deferred_epoch, read_tested_depth, seen)`.
     entry_memo: std::collections::HashMap<
         EntryKey,
         EntryValue,
@@ -159,7 +159,7 @@ impl std::hash::Hasher for MemoHasher {
 /// Key for per-list table-entry memoization: `(handle, kind, tested_depth_resource)`.
 type EntryKey = (u64, ResourceType, usize);
 
-/// Value stored in [`State::entry_memo`]: `(descriptor_bytes, required_epoch,
+/// Value stored in [`State::entry_memo`]: `(descriptor_bytes, deferred_epoch,
 /// read_tested_depth, seen)`.
 type EntryValue = ([u64; 4], u64, bool, Seen);
 
@@ -180,13 +180,22 @@ enum EntryMemo {
 }
 
 /// External state a memoized table entry depended on beyond the command list's
-/// epoch: nothing (buffers, constants, samplers), a title texture and its
-/// current host copy pointer, or a placed texture and its host copy pointer.
+/// `deferred_epoch`: nothing (buffers, constants, samplers), a title texture
+/// with its host copy pointer and transition generation, or a placed texture
+/// with its host copy pointer and transition generation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Seen {
     Nothing,
-    Texture(usize, usize),
-    Placed(usize, usize),
+    Texture(usize, usize, u64),
+    Placed(usize, usize, u64),
+}
+
+/// Result of checking whether a memoized texture's external state still stands.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CopyStatus {
+    Valid,
+    Transitioned,
+    Replaced,
 }
 
 fn table_memo_mode_value(value: Option<&std::ffi::OsStr>) -> u8 {
@@ -238,62 +247,93 @@ thread_local! {
     static TESTED_DEPTH: std::cell::Cell<(usize, bool)> = const { std::cell::Cell::new((0, false)) };
 }
 
-fn copy_of(r: usize) -> usize {
-    crate::resource::made_copy(r as This).map_or(0, |c| std::sync::Arc::as_ptr(&c) as usize)
+fn copy_and_gen(r: usize) -> (usize, u64) {
+    crate::resource::made_copy(r as This).map_or((0, 0), |c| {
+        (std::sync::Arc::as_ptr(&c) as usize, c.transition_gen())
+    })
 }
 
-/// Returns what a memoized table entry for `(view, kind)` depends on, or `None`
-/// if the entry must not be memoized (e.g., buffer UAVs whose write step is
-/// recorded every time, 3-channel widened SRVs that check `widened_ready`, or
-/// aliased textures whose source may be written outside this list).
-fn memo_copy(view: &View, kind: ResourceType) -> Option<Seen> {
-    let is_uav = kind == ResourceType::Uav;
+/// Returns what a memoized table entry for `(view, kind, writes)` depends on,
+/// or `None` if the entry must not be memoized (writable UAVs whose write step
+/// is recorded every time, 3-channel widened SRVs that check `widened_ready`,
+/// or aliased textures whose source may be written outside this list).
+fn memo_copy(view: &View, kind: ResourceType, writes: bool) -> Option<Seen> {
+    if kind == ResourceType::Uav && writes {
+        return None;
+    }
     if kind == ResourceType::Srv && crate::descriptor::host::three_channel_srv(view) {
         return None;
     }
-    let texture = |r: usize| -> Option<(usize, usize)> {
+    let texture = |r: usize| -> Option<(usize, usize, u64)> {
         if crate::resource::buffer_bytes(r as This).is_some() {
             None
         } else {
-            Some((r, copy_of(r)))
+            let (copy, tgen) = copy_and_gen(r);
+            Some((r, copy, tgen))
         }
     };
     let aliased = |r: usize| crate::resource::alias_source(r as This).is_some();
     match view {
-        View::Constant(..) => (!is_uav).then_some(Seen::Nothing),
+        View::Constant(..) => Some(Seen::Nothing),
         View::Sampler(..) | View::ConsoleSampler(..) => Some(Seen::Nothing),
         View::Shader(r, _) | View::Unordered(r, _, _) => match texture(*r) {
-            Some((r, copy)) => (!aliased(r)).then_some(Seen::Texture(r, copy)),
-            None => (!is_uav).then_some(Seen::Nothing),
+            Some((r, copy, tgen)) => (!aliased(r)).then_some(Seen::Texture(r, copy, tgen)),
+            None => Some(Seen::Nothing),
         },
         View::Placed(..) => match crate::descriptor::host::placed_texture(view) {
             Some(View::Shader(r, _) | View::Unordered(r, _, _)) => match texture(r) {
-                Some((r, copy)) => (!aliased(r)).then_some(Seen::Placed(r, copy)),
-                None => (!is_uav).then_some(Seen::Nothing),
+                Some((r, copy, tgen)) => (!aliased(r)).then_some(Seen::Placed(r, copy, tgen)),
+                None => Some(Seen::Nothing),
             },
             Some(_) => None,
-            None => (!is_uav).then_some(Seen::Nothing),
+            None => Some(Seen::Nothing),
         },
     }
 }
 
 /// Checks whether the external resource state observed when `handle` was
 /// memoized still stands.
-fn copy_stands(seen: Seen, handle: u64) -> bool {
+fn copy_stands(seen: Seen, handle: u64) -> CopyStatus {
     match seen {
-        Seen::Nothing => true,
-        Seen::Texture(r, copy) => crate::descriptor::view(handle).is_some_and(|view| {
-            matches!(
-                &*view,
-                View::Shader(p, _) | View::Unordered(p, _, _) if *p == r
-            ) && copy_of(r) == copy
-        }),
-        Seen::Placed(r, copy) => crate::descriptor::view(handle).is_some_and(|view| {
-            matches!(
-                crate::descriptor::host::placed_texture(&view),
-                Some(View::Shader(p, _) | View::Unordered(p, _, _)) if p == r
-            ) && copy_of(r) == copy
-        }),
+        Seen::Nothing => CopyStatus::Valid,
+        Seen::Texture(r, copy, tgen) => {
+            let matches_view = crate::descriptor::view(handle).is_some_and(|view| {
+                matches!(
+                    &*view,
+                    View::Shader(p, _) | View::Unordered(p, _, _) if *p == r
+                )
+            });
+            if !matches_view {
+                return CopyStatus::Replaced;
+            }
+            let (cur_copy, cur_gen) = copy_and_gen(r);
+            if cur_copy != copy {
+                CopyStatus::Replaced
+            } else if cur_gen != tgen {
+                CopyStatus::Transitioned
+            } else {
+                CopyStatus::Valid
+            }
+        }
+        Seen::Placed(r, copy, tgen) => {
+            let matches_view = crate::descriptor::view(handle).is_some_and(|view| {
+                matches!(
+                    crate::descriptor::host::placed_texture(&view),
+                    Some(View::Shader(p, _) | View::Unordered(p, _, _)) if p == r
+                )
+            });
+            if !matches_view {
+                return CopyStatus::Replaced;
+            }
+            let (cur_copy, cur_gen) = copy_and_gen(r);
+            if cur_copy != copy {
+                CopyStatus::Replaced
+            } else if cur_gen != tgen {
+                CopyStatus::Transitioned
+            } else {
+                CopyStatus::Valid
+            }
+        }
     }
 }
 
@@ -452,35 +492,118 @@ pub(crate) fn take_dropped() -> u64 {
 }
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
-/// Marks the last traced draw as not run on the host, counts it by why
-/// (the reason [`not_run`] gave, if its pipeline has a host one) and notes
-/// it in the list (diagnostics).
-#[cfg(feature = "diagnostics")]
+/// Dispatches of the BVH builder held back on purpose (`pipeline::builder`)
+/// since the last call. They are not missing a host pipeline, so the frame
+/// line counts them apart from [`take_dropped`].
+pub(crate) fn take_held() -> u64 {
+    HELD.swap(0, Ordering::Relaxed)
+}
+static HELD: AtomicU64 = AtomicU64::new(0);
+
+/// Counts a draw or dispatch not run on the host by why
+/// ([`crate::pipeline::drop_why`]): the reason [`not_run`] gave, if its
+/// pipeline has a host one, else why it has none. In diagnostics builds,
+/// also marks the last traced draw as not run and notes it in the list.
 fn dropped(list: &HostList, pipeline: usize, kind: &str) {
     let why = NOT_RUN.with(|w| w.replace(""));
-    if why.is_empty() || crate::pipeline::host_pipeline(pipeline as This).is_none() {
-        crate::pipeline::note_drop(pipeline as This);
-    } else {
-        crate::pipeline::note_why(format!("{kind}: {why} {}", crate::pipeline::shaders_of(pipeline as This)));
+    if crate::pipeline::drop_why() {
+        if why.is_empty() || crate::pipeline::host_pipeline(pipeline as This).is_none() {
+            crate::pipeline::note_drop(pipeline as This, kind);
+        } else {
+            crate::pipeline::note_why(format!(
+                "{kind}: {why} {}",
+                crate::pipeline::shaders_of(pipeline as This)
+            ));
+        }
     }
-    list.note_op(|| format!("DROPPED {kind} ({why}) {}", crate::pipeline::shaders_of(pipeline as This)));
-    if let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
-        last.push_str(" DROPPED");
+    #[cfg(feature = "diagnostics")]
+    {
+        list.note_op(|| format!("DROPPED {kind} ({why}) {}", crate::pipeline::shaders_of(pipeline as This)));
+        if let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
+            last.push_str(" DROPPED");
+        }
     }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = list;
 }
 
-#[cfg(feature = "diagnostics")]
 thread_local! {
     /// Why the draw or dispatch this thread last prepared cannot run.
     static NOT_RUN: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
 }
 
-/// Notes why the draw or dispatch being prepared cannot run (diagnostics).
+/// Notes why the draw or dispatch being prepared cannot run ([`dropped`]).
 fn not_run(why: &'static str) {
-    #[cfg(feature = "diagnostics")]
     NOT_RUN.with(|w| w.set(why));
-    #[cfg(not(feature = "diagnostics"))]
-    let _ = why;
+}
+
+/// The title commands counted by kind (and, for measuring only, left out
+/// with `VICTORY_SKIP_KINDS=<names>`, comma-separated): mesh dispatches,
+/// draws, indexed draws, dispatches, then the same four executed
+/// indirectly. Leaving a kind out breaks the picture; what the GPU time
+/// does without it says what that kind costs the host.
+pub(crate) const KINDS: [&str; 8] = [
+    "mesh", "draw", "indexed", "dispatch", "imesh", "idraw", "iindexed", "idispatch",
+];
+static KIND_COUNTS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// The kinds `VICTORY_SKIP_KINDS` names, as bits of [`KINDS`].
+fn skipped_kinds() -> u32 {
+    static MASK: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MASK.get_or_init(|| {
+        let value = std::env::var("VICTORY_SKIP_KINDS").unwrap_or_default();
+        let mask = value
+            .split(',')
+            .filter_map(|k| KINDS.iter().position(|n| *n == k.trim()))
+            .fold(0, |m, i| m | 1 << i);
+        if mask != 0 {
+            tracing::warn!(kinds = %value, "VICTORY_SKIP_KINDS: leaving these commands out (measuring only)");
+        }
+        mask
+    })
+}
+
+/// Counts a command of kind `i` of [`KINDS`]; whether it is left out.
+fn kind_skipped(i: usize) -> bool {
+    KIND_COUNTS[i].fetch_add(1, Ordering::Relaxed);
+    skipped_kinds() & (1 << i) != 0
+}
+
+/// Switches between compute dispatches and draws within one host list
+/// since the last frame line: D3DMetal ends the render pass for a dispatch
+/// and starts another for the next draw, so each switch from a draw to a
+/// dispatch and back stores and loads the render targets.
+static CLASS_SWITCHES: AtomicU64 = AtomicU64::new(0);
+
+std::thread_local! {
+    /// The host list this thread last recorded a command into, and whether
+    /// that command was a dispatch.
+    static LAST_CLASS: std::cell::Cell<(usize, bool)> = const { std::cell::Cell::new((0, false)) };
+}
+
+/// Notes a dispatch (`compute`) or draw recorded into `list`.
+fn note_class(list: &HostList, compute: bool) {
+    let at = list as *const HostList as usize;
+    LAST_CLASS.with(|last| {
+        let (was_at, was) = last.replace((at, compute));
+        if was_at == at && was != compute {
+            CLASS_SWITCHES.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+}
+
+/// The commands per frame by kind since the last call, over `frames`.
+pub(crate) fn kinds_line(frames: f64) -> String {
+    KINDS
+        .iter()
+        .zip(&KIND_COUNTS)
+        .map(|(n, c)| format!("{n} {:.0}", c.swap(0, Ordering::Relaxed) as f64 / frames))
+        .chain(std::iter::once(format!(
+            "dispatch/draw switches {:.0}",
+            CLASS_SWITCHES.swap(0, Ordering::Relaxed) as f64 / frames
+        )))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Dispatches run on the host so far.
@@ -1561,6 +1684,16 @@ impl State {
     /// along x is a part of one, the pipeline's form whose lanes past the
     /// count leave runs instead (`crate::pipeline::thread_limited`).
     pub(crate) fn dispatch_x(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
+        if kind_skipped(3) || crate::pipeline::left_out(self.pipeline as This) {
+            return;
+        }
+        note_class(list, true);
+        if let Some(hash) = crate::pipeline::traced_dispatch(self.pipeline as This) {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 400 {
+                tracing::info!(%hash, x, y, z, flags, frame = crate::queue::presented(), "traced dispatch");
+            }
+        }
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1571,7 +1704,7 @@ impl State {
         // (`pipeline::builder`).
         if crate::pipeline::held_back(self.pipeline as This) {
             once!("a dispatch of the BVH builder held back");
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            HELD.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "dispatch");
             return;
@@ -1594,7 +1727,6 @@ impl State {
                 "a dispatch without a host pipeline dropped"
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "dispatch");
             return;
         };
@@ -1626,7 +1758,6 @@ impl State {
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "dispatch");
             return;
         }
@@ -1897,6 +2028,10 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+        if kind_skipped(0) || crate::pipeline::left_out(self.pipeline as This) {
+            return;
+        }
+        note_class(list, false);
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = self.prepare(list, false, true)
@@ -1914,7 +2049,6 @@ impl State {
             };
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "mesh");
         }
     }
@@ -1955,24 +2089,27 @@ impl State {
                 memo_count(5);
                 (false, false)
             }
-            Some(&(_, saved_epoch, _, seen))
-                if saved_epoch
-                    != if matches!(seen, Seen::Nothing) {
-                        deferred_epoch
-                    } else {
-                        epoch
-                    } =>
-            {
+            Some(&(_, saved_deferred_epoch, _, _)) if saved_deferred_epoch != deferred_epoch => {
                 memo_count(6);
                 (false, false)
             }
             Some(&(_, _, depth_hit, seen)) => {
                 let slot_ok = ready_slot.is_none_or(|(host, index)| host.slot_ready(index, handle));
-                if slot_ok && copy_stands(seen, handle) {
-                    (true, depth_hit)
-                } else {
+                if !slot_ok {
                     memo_count(7);
                     (false, false)
+                } else {
+                    match copy_stands(seen, handle) {
+                        CopyStatus::Valid => (true, depth_hit),
+                        CopyStatus::Transitioned => {
+                            memo_count(6);
+                            (false, false)
+                        }
+                        CopyStatus::Replaced => {
+                            memo_count(7);
+                            (false, false)
+                        }
+                    }
                 }
             }
         };
@@ -1998,7 +2135,13 @@ impl State {
         }
     }
 
-    fn entry_end(&mut self, list: &HostList, memo: EntryMemo, view: Option<&View>) {
+    fn entry_end(
+        &mut self,
+        list: &HostList,
+        memo: EntryMemo,
+        view: Option<&View>,
+        writes: bool,
+    ) {
         let EntryMemo::Do {
             key,
             bytes,
@@ -2058,15 +2201,10 @@ impl State {
         if self.entry_memo.len() >= 1 << 16 {
             self.entry_memo.clear();
         }
-        match view.and_then(|v| memo_copy(v, key.1)) {
+        match view.and_then(|v| memo_copy(v, key.1, writes)) {
             Some(seen) => {
-                let required_epoch = if matches!(seen, Seen::Nothing) {
-                    list.deferred_epoch()
-                } else {
-                    list.epoch()
-                };
                 self.entry_memo
-                    .insert(key, (bytes, required_epoch, depth, seen));
+                    .insert(key, (bytes, list.deferred_epoch(), depth, seen));
             }
             None => {
                 memo_count(8);
@@ -2087,7 +2225,8 @@ impl State {
             return;
         };
         let samplers = heap.samplers();
-        let memo = if writes {
+        let uav_writes = u.kind == ResourceType::Uav && writes;
+        let memo = if !uav_writes {
             self.entry_begin(list, Some((host, index)), handle, u.kind)
         } else {
             EntryMemo::Off
@@ -2102,7 +2241,7 @@ impl State {
         if !samplers {
             list.defer_slot(&host.viewed, index);
         }
-        self.entry_end(list, memo, view.as_deref());
+        self.entry_end(list, memo, view.as_deref(), writes);
     }
 
     /// The descriptors a shader reads through tables, made from the
@@ -2131,6 +2270,9 @@ impl State {
         compute: bool,
     ) -> Vec<(u8, u32)> {
         let writes = |u: &UsedResource| -> bool {
+            if u.kind != ResourceType::Uav {
+                return false;
+            }
             if write_unknown || !table_uav_write_skip() {
                 return true;
             }
@@ -2248,7 +2390,9 @@ impl State {
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
-                    let memo = if writes(u) {
+                    let w = writes(u);
+                    let uav_writes = u.kind == ResourceType::Uav && w;
+                    let memo = if !uav_writes {
                         self.entry_begin(list, None, handle, u.kind)
                     } else {
                         EntryMemo::Off
@@ -2258,9 +2402,9 @@ impl State {
                     }
                     let view = crate::descriptor::view(handle);
                     if let Some(view) = &view {
-                        readable_entry(list, u, view, true, writes(u));
+                        readable_entry(list, u, view, true, w);
                     }
-                    self.entry_end(list, memo, view.as_deref());
+                    self.entry_end(list, memo, view.as_deref(), w);
                 }
                 made.push((slot, first * 32));
                 continue;
@@ -2501,6 +2645,10 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
+        if kind_skipped(1) || crate::pipeline::left_out(self.pipeline as This) {
+            return;
+        }
+        note_class(list, false);
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         // Rectangles: completed by the pipeline's geometry shader, else
@@ -2532,7 +2680,6 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "draw");
         }
     }
@@ -2607,6 +2754,10 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
+        if kind_skipped(2) || crate::pipeline::left_out(self.pipeline as This) {
+            return;
+        }
+        note_class(list, false);
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         let rects = self.topology == RECTANGLES && !self.completes_rectangles();
@@ -2628,7 +2779,6 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "indexed");
         }
     }
@@ -2685,7 +2835,7 @@ impl State {
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
-            crate::pipeline::note_drop(self.pipeline as This);
+            crate::pipeline::note_drop(self.pipeline as This, "indirect");
             list.note_op(|| format!("DROPPED indirect kind {kind} (skipped) {}", crate::pipeline::shaders_of(self.pipeline as This)));
             return Some(false);
         }
@@ -2693,6 +2843,28 @@ impl State {
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
+        // Counted (and left out with `VICTORY_SKIP_KINDS`) once per title
+        // call: the title list calls first with `may_cut`, again without it
+        // after a cut.
+        if may_cut {
+            let i = match kind {
+                MESH => Some(4),
+                DRAW => Some(5),
+                INDEXED => Some(6),
+                DISPATCH => Some(7),
+                _ => None,
+            };
+            if i.is_some_and(kind_skipped) || crate::pipeline::left_out(self.pipeline as This) {
+                return Some(true);
+            }
+            note_class(list, kind == DISPATCH);
+            if let Some(hash) = crate::pipeline::traced_dispatch(self.pipeline as This) {
+                static N: AtomicU64 = AtomicU64::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 400 {
+                    tracing::info!(%hash, kind, stride, max, frame = crate::queue::presented(), "traced indirect execution");
+                }
+            }
+        }
         #[cfg(feature = "diagnostics")]
         let pipeline = self.pipeline as This;
         #[cfg(feature = "diagnostics")]
@@ -2728,7 +2900,7 @@ impl State {
         }
         if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
             #[cfg(feature = "diagnostics")]
-            crate::pipeline::note_drop(self.pipeline as This);
+            crate::pipeline::note_drop(self.pipeline as This, "indirect");
             why("no host pipeline");
             return Some(false);
         }
@@ -2818,10 +2990,14 @@ impl State {
             if let Some((clamped, _)) = &inline_clamped {
                 crate::indirect::done(list, clamped);
             }
+            // Indirect calls are counted apart; their reason must not
+            // linger for the next direct drop ([`dropped`]).
+            #[cfg(not(feature = "diagnostics"))]
+            NOT_RUN.with(|w| w.set(""));
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => {
-                    crate::pipeline::note_drop(self.pipeline as This);
+                    crate::pipeline::note_drop(self.pipeline as This, "indirect");
                     list.note_op(|| format!("DROPPED indirect kind {kind} (no host pipeline) {}", crate::pipeline::shaders_of(pipeline)));
                 }
                 Some(p) => why(&format!(
@@ -6004,7 +6180,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         drop(copy);
         // A slot made from the view holds its copy: after more than a
         // thousand other views' copies, draws still find (and refresh) the
-        // copy the slot shows; rewritten, the slot lets it go.
+        // copy the slot shows; rewritten, the old copy retires after GPU work.
         let null = std::ptr::null();
         let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
         let mut heap = null;
@@ -6021,8 +6197,14 @@ void main(uint3 id : SV_DispatchThreadID) {
         let found = crate::descriptor::host::view_copy(&view(start + 100)).unwrap().0;
         assert!(shown.upgrade().is_some_and(|s| std::sync::Arc::ptr_eq(&s, &found)), "the slot's copy");
         drop(found);
-        slots.make_null(0);
-        assert!(shown.upgrade().is_none(), "released with the slot");
+        let list = host.new_list().expect("retirement submission");
+        list.close();
+        crate::host::with_bury_lag(0, || {
+            slots.make_null(0);
+            host.execute(&[&list]);
+        });
+        crate::host::wait_for_releases();
+        assert!(shown.upgrade().is_none(), "released after retirement");
     }
 
     #[test]
@@ -6524,7 +6706,7 @@ void main() {
     #[test]
     fn table_memo_skips_repeat_entries_and_verifies_zero_mismatches() {
         let Some(host) = crate::host::host() else { return };
-        let Ok(list) = host.new_list() else { return };
+        let list = host.new_list().expect("host command list");
         let p = crate::watch::tests::pool(1);
         let buf = buffer_at_address(p as u64, crate::watch::PAGE as u64);
         let tex_mem = crate::watch::tests::pool(1) as u64;
@@ -6555,19 +6737,19 @@ void main() {
             flush_memo_local();
             let prev = TESTED_DEPTH.with(|d| d.replace((tex as usize, false)));
 
-            state.table_entry(&list, &u_cbv, false, true);
+            state.table_entry(&list, &u_cbv, false, false);
             let epoch_after_cbv = list.epoch();
             let steps_after_cbv = list.deferred_steps();
-            state.table_entry(&list, &u_cbv, false, true);
+            state.table_entry(&list, &u_cbv, false, false);
             assert_eq!(list.epoch(), epoch_after_cbv);
             assert_eq!(list.deferred_steps(), steps_after_cbv);
 
-            state.table_entry(&list, &u_srv, false, true);
+            state.table_entry(&list, &u_srv, false, false);
             assert!(TESTED_DEPTH.with(std::cell::Cell::get).1, "first SRV read marks tested depth");
             let epoch_after_srv = list.epoch();
             let steps_after_srv = list.deferred_steps();
             TESTED_DEPTH.with(|d| d.set((tex as usize, false)));
-            state.table_entry(&list, &u_srv, false, true);
+            state.table_entry(&list, &u_srv, false, false);
             assert!(TESTED_DEPTH.with(std::cell::Cell::get).1, "verified SRV hit preserves tested depth");
             assert_eq!(list.epoch(), epoch_after_srv);
             assert_eq!(list.deferred_steps(), steps_after_srv);
@@ -6590,7 +6772,7 @@ void main() {
             let epoch_before = list.epoch();
             let steps_before = list.deferred_steps();
 
-            state.table_entry(&list, &u_srv, false, true);
+            state.table_entry(&list, &u_srv, false, false);
             assert!(
                 TESTED_DEPTH.with(std::cell::Cell::get).1,
                 "active skip hit must restore tested depth flag"
@@ -6605,6 +6787,8 @@ void main() {
         }
 
         list.close();
+        // SAFETY: plain device health query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok(), "host device must stay alive");
         crate::shadow::unregister(buf as usize, p as u64);
         let release = crate::object::slot::<extern "system" fn(This) -> u32>;
         assert_eq!(release(tex, 0x10)(tex), 0);
@@ -6615,7 +6799,7 @@ void main() {
     #[test]
     fn table_memo_invalidates_on_descriptor_change_epoch_bump_stores_and_reset() {
         let Some(host) = crate::host::host() else { return };
-        let Ok(list) = host.new_list() else { return };
+        let list = host.new_list().expect("host command list");
         let p = crate::watch::tests::pool(1);
         let buf = buffer_at_address(p as u64, crate::watch::PAGE as u64);
         let (heap_raw, title_heap, _heap_host) = view_heap(8);
@@ -6634,35 +6818,35 @@ void main() {
         flush_memo_local();
 
         // Initial miss + repeat hit.
-        state.table_entry(&list, &u_cbv, false, true);
-        state.table_entry(&list, &u_cbv, false, true);
+        state.table_entry(&list, &u_cbv, false, false);
+        state.table_entry(&list, &u_cbv, false, false);
         let c = local_memo_counts();
         assert_eq!((c[0], c[1], c[5]), (2, 1, 1), "first miss then hit");
 
         // (a) Descriptor bytes change at the same handle -> miss, including ABA
         // restoration back to `cbv_a`.
         crate::descriptor::create_cbv(std::ptr::null(), &cbv_b, slot0);
-        state.table_entry(&list, &u_cbv, false, true);
+        state.table_entry(&list, &u_cbv, false, false);
         let c = local_memo_counts();
         assert_eq!((c[0], c[1], c[5]), (3, 1, 2), "changed descriptor bytes miss");
-        state.table_entry(&list, &u_cbv, false, true);
+        state.table_entry(&list, &u_cbv, false, false);
         assert_eq!(local_memo_counts()[1], 2, "updated descriptor hits on repeat");
         crate::descriptor::create_cbv(std::ptr::null(), &cbv_a, slot0);
-        state.table_entry(&list, &u_cbv, false, true);
+        state.table_entry(&list, &u_cbv, false, false);
         let c = local_memo_counts();
         assert_eq!((c[0], c[1], c[5]), (5, 2, 3), "ABA descriptor restoration misses");
 
         // (b) `list.deferred_epoch()` bump (e.g., deferred copy) -> epoch miss.
         let src = [0x5Au8; 16];
         list.defer_copy(p as *mut u8, src.as_ptr(), src.len());
-        state.table_entry(&list, &u_cbv, false, true);
+        state.table_entry(&list, &u_cbv, false, false);
         let c = local_memo_counts();
         assert_eq!(c[6], 1, "deferred_epoch bump causes epoch miss");
         assert_eq!(c[1], 2, "no hit after deferred copy");
 
         // (c) Texture-only `list.epoch()` bump does NOT invalidate buffer CBVs.
         list.changed_something();
-        state.table_entry(&list, &u_cbv, false, true);
+        state.table_entry(&list, &u_cbv, false, false);
         let c = local_memo_counts();
         assert_eq!(c[1], 3, "texture-only epoch bump preserves CBV memo hit");
 
@@ -6683,13 +6867,243 @@ void main() {
 
         state.set_heaps(&[heap_raw]);
         state.set_table(false, 0, title_heap.start);
-        state.table_entry(&list, &u_cbv, false, true);
+        state.table_entry(&list, &u_cbv, false, false);
         assert_eq!(local_memo_counts()[1], 3, "post-reset call misses cleanly");
 
         list.close();
+        // SAFETY: plain device health query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok(), "host device must stay alive");
         crate::shadow::unregister(buf as usize, p as u64);
         let release = crate::object::slot::<extern "system" fn(This) -> u32>;
         assert_eq!(release(buf, 0x10)(buf), 0);
+        assert_eq!(release(heap_raw, 0x10)(heap_raw), 0);
+    }
+
+    #[test]
+    fn table_memo_hits_for_read_only_entries_and_never_skips_writable_uav() {
+        let Some(host) = crate::host::host() else { return };
+        let list = host.new_list().expect("host command list");
+        let p = crate::watch::tests::pool(1);
+        let buf = buffer_at_address(p as u64, crate::watch::PAGE as u64);
+        let tex_mem = crate::watch::tests::pool(1) as u64;
+        let tex = texture_at_address(tex_mem, &texture_words(32, 32, 28, 0x100, 0));
+        let (view_heap_raw, view_title_heap, _view_host) = view_heap(8);
+
+        // Create a shader-visible sampler heap alongside the view heap.
+        let null = std::ptr::null();
+        let sampler_heap_desc: [u32; 8] = [1, 8, 1, 0, 0, 0, 0, 0];
+        let mut sampler_heap_raw = null;
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(
+            crate::descriptor::create_heap(null, sampler_heap_desc.as_ptr().cast(), &iid, &mut sampler_heap_raw),
+            S_OK
+        );
+        let sampler_title_heap = crate::descriptor::heap(sampler_heap_raw);
+
+        let slot_cbv = view_title_heap.start;
+        let slot_srv = view_title_heap.start + 32;
+        let slot_uav = view_title_heap.start + 64;
+        let slot_smp = sampler_title_heap.start;
+
+        let cbv_desc: [u32; 4] = [p as u32, (p as u64 >> 32) as u32, 256, 0];
+        let uav_desc: [u32; 10] = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
+        // Valid D3D12_SAMPLER_DESC: Filter=MIN_MAG_MIP_LINEAR (21),
+        // AddressU/V/W=CLAMP (3; 0 is invalid and removes the WARP device with
+        // DXGI_ERROR_DEVICE_REMOVED), MipLODBias=0, MaxAnisotropy=1,
+        // ComparisonFunc=NEVER (1), BorderColor=[0; 4], MinLOD=0, MaxLOD=FLT_MAX.
+        let sampler_desc: [u32; 13] = [21, 3, 3, 3, 0, 1, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff];
+        crate::descriptor::create_cbv(null, &cbv_desc, slot_cbv);
+        crate::descriptor::create_srv(null, tex, std::ptr::null(), slot_srv);
+        crate::descriptor::create_uav(null, buf, null, &uav_desc, slot_uav);
+        crate::descriptor::create_sampler(null, &sampler_desc, slot_smp);
+
+        let mut state = State::default();
+        state.set_heaps(&[view_heap_raw, sampler_heap_raw]);
+        state.set_table(false, 0, view_title_heap.start);
+        state.set_table(false, 1, sampler_title_heap.start);
+
+        let used_all = [
+            used(ResourceType::Cbv),
+            UsedResource {
+                table_offset_dwords: 8,
+                ..used(ResourceType::Srv)
+            },
+            UsedResource {
+                table_offset_dwords: 16,
+                ..used(ResourceType::Uav)
+            },
+            UsedResource {
+                slot: 1,
+                table_offset_dwords: 0,
+                ..used(ResourceType::Sampler)
+            },
+        ];
+
+        // (1) Read-only entries (CBV, SRV, read-only UAV, Sampler) all memoize
+        // and verify with 0 mismatches when `writes == false`.
+        {
+            let _guard = TableMemoGuard::set(2);
+            flush_memo_local();
+            let ro = [false, false, false, false];
+            state.tables(&list, &used_all, &ro, false, &[], false);
+            let steps_after_first = list.deferred_steps();
+            state.tables(&list, &used_all, &ro, false, &[], false);
+            assert_eq!(
+                list.deferred_steps(),
+                steps_after_first,
+                "read-only repeat adds no deferred steps"
+            );
+            let c = local_memo_counts();
+            assert_eq!(c[0], 8, "4 entries x 2 calls = 8 lookups");
+            assert_eq!(c[1], 4, "all 4 read-only entries hit on repeat");
+            assert_eq!((c[2], c[3], c[4]), (0, 0, 0), "zero verify mismatches");
+            assert_eq!(c[8], 0, "all 4 read-only entries memoized");
+        }
+
+        // (2) Active skip mode: read-only entries hit and skip; writable UAV
+        // (`writes == true`) NEVER skips and records `Step::GpuWrite` every time
+        // even though the same UAV handle was just memoized as read-only!
+        {
+            let _guard = TableMemoGuard::set(1);
+            flush_memo_local();
+            let rw = [false, false, true, false];
+            let steps_before = list.deferred_steps();
+            state.tables(&list, &used_all, &rw, false, &[], false);
+            let steps_after_rw1 = list.deferred_steps();
+            assert!(
+                steps_after_rw1 > steps_before,
+                "writable UAV must record a GPU write step on first write"
+            );
+            state.tables(&list, &used_all, &rw, false, &[], false);
+            let steps_after_rw2 = list.deferred_steps();
+            assert!(
+                steps_after_rw2 > steps_after_rw1,
+                "writable UAV must never skip and must record a GPU write step on repeat"
+            );
+            let c = local_memo_counts();
+            // Only the 3 non-writing entries (CBV, SRV, Sampler) hit memo (x2 = 6).
+            assert_eq!(c[0], 6, "writable UAV bypasses memo; 3 non-UAV entries looked up twice");
+            assert_eq!(c[1], 6, "all 3 non-UAV entries hit in active skip mode");
+
+            // (3) Even when `write_unknown == true`, CBV/SRV/Sampler still memoize
+            // while UAVs conservatively bypass memo and record GPU writes.
+            let steps_before_unk = list.deferred_steps();
+            state.tables(&list, &used_all, &[], true, &[], false);
+            assert!(
+                list.deferred_steps() > steps_before_unk,
+                "write_unknown forces UAV write step"
+            );
+            let c = local_memo_counts();
+            assert_eq!(c[0], 9, "CBV/SRV/Sampler still looked up under write_unknown");
+            assert_eq!(c[1], 9, "CBV/SRV/Sampler still hit under write_unknown");
+        }
+
+        list.close();
+        // SAFETY: plain device health query; catches WARP CreateSampler/view
+        // validation removals immediately rather than poisoning later tests.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok(), "host device must stay alive");
+        crate::shadow::unregister(buf as usize, p as u64);
+        let release = crate::object::slot::<extern "system" fn(This) -> u32>;
+        assert_eq!(release(tex, 0x10)(tex), 0);
+        assert_eq!(release(buf, 0x10)(buf), 0);
+        assert_eq!(release(view_heap_raw, 0x10)(view_heap_raw), 0);
+        assert_eq!(release(sampler_heap_raw, 0x10)(sampler_heap_raw), 0);
+    }
+
+    #[test]
+    fn table_memo_per_texture_transition_invalidation() {
+        const COPY_SOURCE: u32 = 0x800;
+        const RENDER_TARGET: u32 = 0x4;
+
+        let Some(host) = crate::host::host() else { return };
+        let list = host.new_list().expect("host command list");
+        let mem_a = crate::watch::tests::pool(1) as u64;
+        let mem_b = crate::watch::tests::pool(1) as u64;
+        // Flags = 1 (ALLOW_RENDER_TARGET) so both can transition cleanly.
+        let tex_a = texture_at_address(mem_a, &texture_words(32, 32, 28, 0x100, 1));
+        let tex_b = texture_at_address(mem_b, &texture_words(32, 32, 28, 0x100, 1));
+        let (heap_raw, title_heap, _heap_host) = view_heap(8);
+
+        let slot_a = title_heap.start;
+        crate::descriptor::create_srv(std::ptr::null(), tex_a, std::ptr::null(), slot_a);
+
+        let mut state = State::default();
+        state.set_heaps(&[heap_raw]);
+        state.set_table(false, 0, title_heap.start);
+        let u_a = used(ResourceType::Srv);
+
+        // First call populates memo for `tex_a` in SHADER_RESOURCE.
+        {
+            let _guard = TableMemoGuard::set(2);
+            flush_memo_local();
+            state.table_entry(&list, &u_a, false, false);
+            assert_eq!(local_memo_counts()[0], 1);
+            assert_eq!(local_memo_counts()[1], 0);
+
+            // Transition unrelated `tex_b` twice (first use inserts, second transitions
+            // and bumps `list.epoch()` + `tex_b.transition_gen()`, NOT `tex_a`).
+            crate::list::ensure_state(&list, tex_b, RENDER_TARGET);
+            let epoch_before_b = list.epoch();
+            crate::list::ensure_state(&list, tex_b, COPY_SOURCE);
+            assert_ne!(
+                list.epoch(),
+                epoch_before_b,
+                "transitioning unrelated tex_b advances list.epoch()"
+            );
+
+            // `tex_a` must STILL hit in verify mode with 0 epoch/step/depth mismatches!
+            state.table_entry(&list, &u_a, false, false);
+            let c = local_memo_counts();
+            assert_eq!(c[0], 2, "2 lookups");
+            assert_eq!(c[1], 1, "unrelated tex_b transition preserves tex_a hit");
+            assert_eq!((c[2], c[3], c[4]), (0, 0, 0), "0 verify mismatches");
+            assert_eq!(c[6], 0, "0 transition/epoch misses");
+        }
+
+        // Now test active skip mode (=1): another unrelated transition on `tex_b`
+        // preserves `tex_a`'s hit, while transitioning `tex_a` itself invalidates it.
+        {
+            let _guard = TableMemoGuard::set(1);
+            flush_memo_local();
+
+            crate::list::ensure_state(&list, tex_b, RENDER_TARGET);
+            state.table_entry(&list, &u_a, false, false);
+            let c = local_memo_counts();
+            assert_eq!(c[0], 1, "1 lookup");
+            assert_eq!(c[1], 1, "active skip hit survives unrelated tex_b transition");
+
+            // Transition `tex_a` itself -> must invalidate `tex_a`'s memo entry!
+            crate::list::ensure_state(&list, tex_a, COPY_SOURCE);
+            let epoch_before_rebind = list.epoch();
+            state.table_entry(&list, &u_a, false, false);
+            assert_ne!(
+                list.epoch(),
+                epoch_before_rebind,
+                "re-binding tex_a after miss transitions tex_a back to SHADER_RESOURCE"
+            );
+            let c = local_memo_counts();
+            assert_eq!(c[0], 2, "2 lookups");
+            assert_eq!(c[1], 1, "tex_a transition causes miss");
+            assert_eq!(c[6], 1, "tex_a transition counted as transition/epoch miss");
+
+            // Repeat bind of `tex_a` hits again now that it is back in SHADER_RESOURCE.
+            state.table_entry(&list, &u_a, false, false);
+            let c = local_memo_counts();
+            assert_eq!(c[0], 3, "3 lookups");
+            assert_eq!(c[1], 2, "tex_a hits again after re-entering SHADER_RESOURCE");
+        }
+
+        list.close();
+        // SAFETY: plain device health query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok(), "host device must stay alive");
+        let release = crate::object::slot::<extern "system" fn(This) -> u32>;
+        assert_eq!(release(tex_a, 0x10)(tex_a), 0);
+        assert_eq!(release(tex_b, 0x10)(tex_b), 0);
         assert_eq!(release(heap_raw, 0x10)(heap_raw), 0);
     }
 

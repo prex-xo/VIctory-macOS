@@ -361,7 +361,16 @@ pub(crate) fn uav(
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<ID3D12Resource> {
     let console = crate::resource::title_format(resource)?;
-    let twin = copy.twin.get_or_init(|| make(console, &copy.texture)).as_ref()?;
+    let twin = copy
+        .twin
+        .get_or_init(|| {
+            let made = make(console, &copy.texture);
+            if made.is_some() {
+                copy.bump_transition_gen();
+            }
+            made
+        })
+        .as_ref()?;
     let mut words = *words?;
     const TEXTURE_2D: u32 = 4;
     const TEXTURE_2D_ARRAY: u32 = 5;
@@ -443,6 +452,11 @@ impl Use {
     /// whole clear), so a copy owed into it is pointless.
     pub(crate) fn new(depth: &Arc<HostTexture>, side: u8, writes: bool, whole: bool) -> Self {
         Use { first: side, last: writes.then_some(side), whole, stored: false, synced: false, depth: depth.clone() }
+    }
+
+    /// Side currently left newer by this list (`None` if unchanged).
+    pub(crate) fn last(&self) -> Option<u8> {
+        self.last
     }
 
     /// A later use in the list needing `side`: whether a copy must be

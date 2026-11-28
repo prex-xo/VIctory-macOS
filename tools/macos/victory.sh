@@ -11,13 +11,42 @@
 # VICTORY_DIAGNOSTICS=1 builds with the diagnostics feature (debug logs,
 # black-frame reports, frame capture and the other debugging switches).
 set -e
-# Resolve a caller-supplied relative path before entering the checkout.
-case "${WINE:-}" in
-    ''|/*) ;;
-    *) WINE="$PWD/$WINE" ;;
-esac
+caller="$PWD"
 cd "$(dirname "$0")/../.."
 ROOT="$PWD"
+
+# VICTORY_SET=<name> reads the switches in tools/macos/sets/<name>.txt (one
+# NAME=value a line, # comments), as a named set testers can compare runs by
+# (#555). A variable already set in the environment wins over the set.
+if [ -n "${VICTORY_SET:-}" ]; then
+    case "$VICTORY_SET" in
+        *[!A-Za-z0-9_-]*) echo "VICTORY_SET names a file in tools/macos/sets: $VICTORY_SET" >&2; exit 1 ;;
+    esac
+    applied=
+    set_file="$ROOT/tools/macos/sets/$VICTORY_SET.txt"
+    [ -f "$set_file" ] || { echo "no switch set $VICTORY_SET: the sets are $(ls "$ROOT/tools/macos/sets" | sed 's/\.txt$//' | tr '\n' ' ')" >&2; exit 1; }
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            ''|'#'*) continue ;;
+        esac
+        name=${line%%=*}
+        case "$name" in
+            VICTORY_*|WINE*) ;;
+            *) echo "$set_file: not a VICTORY_ or WINE variable: $line" >&2; exit 1 ;;
+        esac
+        if ! printenv "$name" > /dev/null; then
+            export "$name=${line#*=}"
+        fi
+        applied="${applied:+$applied }$name=$(printenv "$name")"
+    done < "$set_file"
+    echo "switch set $VICTORY_SET: $applied" >&2
+fi
+
+# Resolve a relative Wine override from the environment or the switch set.
+case "${WINE:-}" in
+    ''|/*) ;;
+    *) WINE="$caller/$WINE" ;;
+esac
 TARGET=x86_64-pc-windows-gnullvm
 export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
 if [ -z "${WINE:-}" ]; then
@@ -52,32 +81,6 @@ fi
 # Ask Cargo where it built the executable, including any configured target directory.
 metadata=$(cargo metadata --format-version 1 --no-deps)
 target_dir=$(printf '%s\n' "$metadata" | /usr/bin/plutil -extract target_directory raw -o - -)
-# VICTORY_SET=<name> reads the switches in tools/macos/sets/<name>.txt (one
-# NAME=value a line, # comments), as a named set testers can compare runs by
-# (#555). A variable already set in the environment wins over the set.
-if [ -n "${VICTORY_SET:-}" ]; then
-    case "$VICTORY_SET" in
-        *[!A-Za-z0-9_-]*) echo "VICTORY_SET names a file in tools/macos/sets: $VICTORY_SET" >&2; exit 1 ;;
-    esac
-    applied=
-    set_file="$ROOT/tools/macos/sets/$VICTORY_SET.txt"
-    [ -f "$set_file" ] || { echo "no switch set $VICTORY_SET: the sets are $(ls "$ROOT/tools/macos/sets" | sed 's/\.txt$//' | tr '\n' ' ')" >&2; exit 1; }
-    while IFS= read -r line || [ -n "$line" ]; do
-        case "$line" in
-            ''|'#'*) continue ;;
-        esac
-        name=${line%%=*}
-        case "$name" in
-            VICTORY_*|WINE*) ;;
-            *) echo "$set_file: not a VICTORY_ or WINE variable: $line" >&2; exit 1 ;;
-        esac
-        if ! printenv "$name" > /dev/null; then
-            export "$name=${line#*=}"
-        fi
-        applied="${applied:+$applied }$name=$(printenv "$name")"
-    done < "$set_file"
-    echo "switch set $VICTORY_SET: $applied" >&2
-fi
 export WINEPREFIX="${WINEPREFIX:-$ROOT/target/wineprefix-play}"
 export WINEDEBUG="${WINEDEBUG:--all}"
 export WINEDLLOVERRIDES="mscoree,mshtml=;winedbg.exe=d;d3d12,d3d12core,dxgi=b${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"

@@ -108,6 +108,10 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 // (`crate::ray_skip`; nothing while it is off).
                 #[cfg(windows)]
                 crate::ray_skip::note_program(stage, &full.to_hex()[..16], bytes);
+                name_program(stage, &full.to_hex()[..16], bytes);
+                note_leave_out(&full.to_hex()[..16], bytes);
+                #[cfg(windows)]
+                dump_program(&full.to_hex()[..16], bytes);
                 Arc::new(Shader::with_hash(stage, bytes, full))
             })
             .clone()
@@ -116,6 +120,10 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     #[cfg(windows)]
     if created {
         spill(&shader, full.as_bytes());
+        // With the frame recorder asked for (`VICTORY_RECORD`), the container
+        // is kept beside its captures, so that a replay can translate it
+        // again (`--retranslate`); without it, one look at a flag.
+        crate::replay::record::container(&full.to_hex()[..16], bytes);
     }
     #[cfg(not(windows))]
     let _ = created;
@@ -216,6 +224,11 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
+    /// Its full BLAKE3, kept whether or not the container's bytes still are.
+    pub(crate) fn full_hash(&self) -> [u8; 32] {
+        self.full_hash
+    }
+
     /// The translation, made on first use (or taken from the cache); a
     /// shader that does not translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
@@ -523,12 +536,13 @@ fn may_limit_threads(threads: Option<[u32; 3]>) -> bool {
 }
 
 /// The host pipeline of compute pipeline `p` whose lanes past a dispatch's
-/// count of threads leave at once (`emit::Options::thread_limits`), made on
-/// the first dispatch counted in threads that ends in a part of a group
-/// (`draw::State::dispatch_x`): its shader translated again, so programs
-/// no such dispatch reaches keep their translation. None where the program
-/// cannot leave them (a group barrier, 32-lane halves passing values) or
-/// that translation or pipeline fails; asked once per shader.
+/// count of threads do not run (`emit::Options::thread_limits`: they leave
+/// at once, or stay outside EXEC where the program's lanes wait for each
+/// other), made on the first dispatch counted in threads that ends in a
+/// part of a group (`draw::State::dispatch_x`): its shader translated
+/// again, so programs no such dispatch reaches keep their translation.
+/// None where the program has no such form (literal halves, or a refusal)
+/// or that translation or pipeline fails; asked once per shader.
 #[cfg(windows)]
 pub(crate) fn thread_limited(p: &host::HostPipeline) -> Option<&'static host::HostPipeline> {
     type Made = HashMap<[u8; 32], Option<&'static host::HostPipeline>>;
@@ -603,6 +617,59 @@ fn link_mesh_outputs() -> bool {
         Some(v) => crate::switch::value_is_on(Some(&v)),
         None => crate::shader_cache::under_wine(),
     })
+}
+
+/// Diagnostics (`VICTORY_NAME_PROGRAMS=1`): logs the program name a shader
+/// container holds (its first `CS_`, `MS_`, `PS_`, `VS_` or `AS_` string),
+/// once, when the title first passes it, so a hash in the GPU timings can
+/// be told by its name.
+fn name_program(stage: &str, hash: &str, container: &[u8]) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| crate::switch::on("VICTORY_NAME_PROGRAMS")) {
+        return;
+    }
+    let names: Vec<String> = [b"CS_", b"MS_", b"PS_", b"VS_", b"AS_"]
+        .iter()
+        .filter_map(|prefix| {
+            let at = container.windows(3).position(|w| w == *prefix)?;
+            let name: Vec<u8> = container[at..]
+                .iter()
+                .take(96)
+                .take_while(|&&b| b.is_ascii_graphic())
+                .copied()
+                .collect();
+            Some(String::from_utf8_lossy(&name).into_owned())
+        })
+        .collect();
+    tracing::info!(stage, hash, names = %names.join(" "), "program named");
+}
+
+/// Diagnostics (`VICTORY_DUMP_PROGRAMS=<hash>,...`): writes the shader
+/// container of each listed program, as the title passes it, to
+/// `program-<hash>.bin` in the capture folder (`VICTORY_CAPTURE`), for
+/// `victory shader-info --disasm` and `victory translate`.
+#[cfg(windows)]
+fn dump_program(hash: &str, container: &[u8]) {
+    static LIST: OnceLock<Vec<String>> = OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        std::env::var("VICTORY_DUMP_PROGRAMS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_owned())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    if !list.iter().any(|h| h == hash) {
+        return;
+    }
+    let Some(dir) = std::env::var_os("VICTORY_CAPTURE").map(std::path::PathBuf::from) else {
+        return;
+    };
+    let path = dir.join(format!("program-{hash}.bin"));
+    match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, container)) {
+        Ok(()) => tracing::info!(path = %path.display(), "program container saved"),
+        Err(e) => tracing::warn!(error = %e, path = %path.display(), "program container not saved"),
+    }
 }
 
 /// Whether mesh+pixel pipelines whose pixel shader reads non-provoking vertex
@@ -943,9 +1010,20 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+/// `VICTORY_DROP_WHY=1` (always in diagnostics builds): draws and
+/// dispatches dropped for want of a host pipeline are counted by why, and
+/// the frame report lists the reasons (the shaders that do not translate,
+/// the host's refusal, a prepare step that failed), most first. Off, only
+/// their total is counted.
+#[cfg(windows)]
+pub(crate) fn drop_why() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| cfg!(feature = "diagnostics") || crate::switch::on("VICTORY_DROP_WHY"))
+}
+
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
-/// (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
+/// ([`drop_why`]).
+#[cfg(windows)]
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
@@ -994,8 +1072,73 @@ pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && pipeline(this).host.skipped_shader.is_some()
 }
 
+/// Programs left out by name (`VICTORY_LEAVE_OUT=<names>`, comma-separated
+/// substrings of the program names in shader containers, such as
+/// `CS_DepthProcessingHBO`): their draws and dispatches are not run. For
+/// measuring what a pass costs, and a picture without it.
+fn leave_out_names() -> &'static [String] {
+    static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| {
+        std::env::var("VICTORY_LEAVE_OUT")
+            .unwrap_or_default()
+            .split(',')
+            .map(|n| n.trim().to_owned())
+            .filter(|n| !n.is_empty())
+            .collect()
+    })
+}
+
+/// The shader hashes [`leave_out_names`] matched so far.
+static LEFT_OUT: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+/// Notes `hash` as left out if its container names a listed program.
+fn note_leave_out(hash: &str, container: &[u8]) {
+    let names = leave_out_names();
+    if names.is_empty() {
+        return;
+    }
+    if let Some(name) = names
+        .iter()
+        .find(|n| container.windows(n.len()).any(|w| w == n.as_bytes()))
+    {
+        tracing::info!(hash, name = %name, "program left out (VICTORY_LEAVE_OUT)");
+        LEFT_OUT.write().unwrap_or_else(|e| e.into_inner()).push(hash.to_owned());
+    }
+}
+
+/// Whether `this` has a shader [`note_leave_out`] left out.
+pub(crate) fn left_out(this: This) -> bool {
+    if leave_out_names().is_empty() || this.is_null() {
+        return false;
+    }
+    let left = LEFT_OUT.read().unwrap_or_else(|e| e.into_inner());
+    pipeline(this).shaders.iter().any(|s| left.contains(&s.hash))
+}
+
+/// The hash of a shader of `this` that `VICTORY_TRACE_DISPATCH` lists
+/// (comma-separated 16-digit hashes), whose dispatches' sizes are logged.
+pub(crate) fn traced_dispatch(this: This) -> Option<String> {
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        std::env::var("VICTORY_TRACE_DISPATCH")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_owned())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    if list.is_empty() || this.is_null() {
+        return None;
+    }
+    pipeline(this)
+        .shaders
+        .iter()
+        .find(|s| list.contains(&s.hash))
+        .map(|s| s.hash.clone())
+}
+
 /// The shaders of `this`, as host pipelines are named (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 pub(crate) fn shaders_of(this: This) -> String {
     if this.is_null() {
         return "no pipeline".into();
@@ -1004,26 +1147,27 @@ pub(crate) fn shaders_of(this: This) -> String {
 }
 
 /// Counts a draw or dispatch of `this` intentionally skipped or dropped
-/// for want of a host pipeline (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn note_drop(this: This) {
+/// for want of a host pipeline ([`drop_why`]). `kind` names the command
+/// when its pipeline has a host one: it was dropped for its bound target
+/// formats, whose pipeline is apart.
+#[cfg(windows)]
+pub(crate) fn note_drop(this: This, kind: &str) {
     let why = if this.is_null() {
-        Some("no pipeline set".to_owned())
+        "no pipeline set".to_owned()
     } else {
         let p = pipeline(this);
-        p.host
-            .skipped_shader
-            .as_deref()
-            .map(|hash| format!("skipped shader {hash}"))
-            .or_else(|| make::missing(&p.host))
+        make::missing(&p.host).unwrap_or_else(|| {
+            format!(
+                "{kind}: no host pipeline for its bound target formats {:?}",
+                p.shaders
+            )
+        })
     };
-    if let Some(why) = why {
-        note_why(why);
-    }
+    note_why(why);
 }
 
-/// Counts a draw or dispatch dropped for `why` (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
+/// Counts a draw or dispatch dropped for `why` ([`drop_why`]).
+#[cfg(windows)]
 pub(crate) fn note_why(why: String) {
     let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
     *drops
@@ -1032,8 +1176,8 @@ pub(crate) fn note_why(why: String) {
         .or_default() += 1;
 }
 
-/// The drops counted since the last call, most first (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
+/// The drops counted since the last call, most first ([`drop_why`]).
+#[cfg(windows)]
 pub(crate) fn take_drops() -> Vec<(String, u64)> {
     let drops = DROPS.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut drops: Vec<(String, u64)> = drops.into_iter().flatten().collect();
@@ -1076,6 +1220,11 @@ fn hand_out(
         #[cfg(feature = "diagnostics")]
         skip_hashes(),
     ));
+    // Write the pipeline down for `victory warm` (VICTORY_PIPELINE_BOOK=1).
+    // Before `make::early`, so that a shader's container is still here: this
+    // tree releases containers after translation.
+    #[cfg(windows)]
+    known::note(&make::key(&shaders, host.graphics.as_deref()), &shaders, host.graphics.as_deref());
     #[cfg(windows)]
     make::early(&host);
     #[cfg(windows)]
@@ -1299,6 +1448,8 @@ mod builder;
 #[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
+pub mod known;
+#[cfg(windows)]
 mod library;
 #[cfg(windows)]
 mod make;
@@ -1330,6 +1481,7 @@ pub fn use_pipeline_cache(dir: std::path::PathBuf) {
 #[cfg(windows)]
 pub fn save_pipeline_cache() {
     library::save(true);
+    known::flush();
 }
 
 /// The pre-build: a title pipeline made ahead of a run into the pipeline
@@ -1544,6 +1696,64 @@ mod tests {
         for q in [p, other] {
             slot::<extern "system" fn(This) -> u32>(q, 0x10)(q);
         }
+    }
+
+    /// A drop is counted by why (`VICTORY_DROP_WHY`, here called directly):
+    /// a pipeline whose shader does not translate names that shader, one
+    /// never set says so, and the reasons come most first.
+    #[cfg(windows)]
+    #[test]
+    fn drops_are_counted_by_why() {
+        let code = [0xD1u8; 64];
+        let desc = ComputeHead {
+            root: std::ptr::null(),
+            stage: Bytecode {
+                code: code.as_ptr(),
+                size: code.len(),
+            },
+        };
+        let mut p: This = std::ptr::null();
+        assert_eq!(
+            create_compute(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
+            S_OK
+        );
+        // Its first use starts it; not a container, it is refused.
+        assert!(host_pipeline(p).is_none());
+        let made = (0..500).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            make::state(&pipeline(p).host).is_some()
+        });
+        assert!(made, "its host pipeline was started");
+        let hash = pipeline(p).shaders[0].hash.clone();
+        let reason = "drops_are_counted_by_why: three";
+        for _ in 0..3 {
+            note_why(reason.to_owned());
+        }
+        note_drop(p, "dispatch");
+        note_drop(std::ptr::null(), "dispatch");
+        let drops = take_drops();
+        let count = |pred: &dyn Fn(&str) -> bool| {
+            drops
+                .iter()
+                .filter(|(why, _)| pred(why))
+                .map(|(_, n)| *n)
+                .sum::<u64>()
+        };
+        assert_eq!(count(&|why| why == reason), 3);
+        assert!(
+            count(&|why| why.contains(&hash)) >= 1,
+            "the untranslated shader is named: {drops:?}"
+        );
+        assert!(count(&|why| why == "no pipeline set") >= 1, "{drops:?}");
+        assert!(
+            drops.windows(2).all(|w| w[0].1 >= w[1].1),
+            "most first: {drops:?}"
+        );
+        assert!(
+            take_drops().iter().all(|(why, _)| why != reason),
+            "taken once"
+        );
+        slot::<extern "system" fn(This) -> u32>(p, 0x10)(p);
     }
 
     #[test]

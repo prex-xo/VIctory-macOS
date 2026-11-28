@@ -45,7 +45,6 @@ pub(crate) struct Pending {
     now: AtomicBool,
     taken: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
-    #[cfg(feature = "diagnostics")]
     refusal: OnceLock<(&'static str, Option<i32>)>,
     #[cfg(feature = "diagnostics")]
     pub(super) skipped_shader: Option<String>,
@@ -105,7 +104,6 @@ impl Pending {
             now: AtomicBool::new(false),
             taken: AtomicBool::new(false),
             made,
-            #[cfg(feature = "diagnostics")]
             refusal: OnceLock::new(),
             #[cfg(feature = "diagnostics")]
             skipped_shader,
@@ -117,9 +115,8 @@ impl Pending {
         self.making_since.get_or_init(Instant::now);
         self.made.get_or_init(|| {
             let (started, cpu) = (Instant::now(), super::thread_cpu());
-            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref(), |_reason, _code| {
-                #[cfg(feature = "diagnostics")]
-                let _ = self.refusal.set((_reason, _code));
+            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref(), |reason, code| {
+                let _ = self.refusal.set((reason, code));
             });
             #[cfg(feature = "diagnostics")]
             log_built(&self.key);
@@ -151,11 +148,12 @@ pub(crate) fn key(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> 
     key.finalize().to_hex()[..32].to_owned()
 }
 
-/// Why a draw lacks a host pipeline (diagnostics): skipped shader, still
-/// building, a recorded refusal (with optional HRESULT and shader list), or
-/// the shaders that failed to translate. `None` if it has one.
-#[cfg(feature = "diagnostics")]
+/// Why a draw lacks a host pipeline (diagnostics, or `VICTORY_DROP_WHY=1`):
+/// skipped shader, still building, a recorded refusal (with optional HRESULT
+/// and shader list), or the shaders that failed to translate. `None` if it
+/// has one.
 pub(crate) fn missing(p: &Pending) -> Option<String> {
+    #[cfg(feature = "diagnostics")]
     if let Some(hash) = p.skipped_shader.as_deref() {
         return Some(format!("skipped shader {hash}"));
     }
@@ -534,11 +532,9 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
-        #[cfg(feature = "diagnostics")]
         assert_eq!(missing(&p).as_deref(), Some("no vertex or mesh shader"));
     }
 
-    #[cfg(feature = "diagnostics")]
     #[test]
     fn missing_formats_static_refusal_driver_hresult_and_skipped_shader() {
         let shader = Arc::new(Shader {
@@ -552,7 +548,12 @@ mod tests {
         });
 
         // 1. Driver refusal keeps HRESULT (hex) and shader identity.
-        let driver = Pending::new(vec![shader.clone()], None, &[]);
+        let driver = Pending::new(
+            vec![shader.clone()],
+            None,
+            #[cfg(feature = "diagnostics")]
+            &[],
+        );
         driver
             .refusal
             .set(("compute pipeline refused", Some(0x80070057u32 as i32)))
@@ -565,7 +566,12 @@ mod tests {
         );
 
         // 2. Static refusal with shaders includes reason and shader list; without shaders keeps bare reason.
-        let static_with = Pending::new(vec![shader.clone()], None, &[]);
+        let static_with = Pending::new(
+            vec![shader.clone()],
+            None,
+            #[cfg(feature = "diagnostics")]
+            &[],
+        );
         static_with
             .refusal
             .set(("the host GPU has no 64-bit atomics on typed heap resources", None))
@@ -576,7 +582,12 @@ mod tests {
             Some("the host GPU has no 64-bit atomics on typed heap resources [compute abcdef0123456789]")
         );
 
-        let static_empty = Pending::new(Vec::new(), None, &[]);
+        let static_empty = Pending::new(
+            Vec::new(),
+            None,
+            #[cfg(feature = "diagnostics")]
+            &[],
+        );
         static_empty
             .refusal
             .set(("no vertex or mesh shader", None))
@@ -588,12 +599,17 @@ mod tests {
         );
 
         // 3. Skipped shader keeps its dedicated label.
-        let hashes = crate::pipeline::parse_skip_hashes("ABCDEF0123456789");
-        let skipped = Pending::new(vec![shader], None, &hashes);
-        assert_eq!(
-            missing(&skipped).as_deref(),
-            Some("skipped shader abcdef0123456789")
-        );
+        #[cfg(feature = "diagnostics")]
+        {
+            let hashes = crate::pipeline::parse_skip_hashes("ABCDEF0123456789");
+            let skipped = Pending::new(vec![shader], None, &hashes);
+            assert_eq!(
+                missing(&skipped).as_deref(),
+                Some("skipped shader abcdef0123456789")
+            );
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        drop(shader);
     }
 
     #[test]

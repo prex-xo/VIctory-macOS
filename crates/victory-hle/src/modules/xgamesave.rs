@@ -20,7 +20,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::{CString, c_char, c_void};
-use std::io::Write as _;
+use std::io::{ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -186,26 +186,33 @@ fn version_number(file: &str) -> Option<u64> {
     (n > 0 && format!("v{n}") == file).then_some(n)
 }
 
-/// The names in version folder `dir`: container, display, blobs; `None` if
-/// its manifest is missing or does not parse.
+/// The names in version folder `dir`: container, display, blobs. Return
+/// `None` if the manifest is missing or invalid or a listed blob is not a file.
 fn load(dir: &Path) -> std::io::Result<Option<(String, String, Vec<String>)>> {
     let bytes = match std::fs::read(dir.join(MANIFEST)) {
         Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
     let Some(mut names) = parse_manifest(&bytes) else {
         return Ok(None);
     };
     let blobs = names.split_off(2);
+    for i in 0..blobs.len() {
+        match std::fs::metadata(dir.join(i.to_string())) {
+            Ok(info) if info.is_file() => {}
+            Ok(_) => return Ok(None),
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        }
+    }
     let [name, display] = <[String; 2]>::try_from(names).expect("two names, checked by the parser");
     Ok(Some((name, display, blobs)))
 }
 
-/// The container's newest readable committed version, if any. Removes what
-/// a crash left: unfinished versions, and versions older than that one.
-/// An unreadable newer folder (a stray, or a broken manifest) is neither
-/// taken nor removed, and never costs the version below it.
+/// The container's newest complete committed version, if any. Removes
+/// unfinished versions and versions older than the one selected. An
+/// incomplete newer version is left in place and skipped.
 fn current(dir: &Path) -> std::io::Result<Option<Version>> {
     let mut committed = Vec::new();
     let mut highest = 0;
@@ -241,10 +248,10 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
             blobs,
         }));
     }
-    // Versions exist but none reads: keep them all, and refuse.
+    // No complete version: keep what remains for recovery.
     Err(std::io::Error::new(
         std::io::ErrorKind::InvalidData,
-        "no save version has a readable manifest",
+        "no complete save version could be loaded",
     ))
 }
 
@@ -1505,17 +1512,30 @@ mod tests {
     }
 
     /// A newer version folder that does not read (an empty folder, a file,
-    /// a broken manifest) neither hides the committed save, nor removes it,
-    /// nor blocks the next update, which goes above it.
+    /// a broken manifest or a missing blob) neither hides the committed save,
+    /// nor removes it, nor blocks the next update, which goes above it.
     #[test]
     fn an_unreadable_newer_version_does_not_cost_the_save() {
         type Make = fn(&Path);
-        let strays: [(&str, Make); 3] = [
+        let strays: [(&str, Make); 5] = [
             ("empty folder", |p| std::fs::create_dir(p).unwrap()),
             ("file", |p| std::fs::write(p, b"not a version").unwrap()),
             ("broken manifest", |p| {
                 std::fs::create_dir(p).unwrap();
                 std::fs::write(p.join(MANIFEST), [9, 0, 0, 0, b'x']).unwrap();
+            }),
+            ("missing blob", |p| {
+                std::fs::create_dir(p).unwrap();
+                std::fs::write(
+                    p.join(MANIFEST),
+                    manifest("Slot", "incomplete", &["a", "b"]),
+                )
+                .unwrap();
+                std::fs::write(p.join("0"), b"new a").unwrap();
+            }),
+            ("directory in place of a blob", |p| {
+                std::fs::create_dir_all(p.join("0")).unwrap();
+                std::fs::write(p.join(MANIFEST), manifest("Slot", "incomplete", &["a"])).unwrap();
             }),
         ];
         for (what, make) in strays {
@@ -1525,8 +1545,9 @@ mod tests {
             let slot = container_dir(root, "Slot");
             make(&slot.join("v2"));
 
-            assert_eq!(state(root), old_state(), "{what}: read");
+            current_named(&slot, "Slot").unwrap();
             assert!(slot.join("v1").is_dir(), "{what}: v1 was removed");
+            assert_eq!(state(root), old_state(), "{what}: read");
 
             assert_eq!(update(root, "two", &[("a", Some("new a"))]), S_OK, "{what}: update");
             let blobs = vec![("a".into(), "new a".into()), ("b".into(), "old b".into())];
@@ -1551,6 +1572,24 @@ mod tests {
         assert_eq!(read(&c, None).err(), Some(NO_ACCESS));
         assert_eq!(update(root, "two", &[("a", Some("new a"))]), NO_ACCESS);
         assert!(slot.join("v1").join("0").is_file());
+        assert!(!slot.join("v2").exists());
+    }
+
+    #[test]
+    fn a_save_with_no_complete_version_is_refused_and_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(
+            update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]),
+            S_OK
+        );
+        let slot = container_dir(root, "Slot");
+        std::fs::remove_file(slot.join("v1/1")).unwrap();
+
+        let c = Provider { root: root.into() }.container("Slot");
+        assert_eq!(read(&c, Some(vec!["a".into()])).err(), Some(NO_ACCESS));
+        assert_eq!(update(root, "two", &[("b", Some("new b"))]), NO_ACCESS);
+        assert_eq!(std::fs::read(slot.join("v1/0")).unwrap(), b"old a");
         assert!(!slot.join("v2").exists());
     }
 }

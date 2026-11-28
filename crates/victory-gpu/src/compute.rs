@@ -33,6 +33,17 @@ pub(crate) struct Range {
     kind: D3D12_DESCRIPTOR_RANGE_TYPE,
     register: u32,
     count: u32,
+    flags: D3D12_DESCRIPTOR_RANGE_FLAGS,
+}
+
+#[cfg(test)]
+impl Range {
+    /// Allows the title's heap sync and deferred copies after list recording.
+    pub(crate) fn volatile(mut self) -> Self {
+        self.flags = D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
+            | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
+        self
+    }
 }
 
 /// `count` shader resource views from `t{register}`.
@@ -41,6 +52,7 @@ pub(crate) const fn srv(register: u32, count: u32) -> Range {
         kind: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
         register,
         count,
+        flags: D3D12_DESCRIPTOR_RANGE_FLAG_NONE,
     }
 }
 
@@ -50,6 +62,7 @@ pub(crate) const fn uav(register: u32, count: u32) -> Range {
         kind: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
         register,
         count,
+        flags: D3D12_DESCRIPTOR_RANGE_FLAG_NONE,
     }
 }
 
@@ -107,6 +120,10 @@ pub(crate) fn pipeline(
             ..Default::default()
         })
     }?;
+    // A pass of ours, by the name it was compiled under: what a frame
+    // replay's reports call it (`VICTORY_RECORD`).
+    // SAFETY: the caller's name, a string that ends with a NUL.
+    crate::host::name(&pso, || format!("victory: {}", unsafe { name.display() }));
     Ok((root, pso))
 }
 
@@ -121,7 +138,7 @@ pub(crate) fn root_signature(device: &ID3D12Device, params: &[Param]) -> Result<
                     NumDescriptors: r.count,
                     BaseShaderRegister: r.register,
                     RegisterSpace: 0,
-                    Flags: D3D12_DESCRIPTOR_RANGE_FLAG_NONE,
+                    Flags: r.flags,
                     OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
                 })
                 .collect(),

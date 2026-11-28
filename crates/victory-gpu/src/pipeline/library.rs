@@ -56,6 +56,11 @@ pub fn use_pipeline_cache(dir: PathBuf) {
     let _ = DIR.set(dir);
 }
 
+/// The folder the library is kept in.
+pub(super) fn folder() -> Option<PathBuf> {
+    DIR.get().cloned()
+}
+
 /// Host pipelines created, loaded from the library, and title pipelines
 /// started at creation, since the start.
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
@@ -1167,6 +1172,7 @@ mod tests {
                 atomic_locks: true,
                 atomic_lock_rounds: true,
                 atomic_umax: on,
+                racy_minmax: false,
                 ..options
             })
         };

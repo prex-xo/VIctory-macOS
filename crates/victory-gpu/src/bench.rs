@@ -375,6 +375,18 @@ fn escape_json(s: &str) -> String {
     out
 }
 
+/// Draws a frame needs for the warm-up to count it
+/// (`VICTORY_BENCH_WARM_DRAWS`, default [`WORLD_DRAW_THRESHOLD`]).
+fn warm_draws() -> u64 {
+    static N: OnceLock<u64> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_BENCH_WARM_DRAWS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(WORLD_DRAW_THRESHOLD)
+    })
+}
+
 struct BenchRecorder {
     warmup_target: u64,
     world_frame: u64,
@@ -432,6 +444,8 @@ impl BenchRecorder {
         mem: MemorySample,
         device_removed: bool,
     ) -> (u64, u64) {
+        // Device loss describes the run even before any timing samples count.
+        self.device_removed |= device_removed;
         let frame_draws = drawn.saturating_sub(self.prev_drawn);
         self.prev_drawn = drawn;
         let is_world_frame = frame_draws >= WORLD_DRAW_THRESHOLD;
@@ -452,7 +466,14 @@ impl BenchRecorder {
         if !self.measuring {
             if is_world_frame {
                 self.low_run = 0;
-                self.warmup_world += 1;
+                // Only frames of the full scene count with
+                // `VICTORY_BENCH_WARM_DRAWS` (default the world threshold):
+                // the world's first minute streams in at half the draws and
+                // twice the speed, and a run that measured it is not
+                // comparable with one that did not.
+                if frame_draws >= warm_draws() {
+                    self.warmup_world += 1;
+                }
             } else {
                 self.low_run += 1;
                 if self.low_run >= LOADING_RUN {
@@ -473,7 +494,6 @@ impl BenchRecorder {
         if black_frame {
             self.black_frames += 1;
         }
-        self.device_removed |= device_removed;
         self.vram_used_peak_bytes = self.vram_used_peak_bytes.max(mem.vram_used_bytes);
         if mem.vram_budget_bytes > 0 {
             self.vram_budget_bytes = mem.vram_budget_bytes;
@@ -635,21 +655,20 @@ pub(crate) fn on_present(drawn: u64, black_frame: bool) {
             .map(|prev_at| now.saturating_duration_since(prev_at).as_secs_f64() * 1000.0);
         state.last_present = Some(now);
 
-        if next_wf == 0 {
+        // Honor loss already detected by the renderer even during loading.
+        // Keep the explicit device query on its existing frame schedule.
+        let removed = DEVICE_GONE.load(Ordering::Relaxed)
+            || (next_wf > cfg.warmup_frames && is_device_removed());
+        if next_wf == 0 && !removed {
             return;
         }
         // Keep `recorder.world_frame` synchronized with the atomic `WORLD_FRAME`.
         state.recorder.prev_drawn = prev;
-        state.recorder.world_frame = next_wf - 1;
+        state.recorder.world_frame = next_wf.saturating_sub(1);
         let mem = if next_wf > cfg.warmup_frames {
             sample_host_memory()
         } else {
             MemorySample::default()
-        };
-        let removed = if next_wf > cfg.warmup_frames {
-            is_device_removed()
-        } else {
-            false
         };
         let (_, measured) = state
             .recorder
@@ -811,6 +830,30 @@ mod tests {
         let report = rec.report(None);
         assert_eq!(report.warmup_frames, LOADING_RUN + 3);
         assert_eq!(report.zero_draw_world_frames, 1);
+    }
+
+    #[test]
+    fn report_includes_device_loss_before_the_first_world_frame() {
+        let mut rec = BenchRecorder::new(30);
+        let mem = MemorySample::default();
+        assert_eq!(rec.observe(100, None, false, mem, true), (0, 0));
+        let report = rec.report(None);
+        assert_eq!(report.world_frames, 0);
+        assert_eq!(report.warmup_frames, 0);
+        assert!(report.device_removed);
+    }
+
+    #[test]
+    fn report_includes_device_loss_during_warmup() {
+        let mut rec = BenchRecorder::new(30);
+        let mem = MemorySample::default();
+        assert_eq!(rec.observe(1000, None, false, mem, false), (1, 0));
+        assert_eq!(rec.observe(1010, Some(33.0), true, mem, true), (2, 0));
+        let report = rec.report(None);
+        assert_eq!(report.world_frames, 0);
+        assert_eq!(report.warmup_frames, 2);
+        assert!(report.device_removed);
+        assert_eq!(report.black_frames, 0);
     }
 
     #[test]

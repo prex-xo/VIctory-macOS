@@ -1,0 +1,26 @@
+# Switches an M1 Max (64 GB, macOS 26.6.2) ran the world with on
+# 27 November 2026, measured in docs/m1-max.md. Best there with D3DMetal
+# 4.0 beta 3 and a wineserver with tools/macos/patches/wineserver-view-tree.patch.
+#
+# Use it with VICTORY_SET=m1max tools/macos/victory.sh run ... A variable
+# already set in the environment wins over its line here. One NAME=value a
+# line; lines starting with # are skipped.
+
+# Store rewriting and fault tracking, which world runs on main need (README).
+VICTORY_PATCH_MASKED=all
+VICTORY_FAULT_TRACKING=1
+# World loads outlast the title's hang watchdog (#135).
+VICTORY_NO_HANG_WATCHDOG=1
+# Wine's sync objects on Mach semaphores instead of wineserver requests:
+# wineserver went from most of a core to 7-17% in the world, and CPU
+# preparation from 510 to 323 ms a frame (CrossOver 26.3's Wine).
+WINEMSYNC=1
+# The title's queues go to a submit thread, so its own CPU time overlaps
+# host work.
+VICTORY_ASYNC_SUBMIT=1
+# The instance lists' pool trap at +0x5149aec, hit in the world.
+VICTORY_STEP_OVER=pool
+# The ambient stand-in for the probe light the title fills by tracing rays.
+# Main leaves the ray-tracing structures unbuilt unless VICTORY_BVH_BUILDER=1;
+# on this Mac running them cost about 100 ms a frame (820 against 716 ms).
+VICTORY_AMBIENT=1

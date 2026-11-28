@@ -367,6 +367,11 @@ pub(crate) enum Early {
 /// launched while it still was, then one per [`Early`].
 const AHEAD_SLOTS: usize = 2 + Early::CpuRead as usize + 1;
 
+/// Fence-wait microseconds incurred by preparation, indexed by the early
+/// landing reason. Copy-back and callbacks after the fence are excluded.
+#[cfg(feature = "diagnostics")]
+static AHEAD_WAIT_US: [AtomicU64; AHEAD_SLOTS - 2] = [const { AtomicU64::new(0) }; AHEAD_SLOTS - 2];
+
 /// Preparations behind a flight that was not quiet but whose writes were
 /// known (`VICTORY_PREP_AHEAD=ranges`), since the last frame report.
 static BEHIND_BY_RANGES: AtomicU64 = AtomicU64::new(0);
@@ -522,7 +527,7 @@ pub(crate) fn land_ahead(why: Early) {
         AHEAD[2 + why as usize].fetch_add(1, Ordering::Relaxed);
         PREPARING_AHEAD.with(|c| c.set(None));
         AHEAD_OF.with(|w| w.borrow_mut().take());
-        host.finish_flight_locked(submitted, None, None);
+        host.finish_flight_locked_for(submitted, None, None, Some(why));
     }
 }
 
@@ -579,6 +584,43 @@ pub(crate) fn prep_ahead_enabled() -> bool {
 /// from title memory, which its landing writes: a texture the preparation
 /// brings up there is the bytes from before the flight, one submission late,
 /// as one written in the same submission already is (`bindless::uploads`).
+/// `VICTORY_SYNC_EARLY=1` (off by default): before a submission waits for
+/// the one in flight to land (Wait-Before-Prep), the descriptors the title
+/// wrote into its heaps are mirrored (`descriptor::sync_heaps`, ~24 ms a
+/// frame in the world, run I) while that one still runs on the GPU, so the
+/// submit worker waits that much less after it. The preparation syncs again
+/// after the landing, for what the title wrote meanwhile and the views the
+/// landing made (`descriptor::make_read`), which then costs little.
+///
+/// As with `VICTORY_PREP_AHEAD=1`, which syncs heaps behind a quiet flight:
+/// on the console the title does not change descriptors that work it
+/// submitted reads until that work's fence moves, which is at its landing,
+/// so the slots a sync rewrites are none the flight in the air reads.
+pub(crate) fn sync_early_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_SYNC_EARLY.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = crate::switch::on("VICTORY_SYNC_EARLY");
+        if on {
+            tracing::info!("heap views synced while the last host submission runs (VICTORY_SYNC_EARLY=1)");
+        }
+        on
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`sync_early_enabled`] on this test's thread.
+    static TEST_SYNC_EARLY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Heap syncs done while the last flight ran ([`sync_early_enabled`]) and
+/// their microseconds, since the last frame report.
+static SYNCED_EARLY: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 pub(crate) fn prep_ranges_enabled() -> bool {
     #[cfg(test)]
     match TEST_PREP_AHEAD.load(Ordering::Acquire) {
@@ -598,6 +640,10 @@ pub(crate) fn log_frame(frames: f64) {
     let (flights, us) = take_flight_times();
     let worker = crate::queue::take_worker_us();
     let ahead = AHEAD.each_ref().map(|a| a.swap(0, Ordering::Relaxed));
+    #[cfg(feature = "diagnostics")]
+    let ahead_wait = AHEAD_WAIT_US
+        .each_ref()
+        .map(|a| a.swap(0, Ordering::Relaxed));
     if flights == 0 {
         return;
     }
@@ -611,6 +657,15 @@ pub(crate) fn log_frame(frames: f64) {
         ms(worker),
         unasked + idle_preparing,
     );
+    let [early, early_us] = SYNCED_EARLY.each_ref().map(|a| a.swap(0, Ordering::Relaxed));
+    if sync_early_enabled() {
+        tracing::info!(
+            "heap views synced while the last host submission ran, per frame: {:.1} syncs, {:.1} ms \
+             (VICTORY_SYNC_EARLY=1)",
+            early as f64 / frames,
+            early_us as f64 / 1e3 / frames,
+        );
+    }
     if prep_ahead_enabled() {
         let per = |n: u64| n as f64 / frames;
         let p = PROBE.each_ref().map(|a| a.swap(0, Ordering::Relaxed));
@@ -650,6 +705,21 @@ pub(crate) fn log_frame(frames: f64) {
             per(ahead[10]),
             per(ahead[11]),
         );
+        #[cfg(feature = "diagnostics")]
+        {
+            let title_copy = ahead_wait[Early::TitleCopy as usize];
+            let buffer_overlap = ahead_wait[Early::Overlap as usize];
+            let cpu_read = ahead_wait[Early::CpuRead as usize];
+            let other = ahead_wait.iter().sum::<u64>() - title_copy - buffer_overlap - cpu_read;
+            tracing::info!(
+                "prep-ahead GPU fence wait ms/frame: title copies {:.2}, overlapping buffer work {:.2}, \
+                 CPU reads {:.2}, other {:.2}",
+                ms(title_copy),
+                ms(buffer_overlap),
+                ms(cpu_read),
+                ms(other),
+            );
+        }
     }
 }
 
@@ -896,9 +966,17 @@ impl Host {
             if ahead && self.has_in_flight() {
                 AHEAD[2 + Early::NotQuiet as usize].fetch_add(1, Ordering::Relaxed);
             }
+            // `VICTORY_SYNC_EARLY=1`: what the title wrote into its heaps is
+            // mirrored while Flight N-1 still runs, not after it landed.
+            if sync_early_enabled() && self.has_in_flight() {
+                let started = std::time::Instant::now();
+                crate::descriptor::sync_heaps();
+                SYNCED_EARLY[0].fetch_add(1, Ordering::Relaxed);
+                SYNCED_EARLY[1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
             // Wait-Before-Prep: drain Flight N-1 completely before Flight N
-            // touches any shared Shadow, descriptor heap, upload staging
-            // pool, or Mark buffer.
+            // touches any shared Shadow, upload staging pool, or Mark
+            // buffer (and, without `VICTORY_SYNC_EARLY`, descriptor heap).
             self.finish_flight_locked(&mut submitted, None, None);
         }
         let landed = std::time::Instant::now();
@@ -1138,6 +1216,16 @@ impl Host {
         only_if_fence: Option<u64>,
         waited_at: Option<std::time::Instant>,
     ) -> bool {
+        self.finish_flight_locked_for(submitted, only_if_fence, waited_at, None)
+    }
+
+    fn finish_flight_locked_for(
+        &self,
+        submitted: &mut u64,
+        only_if_fence: Option<u64>,
+        waited_at: Option<std::time::Instant>,
+        reason: Option<Early>,
+    ) -> bool {
         let mut landed_any = false;
         loop {
             let flight = {
@@ -1157,7 +1245,7 @@ impl Host {
             let Some(flight) = flight else {
                 return landed_any;
             };
-            self.land(submitted, flight, waited_at.filter(|_| !landed_any));
+            self.land(submitted, flight, waited_at.filter(|_| !landed_any), reason);
             landed_any = true;
             if only_if_fence.is_some() {
                 return true;
@@ -1166,12 +1254,26 @@ impl Host {
     }
 
     /// Lands `flight`, taken from the front of `Host::flight`'s flights.
-    fn land(&self, submitted: &mut u64, flight: InFlight, waited_at: Option<std::time::Instant>) {
+    fn land(
+        &self,
+        submitted: &mut u64,
+        flight: InFlight,
+        waited_at: Option<std::time::Instant>,
+        _reason: Option<Early>,
+    ) {
         let gpu_done = if flight.waited {
             // SAFETY: plain fence completion query.
             if unsafe { self.fence.GetCompletedValue() } < flight.fence_value {
+                #[cfg(feature = "diagnostics")]
+                let started = _reason.map(|_| std::time::Instant::now());
                 self.wait_for(flight.fence_value);
-                std::time::Instant::now()
+                let done = std::time::Instant::now();
+                #[cfg(feature = "diagnostics")]
+                if let Some((reason, started)) = _reason.zip(started) {
+                    AHEAD_WAIT_US[reason as usize]
+                        .fetch_add(done.duration_since(started).as_micros() as u64, Ordering::Relaxed);
+                }
+                done
             } else {
                 waited_at.unwrap_or_else(std::time::Instant::now)
             }
@@ -2074,6 +2176,44 @@ void main(uint3 id : SV_DispatchThreadID) {
         // found again at the same address with this attempt's bytes.
         let _ = layout;
         taken
+    }
+
+    /// With `VICTORY_SYNC_EARLY=1` the heaps are synced while the flight
+    /// before is still in the air, then it lands and the next one runs, in
+    /// order.
+    #[test]
+    fn sync_early_syncs_heaps_while_the_last_flight_runs() {
+        let Some(host) = host() else {
+            return;
+        };
+        let _mode = ModeGuard::new(true, false);
+        TEST_SYNC_EARLY.with(|c| c.set(Some(true)));
+        until_taken(|| {
+            let (_q, f1) = make_queue_and_fence();
+            let (_q2, f2) = make_queue_and_fence();
+            let (out1, out1_ptr) = host.mapped_buffer(64, true).expect("out1");
+            let (out2, out2_ptr) = host.mapped_buffer(64, true).expect("out2");
+            TEST_PAUSE_LANDING.store(true, Ordering::Release);
+            host.execute_flight1(vec![quiet_copy(host, 0x5151_0001, &out1)], vec![]);
+            assert!(host.attach_signal(f1, 1, false));
+            let in_air = flights_in_air(host) == 1;
+            let before = SYNCED_EARLY[0].load(Ordering::Relaxed);
+            // The next one lands it itself (the pause holds only the
+            // landing thread), after syncing the heaps.
+            host.execute_flight1(vec![quiet_copy(host, 0x5151_0002, &out2)], vec![]);
+            assert!(host.attach_signal(f2, 1, false));
+            let synced = SYNCED_EARLY[0].load(Ordering::Relaxed) > before;
+            TEST_PAUSE_LANDING.store(false, Ordering::Release);
+            host.finish_flight_now();
+            assert_eq!((crate::fence::value(f1), crate::fence::value(f2)), (1, 1));
+            // SAFETY: both flights have landed.
+            unsafe {
+                assert_eq!(out1_ptr.cast::<u32>().read_volatile(), 0x5151_0001);
+                assert_eq!(out2_ptr.cast::<u32>().read_volatile(), 0x5151_0002);
+            }
+            in_air && synced
+        });
+        TEST_SYNC_EARLY.with(|c| c.set(None));
     }
 
     #[test]

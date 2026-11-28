@@ -11,6 +11,17 @@ target=x86_64-pc-windows-gnullvm
 count="${PREWARM_SHADERS:-512}"
 rounds="${PREWARM_ROUNDS:-24}"
 repeats="${PREWARM_REPEATS:-3}"
+cli="${PREWARM_CLI:-}"
+fixture="${PREWARM_FIXTURE:-}"
+
+if [ -n "$cli" ] && [ ! -f "$cli" ]; then
+    printf 'PREWARM_CLI does not name a file: %s\n' "$cli" >&2
+    exit 1
+fi
+if [ -n "$fixture" ] && [ ! -f "$fixture" ]; then
+    printf 'PREWARM_FIXTURE does not name a file: %s\n' "$fixture" >&2
+    exit 1
+fi
 
 wine="${WINE:-$repo/target/wine-cx/bin/wine}"
 case "$wine" in
@@ -34,18 +45,19 @@ driver="$(getconf DARWIN_USER_CACHE_DIR)d3dm/$name"
 echo "Synthetic run output: $root"
 echo "Synthetic driver cache: $driver"
 
-# Select the same shader helpers for the application and test build. Run
-# from the temp folder and clear custom Victory variables in the Wine child.
-cli="${PREWARM_CLI:-}"
-fixture="${PREWARM_FIXTURE:-}"
+# Use the same shader helpers for any binaries that need building.
 if [ -z "$cli" ] || [ -z "$fixture" ]; then
     DXC_LIB="$framework/Versions/A/Resources/libdxcompiler.dylib"
     if [ -z "${VICTORY_HELPER_DXC:-}" ] && [ -f "$DXC_LIB" ]; then
         sh tools/macos/dxc-d3dmetal.sh "$root/dxc-d3dmetal"
         export DXC_LIB VICTORY_HELPER_DXC="$root/dxc-d3dmetal"
     fi
+fi
+if [ -z "$cli" ]; then
     cargo build --locked --release -p victory --target "$target"
     cli="$(cargo metadata --format-version 1 --no-deps | plutil -extract target_directory raw -o - -)/$target/release/victory.exe"
+fi
+if [ -z "$fixture" ]; then
     cargo test --locked --release -p victory-gpu --target "$target" --no-run \
         --message-format=json > "$root/build.jsonl"
     fixture="$(sed -nE 's/.*"executable":"([^"]*\/victory_gpu-[^"]*\.exe)".*/\1/p' "$root/build.jsonl")"

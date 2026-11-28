@@ -557,12 +557,42 @@ pub extern "system" fn ReadFile(
         );
     }
     drop(writing);
+    if done == 0 && error != ERROR_IO_PENDING {
+        failed_read(buffer, len, error);
+    }
     if super::read_stats::on() {
         super::read_stats::add_handle(file, u64::from(len));
     }
     // SAFETY: sets the thread's last error.
     unsafe { SetLastError(error) };
     done
+}
+
+/// A `ReadFile` the host failed (not one still in flight): logged the first
+/// few times and then at each power of two, with what the destination's
+/// pages are, since the title retries some reads forever and a read that
+/// cannot complete otherwise shows only as a load that never ends.
+fn failed_read(buffer: *mut u8, len: u32, error: u32) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    static FAILED: AtomicU64 = AtomicU64::new(0);
+    let n = FAILED.fetch_add(1, Ordering::Relaxed) + 1;
+    if n > 8 && !n.is_power_of_two() {
+        return;
+    }
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size; the address is only queried.
+    let queried = unsafe { VirtualQuery(buffer as *const _, &mut info, size_of_val(&info)) } != 0;
+    tracing::warn!(
+        n,
+        error,
+        buffer = format_args!("{:#x}", buffer as usize),
+        len,
+        protect = format_args!("{:#x}", if queried { info.Protect } else { 0 }),
+        state = format_args!("{:#x}", if queried { info.State } else { 0 }),
+        "ReadFile failed (the title retries some reads for good)"
+    );
 }
 
 /// The host CRT reads large requests straight into the caller's buffer.

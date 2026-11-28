@@ -23,19 +23,19 @@ use crate::host::host;
 /// A stream's graphics state, owned (the title's stream lives only for the
 /// creation call). Subobjects the stream leaves out keep D3D12's defaults.
 pub(crate) struct GraphicsState {
-    blend: D3D12_BLEND_DESC,
-    sample_mask: u32,
-    rasterizer: D3D12_RASTERIZER_DESC,
-    depth: D3D12_DEPTH_STENCIL_DESC,
-    depth_bounds: bool,
+    pub(super) blend: D3D12_BLEND_DESC,
+    pub(super) sample_mask: u32,
+    pub(super) rasterizer: D3D12_RASTERIZER_DESC,
+    pub(super) depth: D3D12_DEPTH_STENCIL_DESC,
+    pub(super) depth_bounds: bool,
     /// Input elements, their names pointing into `names`.
-    inputs: Vec<D3D12_INPUT_ELEMENT_DESC>,
-    names: Vec<CString>,
-    strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE,
+    pub(super) inputs: Vec<D3D12_INPUT_ELEMENT_DESC>,
+    pub(super) names: Vec<CString>,
+    pub(super) strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE,
     pub(crate) topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE,
     pub(crate) targets: D3D12_RT_FORMAT_ARRAY,
-    depth_format: DXGI_FORMAT,
-    samples: DXGI_SAMPLE_DESC,
+    pub(super) depth_format: DXGI_FORMAT,
+    pub(super) samples: DXGI_SAMPLE_DESC,
 }
 
 impl Default for GraphicsState {
@@ -477,6 +477,70 @@ pub(crate) struct HostPipeline {
     pub(crate) marks: Option<(u32, u32)>,
 }
 
+/// The stages [`HostPipeline::new`] translates together for a mesh
+/// pipeline, if any; `None` when each stage keeps its own translation.
+/// Shared with [`retranslated`], so that `victory replay --retranslate`
+/// reports what a run makes.
+///
+/// Mesh shaders whose standalone output footprint (packed or Metal-
+/// aligned) exceeds Metal's 32 KiB limit are re-translated together with
+/// their paired pixel shader, pruning unread outputs and repacking
+/// attribute order to eliminate alignment padding holes. When the paired pixel
+/// shader reads non-provoking vertex values (`VICTORY_P10`/`VICTORY_P20`),
+/// mesh pipelines have no geometry stage, so lower those reads to
+/// hardware center interpolation (`VICTORY_MESH_PER_VERTEX_CENTER`).
+fn linked_stages(
+    mesh: Option<&Arc<Shader>>,
+    pixel: Option<&Arc<Shader>>,
+) -> Option<(Arc<Shader>, Option<Arc<Shader>>)> {
+    let ps_deltas = mesh.is_some()
+        && super::mesh_per_vertex_center()
+        && pixel
+            .and_then(|ps| ps.translated())
+            .is_some_and(|ps| victory_shader::emit::needs_vertex_deltas(&ps.host.dxil));
+    mesh.and_then(|ms| {
+        let over_limit = super::link_mesh_outputs()
+            && over_limit_mesh_output_bytes(&ms.translated()?.host.dxil).is_some();
+        if over_limit {
+            super::translate_linked(ms, pixel.map(Arc::as_ref), ps_deltas)
+        } else if ps_deltas {
+            let ps = pixel?;
+            let ps_center = super::translate_pixel_center(ps)?;
+            Some((ms.clone(), Some(ps_center)))
+        } else {
+            None
+        }
+    })
+}
+
+/// For `victory replay --retranslate` (`crate::replay::play::retranslate`):
+/// the DXIL each stage of a pipeline of the title's containers `stages`
+/// (stage and container) gets from this build with this run's switches, as
+/// [`HostPipeline::new`] chooses it ([`linked_stages`]); and whether it is
+/// one made for the pipeline rather than the stage's own translation.
+pub(crate) fn retranslated(stages: &[(&'static str, &[u8])]) -> Vec<(Result<Vec<u8>, String>, bool)> {
+    let shaders: Vec<Arc<Shader>> = stages
+        .iter()
+        .map(|(stage, bytes)| super::shader(stage, bytes))
+        .collect();
+    let find = |stage: &str| shaders.iter().find(|s| s.stage == stage);
+    let linked = linked_stages(find("mesh"), find("pixel"));
+    let dxil = |s: &Arc<Shader>| {
+        s.translated()
+            .map(|t| t.host.dxil.clone())
+            .ok_or_else(|| "it does not translate (the log says why)".to_owned())
+    };
+    shaders
+        .iter()
+        .map(|s| match (s.stage, &linked) {
+            // A pixel shader lowered alone keeps the mesh shader as it is.
+            ("mesh", Some((ms, _))) => (dxil(ms), !Arc::ptr_eq(ms, s)),
+            ("pixel", Some((_, Some(ps)))) => (dxil(ps), true),
+            _ => (dxil(s), false),
+        })
+        .collect()
+}
+
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
@@ -527,31 +591,7 @@ impl HostPipeline {
         for (s, _) in &stages {
             s.translated()?;
         }
-        // Mesh shaders whose standalone output footprint (packed or Metal-
-        // aligned) exceeds Metal's 32 KiB limit are re-translated together with
-        // their paired pixel shader, pruning unread outputs and repacking
-        // attribute order to eliminate alignment padding holes. When the paired pixel
-        // shader reads non-provoking vertex values (`VICTORY_P10`/`VICTORY_P20`),
-        // mesh pipelines have no geometry stage, so lower those reads to
-        // hardware center interpolation (`VICTORY_MESH_PER_VERTEX_CENTER`).
-        let ps_deltas = mesh.is_some()
-            && super::mesh_per_vertex_center()
-            && find("pixel")
-                .and_then(|ps| ps.translated())
-                .is_some_and(|ps| victory_shader::emit::needs_vertex_deltas(&ps.host.dxil));
-        let linked = mesh.and_then(|ms| {
-            let over_limit = super::link_mesh_outputs()
-                && over_limit_mesh_output_bytes(&ms.translated()?.host.dxil).is_some();
-            if over_limit {
-                super::translate_linked(ms, find("pixel").map(Arc::as_ref), ps_deltas)
-            } else if ps_deltas {
-                let ps = find("pixel")?;
-                let ps_center = super::translate_pixel_center(ps)?;
-                Some((ms.clone(), Some(ps_center)))
-            } else {
-                None
-            }
-        });
+        let linked = linked_stages(mesh, find("pixel"));
         let stages: Vec<(&Arc<Shader>, D3D12_SHADER_VISIBILITY)> = match &linked {
             Some((ms, ps)) => {
                 let mut v = vec![(ms, D3D12_SHADER_VISIBILITY_MESH)];

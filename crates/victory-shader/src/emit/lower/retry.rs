@@ -19,10 +19,53 @@ pub(crate) fn lower_pruned(
     lower_limited(parts, keep, per_vertex_center, literal_halves, false)
 }
 
-/// [`lower_pruned`]; `limits`: a compute program that can leave the lanes
-/// past a dispatch's count of threads does so at once
-/// ([`Lower::leave_past_the_count`]; never in literal halves).
+/// [`lower_pruned`]; `limits`: a dispatch counted in threads may end in a
+/// part of a group, whose other lanes the console does not start. A
+/// compute program that can leave them at the start does
+/// ([`Lower::leave_past_the_count`]; never in literal halves). One that
+/// cannot (they would miss its group barriers and its exchanges between
+/// 32-lane halves) keeps them, outside EXEC from the entry on, as the
+/// console has them in its last wave
+/// ([`crate::structure::structure_limited`]). Where that form is refused
+/// too, the program is as without `limits`: its last group runs whole.
 pub(crate) fn lower_limited(
+    parts: &Parts,
+    keep: Option<&KeptOutputs>,
+    per_vertex_center: bool,
+    literal_halves: bool,
+    limits: bool,
+) -> Result<Lowered, ShaderError> {
+    let first = lower_limited_as_structured(parts, keep, per_vertex_center, literal_halves, limits);
+    let counted = |l: &Lowered| {
+        l.user_data
+            .iter()
+            .any(|u| u.root == RootType::Other(super::super::USER_DISPATCH_THREADS_X))
+    };
+    let one_row = matches!(
+        &parts.native.io,
+        StageIo::Cs(cs) if cs.threads[0] > 1 && cs.threads[1..] == [1, 1]
+    );
+    if !limits || !one_row || parts.st.limited || first.as_ref().is_ok_and(counted) {
+        return first;
+    }
+    let limited = crate::structure::structure_limited(parts.p).and_then(|st| {
+        let native = parts.native;
+        let res = crate::resource::track(parts.p, &native.layout, native.stage, Some(&st))?;
+        let parts = Parts {
+            st: &st,
+            res: &res,
+            ..parts.clone()
+        };
+        lower_limited_as_structured(&parts, keep, per_vertex_center, false, limits)
+    });
+    match limited {
+        Ok(limited) if counted(&limited) => Ok(limited),
+        _ => first,
+    }
+}
+
+/// [`lower_limited`] with the lanes as `parts.st` has them.
+fn lower_limited_as_structured(
     parts: &Parts,
     keep: Option<&KeptOutputs>,
     per_vertex_center: bool,

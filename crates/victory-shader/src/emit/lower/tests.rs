@@ -80,6 +80,7 @@ fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
         atomic_locks: false,
         atomic_lock_rounds: false,
             atomic_umax: false,
+            racy_minmax: false,
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
@@ -139,6 +140,7 @@ fn lower_wave(
         atomic_locks: false,
         atomic_lock_rounds: false,
         atomic_umax: false,
+        racy_minmax: false,
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
@@ -449,6 +451,7 @@ fn perm_features(selector: u32) -> u64 {
         atomic_locks: false,
         atomic_lock_rounds: false,
         atomic_umax: false,
+        racy_minmax: false,
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
@@ -1431,6 +1434,7 @@ fn lowered_result(
         atomic_locks: false,
         atomic_lock_rounds: false,
         atomic_umax: false,
+        racy_minmax: false,
         bias_as_gradients: false,
         narrow_waves,
         uav_size_level0: false,
@@ -1673,6 +1677,7 @@ fn lowered_halves_lds(
         atomic_locks: false,
         atomic_lock_rounds: false,
         atomic_umax: false,
+        racy_minmax: false,
         bias_as_gradients: false,
         narrow_waves: false,
         uav_size_level0: false,
@@ -2397,6 +2402,7 @@ fn ds_bpermute_wave64_preserves_32_lane_half() {
             atomic_locks: false,
             atomic_lock_rounds: false,
         atomic_umax: false,
+        racy_minmax: false,
             bias_as_gradients: false,
             narrow_waves: false,
             uav_size_level0: false,
@@ -2497,6 +2503,7 @@ fn lower_ps_for_early_z(
         atomic_locks: false,
         atomic_lock_rounds: false,
         atomic_umax: false,
+        racy_minmax: false,
         bias_as_gradients: false,
         narrow_waves: false,
         uav_size_level0: false,
@@ -3302,6 +3309,7 @@ fn lower_halves_io(
             atomic_locks: false,
             atomic_lock_rounds: false,
             atomic_umax: false,
+            racy_minmax: false,
             bias_as_gradients: false,
             host_wave32: true,
             narrow_waves: false,
@@ -4477,4 +4485,220 @@ fn a_cndmask_with_vccz_as_its_mask_keeps_the_first_lane_refusal() {
     );
 }
 
+/// Which lanes of each console wave (by `v0 & 63`, or `v0 & 1` for `Even`)
+/// put `vcc`, through `v3`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Lanes {
+    Even,
+    Below(u32),
+    From(u32),
+}
 
+impl Lanes {
+    fn words(self) -> [u32; 2] {
+        match self {
+            // v_and_b32 v3, 1, v0; v_cmp_eq_u32 vcc, 0, v3
+            Lanes::Even => [0x3606_0081, 0x7D84_0680],
+            // v_and_b32 v3, 63, v0; v_cmp_gt_u32 vcc, n, v3
+            Lanes::Below(n) => [0x3606_00BF, 0x7D88_0680 + n],
+            // v_and_b32 v3, 63, v0; v_cmp_le_u32 vcc, n, v3
+            Lanes::From(n) => [0x3606_00BF, 0x7D86_0680 + n],
+        }
+    }
+}
+
+/// How many steps of a dependent chain the late lanes of
+/// [`mask_in_predicated_guards`] run (two dwords each, so the branches over
+/// them stay within `s_cbranch`'s 16-bit offset).
+pub(crate) const LATE_STEPS: u32 = 15000;
+
+/// The value the late lanes' chain leaves in `v4` for thread `x` (`v0`):
+/// `x + 1`, then [`LATE_STEPS`] times squared (24-bit) and xored with `x`.
+/// Each step needs the one before, and the result is stored, so the host
+/// compiler can neither fold the chain nor drop it.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn late_chain(x: u32) -> u32 {
+    (0..LATE_STEPS).fold(x + 1, |v, _| {
+        let v = v & 0xFF_FFFF;
+        v.wrapping_mul(v) ^ x
+    })
+}
+
+/// `buffer_store_dword v<vdata>, v16, s[40:43], 0 offen offset:<offset>`
+/// (the halves GPU tests' result buffer).
+const fn store(vdata: u8, offset: u32) -> [u32; 2] {
+    [0xE070_1000 | offset, 0x800A_0010 | (vdata as u32) << 8]
+}
+
+/// A lane mask read as data where selective predication runs lanes whose
+/// path is elsewhere too, as in compute programs that start with an early
+/// out (`lower::predicate`): the lanes from 56 leave (an early out, run on
+/// as nothing). The lanes below 40 go through a guard predication leaves
+/// divergent, its body holding an end of the program (the lanes from 63,
+/// none of them here, end), so it is neither a skip guard nor a flat
+/// diamond. There they put the even-lane compare in `vcc` and move both
+/// dwords to `v1`, `v2` (a meet site). The upper half's lanes there (32 to
+/// 39) first run a long dependent chain into `v4` ([`late_chain`]). Counted
+/// done by every lane running the guard's block, the upper half's 8 lanes
+/// from 56 would count there again: 32, its lane count, while its 8 late
+/// lanes are still on their way, and the lower half would read their
+/// ballot bits as 0. The result buffer gets `v1`, `v2` (-1 where not set)
+/// and `v4` (0 where not set), per lane.
+pub(crate) fn mask_in_predicated_guards() -> Vec<u32> {
+    // The upper half's late lanes: a long dependent chain.
+    let mut chain = vec![0x4A08_0081]; // v_add_nc_u32 v4, 1, v0
+    for _ in 0..LATE_STEPS {
+        chain.extend([
+            0x1608_0904, // v_mul_u32_u24 v4, v4, v4
+            0x3A08_0900, // v_xor_b32 v4, v0, v4
+        ]);
+    }
+    let skip = |n: usize| {
+        assert!(
+            n < 0x8000,
+            "a branch over {n} dwords is past s_cbranch's offset"
+        );
+        0xBF88_0000 | n as u32 // s_cbranch_execz over n dwords
+    };
+    // The lanes from 63 end the program (none do: the guard's lanes are
+    // below 40), so the guard's body has an end.
+    let mut body = Lanes::From(63).words().to_vec();
+    body.extend([0xBE9A_246A, skip(1), S_ENDPGM]); // s_and_saveexec_b64 s[26:27], vcc; over the end
+    body.push(0xBEFE_041A); // s_mov_b64 exec, s[26:27]
+    body.extend(Lanes::From(32).words());
+    body.extend([0xBE9C_246A, skip(chain.len())]); // s_and_saveexec_b64 s[28:29], vcc
+    body.extend(chain);
+    body.push(0xBEFE_041C); // s_mov_b64 exec, s[28:29]
+    body.extend(Lanes::Even.words());
+    body.extend([
+        0x7E02_026A, // v_mov_b32 v1, vcc_lo
+        0x7E04_026B, // v_mov_b32 v2, vcc_hi
+    ]);
+    // The lanes below 40.
+    let mut guard = Lanes::Below(40).words().to_vec();
+    guard.extend([0xBE98_246A, skip(body.len())]); // s_and_saveexec_b64 s[24:25], vcc; to the join
+    guard.extend(body);
+    guard.push(0xBEFE_0418); // the join: s_mov_b64 exec, s[24:25]
+    guard.extend(store(1, 0));
+    guard.extend(store(2, 4));
+    guard.extend(store(4, 8));
+    guard.push(S_ENDPGM);
+    let mut w = HALVES_PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x7E02_02C1, // v_mov_b32 v1, -1
+        0x7E04_02C1, // v_mov_b32 v2, -1
+        0x7E08_0280, // v_mov_b32 v4, 0
+    ]);
+    w.extend(store(1, 0));
+    w.extend(store(2, 4));
+    w.extend(store(4, 8));
+    // The lanes from 56 leave (an early out).
+    w.extend(Lanes::Below(56).words());
+    w.extend([0xBE94_246A, skip(guard.len())]); // s_and_saveexec_b64 s[20:21], vcc; to the end
+    w.extend(guard);
+    w.push(S_ENDPGM);
+    w
+}
+
+/// The console's [`mask_in_predicated_guards`] in a group of `threads`.
+// Used by the halves GPU tests (Windows).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn console_mask_in_predicated_guards(threads: u32) -> Vec<u32> {
+    (0..threads)
+        .flat_map(|l| {
+            let t = l & 63;
+            if t >= 40 {
+                return [u32::MAX, u32::MAX, 0];
+            }
+            [0x5555_5555, 0x55, if t >= 32 { late_chain(l) } else { 0 }]
+        })
+        .collect()
+}
+
+/// The halves GPU tests' prologue: `s[40:43]`, the raw UAV at table dword
+/// 16 (s0 is the table's address).
+const HALVES_PROLOGUE: [u32; 5] = [
+    0xBE84_0300,
+    0xBE85_0380,
+    0xF408_0A02,
+    0xFA00_0040,
+    0xBF8C_C07F,
+];
+
+/// [`mask_in_predicated_guards`] meets between the halves with selective
+/// predication on (the guards around its site predicated as in the
+/// programs it stands for), and stays refused without the rendezvous.
+#[test]
+fn a_mask_behind_predicated_guards_meets() {
+    let words = mask_in_predicated_guards();
+    let range = |kind, table_offset_dwords, dwords| UsedResource {
+        kind,
+        root: RootType::Table,
+        table_offset_dwords,
+        lower_bound: 0,
+        stride: 0,
+        dwords,
+        user_data: 0,
+        slot: 0,
+    };
+    for threads in [64, 128, 256] {
+        for rendezvous in [true, false] {
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: true,
+                vgprs: 32,
+                layout: vec![RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                used: vec![
+                    range(ResourceType::Srv, 0, 8),
+                    range(ResourceType::Srv, 8, 4),
+                    range(ResourceType::Uav, 16, 4),
+                ],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 1 << 1,
+                    threads: [threads, 1, 1],
+                }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = ir::build(&native.code, true, 32).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let r = lower(&Parts {
+                halves_rendezvous: rendezvous,
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+                atomic_locks: false,
+                atomic_lock_rounds: false,
+                atomic_umax: false,
+                racy_minmax: false,
+                bias_as_gradients: false,
+                host_wave32: true,
+                narrow_waves: false,
+                uav_size_level0: false,
+                view_marks: false,
+            });
+            match (rendezvous, r) {
+                (true, Ok(l)) => assert_eq!(l.wave_size, Some(32)),
+                (false, Err(crate::ShaderError::Unsupported { what, .. })) => {
+                    assert_eq!(what, super::halves::MASK_ACROSS);
+                }
+                (_, r) => panic!("{threads} rendezvous={rendezvous}: {:?}", r.map(|_| ())),
+            }
+        }
+    }
+}

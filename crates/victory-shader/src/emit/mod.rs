@@ -475,11 +475,12 @@ pub const ROOT_UAV_VIEW: u32 = 3;
 pub const ROOT_VIEW_OFFSET: u32 = 4;
 /// `RootType::Other` code of a user-data dword the host fills at a dispatch
 /// whose counts are threads, not groups (the console's `DispatchX` with its
-/// thread-dimensions flag): how many threads along x run, the lanes past
-/// that count leaving at once; 0, every lane of every group. Its
-/// [`UserData::dword`] is the group's width. Read only in translations
-/// with [`Options::thread_limits`], by compute programs of one dimension
-/// whose lanes never wait for each other (`Lower::leave_past_the_count`).
+/// thread-dimensions flag): how many threads along x run; 0, every lane of
+/// every group. Its [`UserData::dword`] is the group's width. Read only in
+/// translations with [`Options::thread_limits`], by compute programs of
+/// one dimension: the lanes past the count leave at once where no lane
+/// waits for another (`Lower::leave_past_the_count`), and elsewhere stay,
+/// outside EXEC from the entry on (`structure::structure_limited`).
 /// After DexNom/VIctory bc3cd4b0.
 pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
 
@@ -564,6 +565,16 @@ pub struct Options {
     /// representative a group locking (module notes, "Atomic locks"). The
     /// translation differs, so the shader cache keys on it.
     pub atomic_umax: bool,
+    /// With [`Options::atomic_locks`]: a compute or mesh program's glc-clear
+    /// 64-bit min or max runs as a plain read, compare and write, without the
+    /// lock and its fences. Two lanes that update one texel at the same time
+    /// can lose the smaller update (the texel keeps a value that was written,
+    /// never a torn one), which Grand Theft Auto VI's hair visibility pass
+    /// (`CS_VisHair`, a strand per lane, one atomic per pixel it crosses)
+    /// shows at most as a strand behind another for a frame, at a fraction
+    /// of the lock's cost. The translation differs, so the shader cache keys
+    /// on it.
+    pub racy_minmax: bool,
     /// Compute-stage biased samples run as gradient samples with the quad
     /// gradients scaled by `2^bias`, for hosts that ignore the bias of a
     /// compute shader's sample (D3DMetal, #30).
@@ -599,9 +610,11 @@ pub struct Options {
     /// a read across the halves is refused. The translation differs, so
     /// the shader cache keys on it.
     pub halves_rendezvous: bool,
-    /// A compute program of one dimension whose lanes never wait for each
-    /// other reads [`USER_DISPATCH_THREADS_X`]: the lanes past a dispatch's
-    /// count of threads leave at once, as the console never starts them.
+    /// A compute program of one dimension reads
+    /// [`USER_DISPATCH_THREADS_X`]: the console never starts the lanes past
+    /// a dispatch's count of threads. They leave at once where no lane
+    /// waits for another; where lanes wait (a group barrier, 32-lane halves
+    /// passing values) they stay, outside EXEC from the entry on.
     /// The host asks for it only for programs a dispatch counted in threads
     /// ends in a part of a group of (`victory_gpu::pipeline::thread_limited`).
     pub thread_limits: bool,
@@ -1111,6 +1124,7 @@ fn emit_pruned(
         atomic_locks: options.atomic_locks,
         atomic_lock_rounds: options.atomic_lock_rounds,
         atomic_umax: options.atomic_umax,
+        racy_minmax: options.racy_minmax,
         bias_as_gradients: options.bias_as_gradients,
         host_wave32: options.host_wave32,
         narrow_waves: options.narrow_waves,
@@ -2703,7 +2717,9 @@ mod tests {
             ));
         }
         // Where the hardware has mesh shaders: the shapes within the limit
-        // draw; D3DMetal makes no-op pipelines of the others.
+        // draw; D3DMetal makes no-op pipelines of the others, which are
+        // made but not drawn: a draw with one never finished on an M3 Pro
+        // (macOS 26.2, D3DMetal 4.0 beta 3), and the queue stayed blocked.
         #[cfg(windows)]
         {
             use super::host::{Draw, Host, Root};
@@ -2736,29 +2752,28 @@ mod tests {
                 let root = host
                     .root_signature_for(&[(ms, D3D12_SHADER_VISIBILITY_MESH)])
                     .unwrap();
-                let drawn = host
-                    .mesh_pipeline_with(&root, &ms.dxil, &ps)
-                    .and_then(|pso| {
-                        host.draw(
-                            &root,
-                            &pso,
-                            &Draw {
-                                roots: vec![(0, Root::Constants(vec![0]))],
-                                textures: &[],
-                                samplers: &[],
-                                vertices: &[],
-                                stride: 0,
-                                size: (16, 16),
-                                mesh_groups: 1,
-                            },
-                        )
-                    });
-                let drawn = drawn.map(|t| t.iter().all(|t| *t == [1.0, 0.5, 0.25, 1.0]));
-                if bytes <= METAL_MESH_OUTPUT_BYTES {
-                    assert_eq!(drawn, Ok(true), "{label}: {bytes} bytes");
-                } else {
-                    eprintln!("{label}: {bytes} bytes, drawn {drawn:?}");
+                let pso = host.mesh_pipeline_with(&root, &ms.dxil, &ps);
+                if bytes > METAL_MESH_OUTPUT_BYTES {
+                    eprintln!("{label}: {bytes} bytes, pipeline made {}", pso.is_ok());
+                    continue;
                 }
+                let drawn = pso.and_then(|pso| {
+                    host.draw(
+                        &root,
+                        &pso,
+                        &Draw {
+                            roots: vec![(0, Root::Constants(vec![0]))],
+                            textures: &[],
+                            samplers: &[],
+                            vertices: &[],
+                            stride: 0,
+                            size: (16, 16),
+                            mesh_groups: 1,
+                        },
+                    )
+                });
+                let drawn = drawn.map(|t| t.iter().all(|t| *t == [1.0, 0.5, 0.25, 1.0]));
+                assert_eq!(drawn, Ok(true), "{label}: {bytes} bytes");
             }
         }
     }
@@ -4288,13 +4303,22 @@ mod tests {
                         )
                     };
                     let expected = [1.0, 0.5, 0.25, 1.0];
-                    // D3DMetal draws nothing with the standalone pair.
+                    // D3DMetal makes a no-op pipeline of the standalone pair. It
+                    // is made, not drawn: a draw with it never finished on an
+                    // M3 Pro, and the linked draw below queued behind it.
                     let full_ps = emit_pruned(&ps_in, Options::default(), None).unwrap();
-                    let standalone_drawn = draw(&standalone, &full_ps)
-                        .map(|t| t.iter().filter(|t| **t == expected).count());
+                    let standalone_made = host
+                        .root_signature_for(&[
+                            (&standalone, D3D12_SHADER_VISIBILITY_MESH),
+                            (&full_ps, D3D12_SHADER_VISIBILITY_PIXEL),
+                        ])
+                        .and_then(|root| {
+                            host.mesh_pipeline_with(&root, &standalone.dxil, &full_ps.dxil)
+                        })
+                        .is_ok();
                     eprintln!(
                         "{label}, scalar first {scalar_first}: {refused} bytes, \
-                         {standalone_drawn:?} of 256 texels drawn"
+                         standalone pipeline made {standalone_made}"
                     );
                     let texels = draw(&linked_ms, &linked_ps)
                         .unwrap_or_else(|e| panic!("{label}: linked mesh draw: {e}"));

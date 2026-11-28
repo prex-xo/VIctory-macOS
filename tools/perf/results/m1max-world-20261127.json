@@ -1,0 +1,2753 @@
+{
+ "what": "Unattended VIctory benchmarks of Grand Theft Auto VI (Series X profile) on one Mac, 27 November 2026",
+ "mac": "MacBook Pro (MacBookPro18,2), Apple M1 Max, 64 GB, macOS 26.6.2, High Power Mode",
+ "method": "VICTORY_KEYS='2-150/1:Enter' passes the title screen and menus; VICTORY_INPUT_REPLAY holds every stick at 0 so the character stands still in the same scene; VICTORY_BENCH_WARMUP=60 world frames, then VICTORY_BENCH_EXIT_FRAMES=240 measured, then a clean exit. Every run set VICTORY_FAULT_TRACKING=1, VICTORY_PATCH_MASKED=all, VICTORY_ASYNC_SUBMIT=1, VICTORY_STEP_OVER=pool, VICTORY_RAY_TRACING=0, VICTORY_AMBIENT=1, WINEMSYNC=1; 'switches' lists only what a run set beyond that. 'bench' is the report the run wrote; 'world_reports' are medians of the frame-rate lines in its log. A build's first run translates its shaders cold (labels ending in -cold), so compare warm runs. Single runs vary 15% or more with the scene: compare draws too, or ms per draw.",
+ "runs": [
+  {
+   "label": "b-avx",
+   "started": "2026-11-27 10:39:51",
+   "console": "series-x",
+   "exe": "victory-main.exe",
+   "build": "main d1609d9 + 7 M1 Max commits + WIP (m1max/branch-on-main-1127): the best build at 08:40",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 3.0",
+   "switches": {
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 759.8,
+    "preparing_ms": 136.0,
+    "gpu_ms": 546.2,
+    "copy_back_ms": 25.5,
+    "draws": 4919.5,
+    "reports": 20
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 68,
+    "frame_ms": {
+     "avg": 657.384,
+     "median": 698.002,
+     "p95": 965.582,
+     "p99": 1259.032,
+     "low_5pct_fps": 0.899,
+     "low_1pct_fps": 0.731
+    },
+    "draws": {
+     "avg": 3917.308,
+     "min": 0,
+     "max": 11510
+    },
+    "zero_draw_world_frames": 53,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 3942.0,
+    "vram_budget_mb": 106168.344,
+    "ram_private_commit_peak_mb": 141366.676,
+    "ram_working_set_peak_mb": 28203.957,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "b-base1",
+   "started": "2026-11-27 08:54:32",
+   "console": "series-x",
+   "exe": "victory-main.exe",
+   "build": "main d1609d9 + 7 M1 Max commits + WIP (m1max/branch-on-main-1127): the best build at 08:40",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 3.0",
+   "switches": {
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 733.8,
+    "preparing_ms": 139.4,
+    "gpu_ms": 546.5,
+    "copy_back_ms": 25.5,
+    "draws": 5002.0,
+    "reports": 19
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 69,
+    "frame_ms": {
+     "avg": 629.999,
+     "median": 686.204,
+     "p95": 981.384,
+     "p99": 1155.217,
+     "low_5pct_fps": 0.919,
+     "low_1pct_fps": 0.857
+    },
+    "draws": {
+     "avg": 3792.637,
+     "min": 0,
+     "max": 11081
+    },
+    "zero_draw_world_frames": 57,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 3174.0,
+    "vram_budget_mb": 106168.344,
+    "ram_private_commit_peak_mb": 141041.496,
+    "ram_working_set_peak_mb": 27611.527,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "b-base2",
+   "started": "2026-11-27 09:03:30",
+   "console": "series-x",
+   "exe": "victory-main.exe",
+   "build": "main d1609d9 + 7 M1 Max commits + WIP (m1max/branch-on-main-1127): the best build at 08:40",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 3.0",
+   "switches": {
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 771.9,
+    "preparing_ms": 139.3,
+    "gpu_ms": 565.2,
+    "copy_back_ms": 26.5,
+    "draws": 5031.0,
+    "reports": 19
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 68,
+    "frame_ms": {
+     "avg": 654.01,
+     "median": 711.227,
+     "p95": 971.176,
+     "p99": 1259.419,
+     "low_5pct_fps": 0.855,
+     "low_1pct_fps": 0.679
+    },
+    "draws": {
+     "avg": 3912.613,
+     "min": 0,
+     "max": 13571
+    },
+    "zero_draw_world_frames": 56,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 3942.0,
+    "vram_budget_mb": 106168.344,
+    "ram_private_commit_peak_mb": 140806.078,
+    "ram_working_set_peak_mb": 27522.152,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "b-base3",
+   "started": "2026-11-27 10:44:22",
+   "console": "series-x",
+   "exe": "victory-main.exe",
+   "build": "main d1609d9 + 7 M1 Max commits + WIP (m1max/branch-on-main-1127): the best build at 08:40",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 3.0",
+   "switches": {
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 778.1,
+    "preparing_ms": 147.1,
+    "gpu_ms": 560.7,
+    "copy_back_ms": 27.1,
+    "draws": 4948.0,
+    "reports": 19
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 71,
+    "frame_ms": {
+     "avg": 663.348,
+     "median": 725.148,
+     "p95": 974.147,
+     "p99": 1083.514,
+     "low_5pct_fps": 0.943,
+     "low_1pct_fps": 0.87
+    },
+    "draws": {
+     "avg": 3912.083,
+     "min": 0,
+     "max": 11012
+    },
+    "zero_draw_world_frames": 53,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 3942.0,
+    "vram_budget_mb": 106168.344,
+    "ram_private_commit_peak_mb": 142438.773,
+    "ram_working_set_peak_mb": 28752.316,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "b-d3dm4-1",
+   "started": "2026-11-27 09:34:36",
+   "console": "series-x",
+   "exe": "victory-main.exe",
+   "build": "main d1609d9 + 7 M1 Max commits + WIP (m1max/branch-on-main-1127): the best build at 08:40",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 4.0 beta 3",
+   "switches": {
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 794.9,
+    "preparing_ms": 177.1,
+    "gpu_ms": 518.4,
+    "copy_back_ms": 29.0,
+    "draws": 4980.0,
+    "reports": 37
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 77,
+    "frame_ms": {
+     "avg": 774.873,
+     "median": 699.153,
+     "p95": 1097.158,
+     "p99": 1197.244,
+     "low_5pct_fps": 0.825,
+     "low_1pct_fps": 0.741
+    },
+    "draws": {
+     "avg": 4979.962,
+     "min": 0,
+     "max": 10574
+    },
+    "zero_draw_world_frames": 27,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 17428.969,
+    "vram_budget_mb": 53084.172,
+    "ram_private_commit_peak_mb": 138273.574,
+    "ram_working_set_peak_mb": 20043.695,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "b-d3dm4-2",
+   "started": "2026-11-27 09:41:29",
+   "console": "series-x",
+   "exe": "victory-main.exe",
+   "build": "main d1609d9 + 7 M1 Max commits + WIP (m1max/branch-on-main-1127): the best build at 08:40",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 4.0 beta 3",
+   "switches": {
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 756.2,
+    "preparing_ms": 146.6,
+    "gpu_ms": 526.0,
+    "copy_back_ms": 27.9,
+    "draws": 5047.0,
+    "reports": 21
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 71,
+    "frame_ms": {
+     "avg": 690.567,
+     "median": 697.995,
+     "p95": 1000.872,
+     "p99": 1212.624,
+     "low_5pct_fps": 0.874,
+     "low_1pct_fps": 0.778
+    },
+    "draws": {
+     "avg": 4295.942,
+     "min": 0,
+     "max": 11168
+    },
+    "zero_draw_world_frames": 50,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 19073.875,
+    "vram_budget_mb": 53084.172,
+    "ram_private_commit_peak_mb": 140518.383,
+    "ram_working_set_peak_mb": 22859.57,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "b-dedupe",
+   "started": "2026-11-27 08:59:11",
+   "console": "series-x",
+   "exe": "victory-main.exe",
+   "build": "main d1609d9 + 7 M1 Max commits + WIP (m1max/branch-on-main-1127): the best build at 08:40",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 3.0",
+   "switches": {
+    "VICTORY_BARRIER_DEDUPE": "1",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 784.2,
+    "preparing_ms": 146.6,
+    "gpu_ms": 571.6,
+    "copy_back_ms": 26.9,
+    "draws": 5031.5,
+    "reports": 18
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 67,
+    "frame_ms": {
+     "avg": 635.296,
+     "median": 650.851,
+     "p95": 1000.486,
+     "p99": 1189.174,
+     "low_5pct_fps": 0.905,
+     "low_1pct_fps": 0.807
+    },
+    "draws": {
+     "avg": 3656.912,
+     "min": 0,
+     "max": 11040
+    },
+    "zero_draw_world_frames": 61,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 3942.0,
+    "vram_budget_mb": 106168.344,
+    "ram_private_commit_peak_mb": 142253.688,
+    "ram_working_set_peak_mb": 28722.523,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "b-gputiming",
+   "started": "2026-11-27 09:13:38",
+   "console": "series-x",
+   "exe": "victory-diag.exe",
+   "build": "victory-main.exe with --features diagnostics",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 3.0",
+   "switches": {
+    "VICTORY_GPU_TIMING": "1",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": null,
+   "bench": {
+    "world_frames": 80,
+    "warmup_frames": 35,
+    "frame_ms": {
+     "avg": 526.767,
+     "median": 457.109,
+     "p95": 945.185,
+     "p99": 983.588,
+     "low_5pct_fps": 0.98,
+     "low_1pct_fps": 0.86
+    },
+    "draws": {
+     "avg": 1612.225,
+     "min": 0,
+     "max": 7164
+    },
+    "zero_draw_world_frames": 21,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 2914.484,
+    "vram_budget_mb": 106168.344,
+    "ram_private_commit_peak_mb": 135031.363,
+    "ram_working_set_peak_mb": 26858.234,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "b-join256",
+   "started": "2026-11-27 09:27:14",
+   "console": "series-x",
+   "exe": "victory-main.exe",
+   "build": "main d1609d9 + 7 M1 Max commits + WIP (m1max/branch-on-main-1127): the best build at 08:40",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 3.0",
+   "switches": {
+    "VICTORY_JOIN_LISTS": "256",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 760.0,
+    "preparing_ms": 147.3,
+    "gpu_ms": 559.3,
+    "copy_back_ms": 25.1,
+    "draws": 4959.0,
+    "reports": 21
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 74,
+    "frame_ms": {
+     "avg": 673.383,
+     "median": 725.791,
+     "p95": 998.546,
+     "p99": 1132.462,
+     "low_5pct_fps": 0.9,
+     "low_1pct_fps": 0.764
+    },
+    "draws": {
+     "avg": 4031.996,
+     "min": 0,
+     "max": 11500
+    },
+    "zero_draw_world_frames": 48,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 3942.0,
+    "vram_budget_mb": 106168.344,
+    "ram_private_commit_peak_mb": 141267.348,
+    "ram_working_set_peak_mb": 28122.938,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "b-locks0",
+   "started": "2026-11-27 10:00:05",
+   "console": "series-x",
+   "exe": "victory-main.exe",
+   "build": "main d1609d9 + 7 M1 Max commits + WIP (m1max/branch-on-main-1127): the best build at 08:40",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 3.0",
+   "switches": {
+    "VICTORY_ATOMIC_LOCKS": "0",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 587.1,
+    "preparing_ms": 145.9,
+    "gpu_ms": 385.4,
+    "copy_back_ms": 25.3,
+    "draws": 4939.0,
+    "reports": 21
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 76,
+    "frame_ms": {
+     "avg": 601.949,
+     "median": 565.159,
+     "p95": 850.109,
+     "p99": 1331.887,
+     "low_5pct_fps": 0.935,
+     "low_1pct_fps": 0.661
+    },
+    "draws": {
+     "avg": 4659.292,
+     "min": 0,
+     "max": 11787
+    },
+    "zero_draw_world_frames": 38,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 3670.0,
+    "vram_budget_mb": 106168.344,
+    "ram_private_commit_peak_mb": 140261.18,
+    "ram_working_set_peak_mb": 28052.051,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "b-loop4k",
+   "started": "2026-11-27 10:27:02",
+   "console": "series-x",
+   "exe": "victory-main.exe",
+   "build": "main d1609d9 + 7 M1 Max commits + WIP (m1max/branch-on-main-1127): the best build at 08:40",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 3.0",
+   "switches": {
+    "VICTORY_SHADER_LOOP_LIMIT": "4096",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 752.5,
+    "preparing_ms": 135.5,
+    "gpu_ms": 554.6,
+    "copy_back_ms": 25.4,
+    "draws": 4904.5,
+    "reports": 18
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 69,
+    "frame_ms": {
+     "avg": 628.605,
+     "median": 630.036,
+     "p95": 989.907,
+     "p99": 1122.613,
+     "low_5pct_fps": 0.902,
+     "low_1pct_fps": 0.73
+    },
+    "draws": {
+     "avg": 3706.392,
+     "min": 0,
+     "max": 10974
+    },
+    "zero_draw_world_frames": 58,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 3942.0,
+    "vram_budget_mb": 106168.344,
+    "ram_private_commit_peak_mb": 140754.859,
+    "ram_working_set_peak_mb": 27374.496,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "b-rounds16",
+   "started": "2026-11-27 11:00:57",
+   "console": "series-x",
+   "exe": "victory-rounds16.exe",
+   "build": "victory-main.exe with ATOMIC_LOCK_ROUNDS 16 (was 4)",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 3.0",
+   "switches": {
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 763.9,
+    "preparing_ms": 139.5,
+    "gpu_ms": 559.1,
+    "copy_back_ms": 27.8,
+    "draws": 5094.0,
+    "reports": 31
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 69,
+    "frame_ms": {
+     "avg": 823.63,
+     "median": 734.283,
+     "p95": 1088.901,
+     "p99": 1538.922,
+     "low_5pct_fps": 0.463,
+     "low_1pct_fps": 0.2
+    },
+    "draws": {
+     "avg": 5001.117,
+     "min": 0,
+     "max": 10792
+    },
+    "zero_draw_world_frames": 41,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 3622.0,
+    "vram_budget_mb": 106168.344,
+    "ram_private_commit_peak_mb": 142862.93,
+    "ram_working_set_peak_mb": 29750.457,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "b-rounds16b",
+   "started": "2026-11-27 11:07:16",
+   "console": "series-x",
+   "exe": "victory-rounds16.exe",
+   "build": "victory-main.exe with ATOMIC_LOCK_ROUNDS 16 (was 4)",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 3.0",
+   "switches": {
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 776.7,
+    "preparing_ms": 145.3,
+    "gpu_ms": 553.3,
+    "copy_back_ms": 26.2,
+    "draws": 4997.0,
+    "reports": 18
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 67,
+    "frame_ms": {
+     "avg": 625.295,
+     "median": 622.683,
+     "p95": 994.702,
+     "p99": 1160.292,
+     "low_5pct_fps": 0.905,
+     "low_1pct_fps": 0.758
+    },
+    "draws": {
+     "avg": 3657.525,
+     "min": 0,
+     "max": 11062
+    },
+    "zero_draw_world_frames": 57,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 3942.0,
+    "vram_budget_mb": 106168.344,
+    "ram_private_commit_peak_mb": 142338.703,
+    "ram_working_set_peak_mb": 28741.023,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "b-sample",
+   "started": "2026-11-27 09:16:51",
+   "console": "series-x",
+   "exe": "victory-main.exe",
+   "build": "main d1609d9 + 7 M1 Max commits + WIP (m1max/branch-on-main-1127): the best build at 08:40",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 3.0",
+   "switches": {
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 834.3,
+    "preparing_ms": 161.8,
+    "gpu_ms": 554.7,
+    "copy_back_ms": 27.3,
+    "draws": 5005.0,
+    "reports": 15
+   },
+   "bench": {
+    "world_frames": 200,
+    "warmup_frames": 66,
+    "frame_ms": {
+     "avg": 652.068,
+     "median": 630.161,
+     "p95": 1029.589,
+     "p99": 1597.073,
+     "low_5pct_fps": 0.549,
+     "low_1pct_fps": 0.239
+    },
+    "draws": {
+     "avg": 3422.865,
+     "min": 0,
+     "max": 11350
+    },
+    "zero_draw_world_frames": 50,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 3942.0,
+    "vram_budget_mb": 106168.344,
+    "ram_private_commit_peak_mb": 142501.633,
+    "ram_working_set_peak_mb": 28587.699,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "b-scale05",
+   "started": "2026-11-27 09:07:59",
+   "console": "series-x",
+   "exe": "victory-main.exe",
+   "build": "main d1609d9 + 7 M1 Max commits + WIP (m1max/branch-on-main-1127): the best build at 08:40",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 3.0",
+   "switches": {
+    "VICTORY_RENDER_SCALE": "0.5",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 725.4,
+    "preparing_ms": 140.4,
+    "gpu_ms": 519.9,
+    "copy_back_ms": 26.0,
+    "draws": 4954.0,
+    "reports": 19
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 68,
+    "frame_ms": {
+     "avg": 603.466,
+     "median": 633.295,
+     "p95": 957.407,
+     "p99": 1086.256,
+     "low_5pct_fps": 0.939,
+     "low_1pct_fps": 0.798
+    },
+    "draws": {
+     "avg": 3690.971,
+     "min": 0,
+     "max": 10841
+    },
+    "zero_draw_world_frames": 56,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 3942.0,
+    "vram_budget_mb": 106168.344,
+    "ram_private_commit_peak_mb": 140146.613,
+    "ram_working_set_peak_mb": 27461.898,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "b-staleleft",
+   "started": "2026-11-27 11:16:56",
+   "console": "series-x",
+   "exe": "victory-main.exe",
+   "build": "main d1609d9 + 7 M1 Max commits + WIP (m1max/branch-on-main-1127): the best build at 08:40",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 3.0",
+   "switches": {
+    "VICTORY_STALE_LEFT": "1",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 761.1,
+    "preparing_ms": 128.7,
+    "gpu_ms": 551.0,
+    "copy_back_ms": 26.9,
+    "draws": 4850.5,
+    "reports": 20
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 65,
+    "frame_ms": {
+     "avg": 645.007,
+     "median": 691.977,
+     "p95": 1002.148,
+     "p99": 1109.254,
+     "low_5pct_fps": 0.941,
+     "low_1pct_fps": 0.892
+    },
+    "draws": {
+     "avg": 3739.875,
+     "min": 0,
+     "max": 11041
+    },
+    "zero_draw_world_frames": 50,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 3686.0,
+    "vram_budget_mb": 106168.344,
+    "ram_private_commit_peak_mb": 142998.953,
+    "ram_working_set_peak_mb": 28106.422,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "b-umax",
+   "started": "2026-11-27 09:20:53",
+   "console": "series-x",
+   "exe": "victory-main.exe",
+   "build": "main d1609d9 + 7 M1 Max commits + WIP (m1max/branch-on-main-1127): the best build at 08:40",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 3.0",
+   "switches": {
+    "VICTORY_ATOMIC_UMAX": "1",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 758.0,
+    "preparing_ms": 135.3,
+    "gpu_ms": 566.3,
+    "copy_back_ms": 25.9,
+    "draws": 4977.5,
+    "reports": 28
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 76,
+    "frame_ms": {
+     "avg": 759.611,
+     "median": 735.722,
+     "p95": 997.034,
+     "p99": 1140.68,
+     "low_5pct_fps": 0.871,
+     "low_1pct_fps": 0.715
+    },
+    "draws": {
+     "avg": 4850.671,
+     "min": 0,
+     "max": 14221
+    },
+    "zero_draw_world_frames": 41,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 3942.0,
+    "vram_budget_mb": 106168.344,
+    "ram_private_commit_peak_mb": 140826.727,
+    "ram_working_set_peak_mb": 27986.82,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "b-vis-locks1",
+   "started": "2026-11-27 10:05:38",
+   "console": "series-x",
+   "exe": "victory-diag.exe",
+   "build": "victory-main.exe with --features diagnostics",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 3.0",
+   "switches": {
+    "VICTORY_CAPTURE_WORLD": "2000,2100,2200,2300,2400,2500,2600,2700,2800",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 844.9,
+    "preparing_ms": 196.5,
+    "gpu_ms": 518.5,
+    "copy_back_ms": 27.1,
+    "draws": 4749.0,
+    "reports": 8
+   },
+   "bench": {
+    "world_frames": 150,
+    "warmup_frames": 71,
+    "frame_ms": {
+     "avg": 597.045,
+     "median": 548.517,
+     "p95": 1109.852,
+     "p99": 1361.986,
+     "low_5pct_fps": 0.812,
+     "low_1pct_fps": 0.731
+    },
+    "draws": {
+     "avg": 2934.073,
+     "min": 0,
+     "max": 9817
+    },
+    "zero_draw_world_frames": 43,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 3942.0,
+    "vram_budget_mb": 106168.344,
+    "ram_private_commit_peak_mb": 140391.621,
+    "ram_working_set_peak_mb": 26613.914,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "b-vis0",
+   "started": "2026-11-27 10:12:45",
+   "console": "series-x",
+   "exe": "victory-diag.exe",
+   "build": "victory-main.exe with --features diagnostics",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 3.0",
+   "switches": {
+    "VICTORY_CAPTURE_FRAMES": "1700,1750,1800,1850",
+    "VICTORY_ATOMIC_LOCKS": "0",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 726.3,
+    "preparing_ms": 205.6,
+    "gpu_ms": 416.4,
+    "copy_back_ms": 27.6,
+    "draws": 5047.0,
+    "reports": 8
+   },
+   "bench": {
+    "world_frames": 150,
+    "warmup_frames": 70,
+    "frame_ms": {
+     "avg": 604.079,
+     "median": 585.507,
+     "p95": 936.697,
+     "p99": 1143.553,
+     "low_5pct_fps": 0.919,
+     "low_1pct_fps": 0.701
+    },
+    "draws": {
+     "avg": 3486.02,
+     "min": 0,
+     "max": 13974
+    },
+    "zero_draw_world_frames": 34,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 3942.0,
+    "vram_budget_mb": 106168.344,
+    "ram_private_commit_peak_mb": 140566.348,
+    "ram_working_set_peak_mb": 28371.066,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "b-vis1",
+   "started": "2026-11-27 10:09:20",
+   "console": "series-x",
+   "exe": "victory-diag.exe",
+   "build": "victory-main.exe with --features diagnostics",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 3.0",
+   "switches": {
+    "VICTORY_CAPTURE_FRAMES": "1700,1750,1800,1850",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 852.2,
+    "preparing_ms": 198.3,
+    "gpu_ms": 542.1,
+    "copy_back_ms": 27.7,
+    "draws": 4781.0,
+    "reports": 9
+   },
+   "bench": {
+    "world_frames": 150,
+    "warmup_frames": 65,
+    "frame_ms": {
+     "avg": 578.335,
+     "median": 519.742,
+     "p95": 1053.167,
+     "p99": 1237.667,
+     "low_5pct_fps": 0.875,
+     "low_1pct_fps": 0.782
+    },
+    "draws": {
+     "avg": 2867.707,
+     "min": 0,
+     "max": 10204
+    },
+    "zero_draw_world_frames": 36,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 3942.0,
+    "vram_budget_mb": 106168.344,
+    "ram_private_commit_peak_mb": 139869.484,
+    "ram_working_set_peak_mb": 27732.098,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "c-vis0",
+   "started": "2026-11-27 10:21:42",
+   "console": "series-x",
+   "exe": "victory-diag.exe",
+   "build": "victory-main.exe with --features diagnostics",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 3.0",
+   "switches": {
+    "VICTORY_CAPTURE_FRAMES": "1950,2000,2050,2100,2150",
+    "VICTORY_ATOMIC_LOCKS": "0",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 668.6,
+    "preparing_ms": 201.3,
+    "gpu_ms": 402.5,
+    "copy_back_ms": 26.9,
+    "draws": 4943.0,
+    "reports": 21
+   },
+   "bench": {
+    "world_frames": 260,
+    "warmup_frames": 69,
+    "frame_ms": {
+     "avg": 605.291,
+     "median": 630.949,
+     "p95": 929.364,
+     "p99": 1151.16,
+     "low_5pct_fps": 0.926,
+     "low_1pct_fps": 0.752
+    },
+    "draws": {
+     "avg": 3879.281,
+     "min": 0,
+     "max": 11647
+    },
+    "zero_draw_world_frames": 56,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 3942.0,
+    "vram_budget_mb": 106168.344,
+    "ram_private_commit_peak_mb": 140742.043,
+    "ram_working_set_peak_mb": 27027.926,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "c-vis1",
+   "started": "2026-11-27 10:16:40",
+   "console": "series-x",
+   "exe": "victory-diag.exe",
+   "build": "victory-main.exe with --features diagnostics",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 3.0",
+   "switches": {
+    "VICTORY_CAPTURE_FRAMES": "1950,2000,2050,2100,2150",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 794.0,
+    "preparing_ms": 179.2,
+    "gpu_ms": 548.5,
+    "copy_back_ms": 26.4,
+    "draws": 4933.5,
+    "reports": 24
+   },
+   "bench": {
+    "world_frames": 260,
+    "warmup_frames": 71,
+    "frame_ms": {
+     "avg": 718.123,
+     "median": 752.093,
+     "p95": 1058.423,
+     "p99": 1131.677,
+     "low_5pct_fps": 0.888,
+     "low_1pct_fps": 0.817
+    },
+    "draws": {
+     "avg": 4064.592,
+     "min": 0,
+     "max": 10972
+    },
+    "zero_draw_world_frames": 45,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 3942.0,
+    "vram_budget_mb": 106168.344,
+    "ram_private_commit_peak_mb": 140731.207,
+    "ram_working_set_peak_mb": 27108.164,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "d-loop4k",
+   "started": "2026-11-27 10:31:35",
+   "console": "series-x",
+   "exe": "victory-diag.exe",
+   "build": "victory-main.exe with --features diagnostics",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 3.0",
+   "switches": {
+    "VICTORY_SHADER_LOOP_LIMIT": "4096",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 710.8,
+    "preparing_ms": 230.9,
+    "gpu_ms": 421.9,
+    "copy_back_ms": 30.0,
+    "draws": 5029.5,
+    "reports": 38
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 89,
+    "frame_ms": {
+     "avg": 719.569,
+     "median": 693.619,
+     "p95": 974.863,
+     "p99": 1105.666,
+     "low_5pct_fps": 0.943,
+     "low_1pct_fps": 0.859
+    },
+    "draws": {
+     "avg": 5030.933,
+     "min": 0,
+     "max": 10101
+    },
+    "zero_draw_world_frames": 25,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 2918.0,
+    "vram_budget_mb": 106168.344,
+    "ram_private_commit_peak_mb": 139952.52,
+    "ram_working_set_peak_mb": 26277.051,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "d4-base",
+   "started": "2026-11-27 12:13:33",
+   "console": "series-x",
+   "exe": "victory-m3.exe",
+   "build": "+ VICTORY_TITLE_SYNC, VICTORY_GPU_SPLIT, #584 merged (60663b7)",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 4.0 beta 3",
+   "switches": {
+    "VICTORY_CAPTURE_WORLD": "250",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 704.2,
+    "preparing_ms": 158.2,
+    "gpu_ms": 512.1,
+    "copy_back_ms": 25.7,
+    "draws": 4971.5,
+    "reports": 22
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 60,
+    "frame_ms": {
+     "avg": 670.548,
+     "median": 694.423,
+     "p95": 821.936,
+     "p99": 1158.945,
+     "low_5pct_fps": 0.982,
+     "low_1pct_fps": 0.735
+    },
+    "draws": {
+     "avg": 4448.075,
+     "min": 1019,
+     "max": 8366
+    },
+    "zero_draw_world_frames": 0,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 19661.359,
+    "vram_budget_mb": 53084.172,
+    "ram_private_commit_peak_mb": 141328.199,
+    "ram_working_set_peak_mb": 23697.926,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "d4-cold",
+   "started": "2026-11-27 12:07:19",
+   "console": "series-x",
+   "exe": "victory-m3.exe",
+   "build": "+ VICTORY_TITLE_SYNC, VICTORY_GPU_SPLIT, #584 merged (60663b7)",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 4.0 beta 3",
+   "switches": {
+    "VICTORY_CLAMP_SYNC": "1",
+    "VICTORY_PREP_AHEAD": "1",
+    "VICTORY_TITLE_SYNC": "1",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 726.8,
+    "preparing_ms": 168.9,
+    "gpu_ms": 514.2,
+    "copy_back_ms": 27.7,
+    "draws": 4965.0,
+    "reports": 33
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 78,
+    "frame_ms": {
+     "avg": 751.602,
+     "median": 712.771,
+     "p95": 1052.746,
+     "p99": 1258.036,
+     "low_5pct_fps": 0.842,
+     "low_1pct_fps": 0.765
+    },
+    "draws": {
+     "avg": 4978.158,
+     "min": 878,
+     "max": 7645
+    },
+    "zero_draw_world_frames": 0,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 17998.734,
+    "vram_budget_mb": 53084.172,
+    "ram_private_commit_peak_mb": 138966.355,
+    "ram_working_set_peak_mb": 20397.75,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "d4-split",
+   "started": "2026-11-27 12:58:09",
+   "console": "series-x",
+   "exe": "victory-m3-diag.exe",
+   "build": "victory-m3.exe with --features diagnostics",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 4.0 beta 3",
+   "switches": {
+    "VICTORY_GPU_TIMING": "1",
+    "VICTORY_GPU_SPLIT": "1",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 10946.5,
+    "preparing_ms": 934.1,
+    "gpu_ms": 8778.7,
+    "copy_back_ms": 28.4,
+    "draws": 4925.0,
+    "reports": 38
+   },
+   "bench": {
+    "world_frames": 40,
+    "warmup_frames": 21,
+    "frame_ms": {
+     "avg": 9390.138,
+     "median": 10888.883,
+     "p95": 13211.892,
+     "p99": 21075.092,
+     "low_5pct_fps": 0.058,
+     "low_1pct_fps": 0.047
+    },
+    "draws": {
+     "avg": 4247.25,
+     "min": 936,
+     "max": 6999
+    },
+    "zero_draw_world_frames": 0,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 17881.5,
+    "vram_budget_mb": 53084.172,
+    "ram_private_commit_peak_mb": 1533419.27,
+    "ram_working_set_peak_mb": 21331.469,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "d4-sync",
+   "started": "2026-11-27 12:18:17",
+   "console": "series-x",
+   "exe": "victory-m3.exe",
+   "build": "+ VICTORY_TITLE_SYNC, VICTORY_GPU_SPLIT, #584 merged (60663b7)",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 4.0 beta 3",
+   "switches": {
+    "VICTORY_CLAMP_SYNC": "1",
+    "VICTORY_CAPTURE_WORLD": "250",
+    "VICTORY_TITLE_SYNC": "1",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 721.7,
+    "preparing_ms": 160.1,
+    "gpu_ms": 527.8,
+    "copy_back_ms": 26.6,
+    "draws": 4977.0,
+    "reports": 22
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 60,
+    "frame_ms": {
+     "avg": 688.744,
+     "median": 711.641,
+     "p95": 891.424,
+     "p99": 1226.129,
+     "low_5pct_fps": 0.928,
+     "low_1pct_fps": 0.704
+    },
+    "draws": {
+     "avg": 4340.675,
+     "min": 1006,
+     "max": 12166
+    },
+    "zero_draw_world_frames": 0,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 18674.156,
+    "vram_budget_mb": 53084.172,
+    "ram_private_commit_peak_mb": 140183.727,
+    "ram_working_set_peak_mb": 23081.07,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "e-base",
+   "started": "2026-11-27 19:38:29",
+   "console": "series-x",
+   "exe": "victory-m10.exe",
+   "build": "+ VICTORY_EARLY_SYNC (3bf2233)",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 4.0 beta 3",
+   "switches": {
+    "VICTORY_DUMP_PROGRAMS": "b6df66af105d8b2d,2f03a2df10503cef,63381c3250b287fa,db875f50a166bd91,6016f52cd61f30f6",
+    "VICTORY_BENCH_WARM_DRAWS": "3500",
+    "VICTORY_NAME_PROGRAMS": "1",
+    "VICTORY_ATOMIC_RACY": "1",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 682.0,
+    "preparing_ms": 151.9,
+    "gpu_ms": 495.1,
+    "copy_back_ms": 24.9,
+    "draws": 4962.5,
+    "reports": 34
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 150,
+    "frame_ms": {
+     "avg": 679.431,
+     "median": 678.615,
+     "p95": 705.905,
+     "p99": 717.942,
+     "low_5pct_fps": 1.4,
+     "low_1pct_fps": 1.372
+    },
+    "draws": {
+     "avg": 4970.1,
+     "min": 4935,
+     "max": 5599
+    },
+    "zero_draw_world_frames": 0,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 20777.281,
+    "vram_budget_mb": 53084.172,
+    "ram_private_commit_peak_mb": 142938.957,
+    "ram_working_set_peak_mb": 24168.047,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "e-base2",
+   "started": "2026-11-27 19:49:54",
+   "console": "series-x",
+   "exe": "victory-m10.exe",
+   "build": "+ VICTORY_EARLY_SYNC (3bf2233)",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 4.0 beta 3",
+   "switches": {
+    "VICTORY_DUMP_PROGRAMS": "b6df66af105d8b2d,2f03a2df10503cef,63381c3250b287fa,db875f50a166bd91,6016f52cd61f30f6",
+    "VICTORY_BENCH_WARM_DRAWS": "3500",
+    "VICTORY_NAME_PROGRAMS": "1",
+    "VICTORY_ATOMIC_RACY": "1",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 684.4,
+    "preparing_ms": 153.2,
+    "gpu_ms": 499.4,
+    "copy_back_ms": 25.1,
+    "draws": 4996.0,
+    "reports": 34
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 143,
+    "frame_ms": {
+     "avg": 693.411,
+     "median": 683.414,
+     "p95": 761.975,
+     "p99": 833.747,
+     "low_5pct_fps": 1.233,
+     "low_1pct_fps": 1.125
+    },
+    "draws": {
+     "avg": 4995.546,
+     "min": 3485,
+     "max": 7739
+    },
+    "zero_draw_world_frames": 0,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 19429.359,
+    "vram_budget_mb": 53084.172,
+    "ram_private_commit_peak_mb": 140793.965,
+    "ram_working_set_peak_mb": 21290.191,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "e-sync",
+   "started": "2026-11-27 19:32:46",
+   "console": "series-x",
+   "exe": "victory-m10.exe",
+   "build": "+ VICTORY_EARLY_SYNC (3bf2233)",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 4.0 beta 3",
+   "switches": {
+    "VICTORY_EARLY_SYNC": "1",
+    "VICTORY_DUMP_PROGRAMS": "b6df66af105d8b2d,2f03a2df10503cef,63381c3250b287fa,db875f50a166bd91,6016f52cd61f30f6",
+    "VICTORY_BENCH_WARM_DRAWS": "3500",
+    "VICTORY_NAME_PROGRAMS": "1",
+    "VICTORY_ATOMIC_RACY": "1",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 678.1,
+    "preparing_ms": 147.7,
+    "gpu_ms": 498.3,
+    "copy_back_ms": 25.0,
+    "draws": 4993.0,
+    "reports": 33
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 150,
+    "frame_ms": {
+     "avg": 676.545,
+     "median": 675.826,
+     "p95": 697.51,
+     "p99": 705.748,
+     "low_5pct_fps": 1.421,
+     "low_1pct_fps": 1.406
+    },
+    "draws": {
+     "avg": 5004.408,
+     "min": 4978,
+     "max": 5663
+    },
+    "zero_draw_world_frames": 0,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 20563.797,
+    "vram_budget_mb": 53084.172,
+    "ram_private_commit_peak_mb": 142469.949,
+    "ram_working_set_peak_mb": 22269.531,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "e-sync2",
+   "started": "2026-11-27 19:44:08",
+   "console": "series-x",
+   "exe": "victory-m10.exe",
+   "build": "+ VICTORY_EARLY_SYNC (3bf2233)",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 4.0 beta 3",
+   "switches": {
+    "VICTORY_EARLY_SYNC": "1",
+    "VICTORY_DUMP_PROGRAMS": "b6df66af105d8b2d,2f03a2df10503cef,63381c3250b287fa,db875f50a166bd91,6016f52cd61f30f6",
+    "VICTORY_BENCH_WARM_DRAWS": "3500",
+    "VICTORY_NAME_PROGRAMS": "1",
+    "VICTORY_ATOMIC_RACY": "1",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 693.3,
+    "preparing_ms": 151.5,
+    "gpu_ms": 504.7,
+    "copy_back_ms": 25.2,
+    "draws": 4976.5,
+    "reports": 34
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 146,
+    "frame_ms": {
+     "avg": 689.112,
+     "median": 684.784,
+     "p95": 733.471,
+     "p99": 759.224,
+     "low_5pct_fps": 1.342,
+     "low_1pct_fps": 1.305
+    },
+    "draws": {
+     "avg": 4983.617,
+     "min": 4948,
+     "max": 5117
+    },
+    "zero_draw_world_frames": 0,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 20549.0,
+    "vram_budget_mb": 53084.172,
+    "ram_private_commit_peak_mb": 142053.234,
+    "ram_working_set_peak_mb": 23651.852,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "f-frames1",
+   "started": "2026-11-27 10:53:46",
+   "console": "series-x",
+   "exe": "victory-frames.exe",
+   "build": "victory-main.exe + per-frame bench log (VICTORY_BENCH_FRAMES)",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 3.0",
+   "switches": {
+    "VICTORY_BENCH_FRAMES": "C:\\VIctory\\bench\\frames-f1.txt",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 764.0,
+    "preparing_ms": 139.6,
+    "gpu_ms": 564.5,
+    "copy_back_ms": 25.8,
+    "draws": 4946.0,
+    "reports": 21
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 69,
+    "frame_ms": {
+     "avg": 689.553,
+     "median": 723.823,
+     "p95": 1047.338,
+     "p99": 1208.53,
+     "low_5pct_fps": 0.892,
+     "low_1pct_fps": 0.817
+    },
+    "draws": {
+     "avg": 4048.725,
+     "min": 0,
+     "max": 10437
+    },
+    "zero_draw_world_frames": 53,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 3942.0,
+    "vram_budget_mb": 106168.344,
+    "ram_private_commit_peak_mb": 141931.852,
+    "ram_working_set_peak_mb": 28147.09,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "k-cold",
+   "started": "2026-11-27 13:23:14",
+   "console": "series-x",
+   "exe": "victory-m6.exe",
+   "build": "+ 2^20 lock words, VICTORY_DUMP_PROGRAMS",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 4.0 beta 3",
+   "switches": {
+    "VICTORY_RAY_SKIP": "1",
+    "VICTORY_LINK_MESH_OUTPUTS": "all",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 722.6,
+    "preparing_ms": 137.8,
+    "gpu_ms": 551.9,
+    "copy_back_ms": 26.1,
+    "draws": 4998.0,
+    "reports": 25
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 62,
+    "frame_ms": {
+     "avg": 699.052,
+     "median": 718.168,
+     "p95": 859.16,
+     "p99": 1062.883,
+     "low_5pct_fps": 0.88,
+     "low_1pct_fps": 0.563
+    },
+    "draws": {
+     "avg": 4599.242,
+     "min": 1026,
+     "max": 10389
+    },
+    "zero_draw_world_frames": 0,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 18795.531,
+    "vram_budget_mb": 53084.172,
+    "ram_private_commit_peak_mb": 140943.926,
+    "ram_working_set_peak_mb": 23204.434,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "k-disp",
+   "started": "2026-11-27 11:50:15",
+   "console": "series-x",
+   "exe": "victory-kinds.exe",
+   "build": "+ title commands by kind, VICTORY_SKIP_KINDS (84895b2)",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 3.0",
+   "switches": {
+    "VICTORY_SKIP_KINDS": "dispatch,idispatch",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 436.3,
+    "preparing_ms": 180.2,
+    "gpu_ms": 196.7,
+    "copy_back_ms": 1.8,
+    "draws": 5033.0,
+    "reports": 9
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 75,
+    "frame_ms": {
+     "avg": 373.03,
+     "median": 372.974,
+     "p95": 676.309,
+     "p99": 851.589,
+     "low_5pct_fps": 1.286,
+     "low_1pct_fps": 1.138
+    },
+    "draws": {
+     "avg": 3666.438,
+     "min": 0,
+     "max": 13699
+    },
+    "zero_draw_world_frames": 33,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 3942.0,
+    "vram_budget_mb": 106168.344,
+    "ram_private_commit_peak_mb": 140115.293,
+    "ram_working_set_peak_mb": 29460.461,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "k-link",
+   "started": "2026-11-27 13:28:16",
+   "console": "series-x",
+   "exe": "victory-m6.exe",
+   "build": "+ 2^20 lock words, VICTORY_DUMP_PROGRAMS",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 4.0 beta 3",
+   "switches": {
+    "VICTORY_RAY_SKIP": "1",
+    "VICTORY_LINK_MESH_OUTPUTS": "all",
+    "VICTORY_DUMP_PROGRAMS": "b6df66af105d8b2d,2f03a2df10503cef,63381c3250b287fa,db875f50a166bd91,6016f52cd61f30f6",
+    "VICTORY_NAME_PROGRAMS": "1",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 367.0,
+    "preparing_ms": 137.1,
+    "gpu_ms": 197.4,
+    "copy_back_ms": 22.8,
+    "draws": 2432.0,
+    "reports": 4
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 60,
+    "frame_ms": {
+     "avg": 293.141,
+     "median": 263.593,
+     "p95": 616.966,
+     "p99": 817.253,
+     "low_5pct_fps": 1.379,
+     "low_1pct_fps": 1.178
+    },
+    "draws": {
+     "avg": 1658.496,
+     "min": 826,
+     "max": 5100
+    },
+    "zero_draw_world_frames": 0,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 17717.281,
+    "vram_budget_mb": 53084.172,
+    "ram_private_commit_peak_mb": 140357.777,
+    "ram_working_set_peak_mb": 22459.039,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "k-mesh",
+   "started": "2026-11-27 11:41:39",
+   "console": "series-x",
+   "exe": "victory-kinds.exe",
+   "build": "+ title commands by kind, VICTORY_SKIP_KINDS (84895b2)",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 3.0",
+   "switches": {
+    "VICTORY_SKIP_KINDS": "mesh,imesh",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": null,
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 157,
+    "frame_ms": {
+     "avg": 453.86,
+     "median": 448.729,
+     "p95": 708.267,
+     "p99": 838.677,
+     "low_5pct_fps": 1.281,
+     "low_1pct_fps": 1.16
+    },
+    "draws": {
+     "avg": 730.654,
+     "min": 0,
+     "max": 1786
+    },
+    "zero_draw_world_frames": 42,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 3942.0,
+    "vram_budget_mb": 106168.344,
+    "ram_private_commit_peak_mb": 143010.902,
+    "ram_working_set_peak_mb": 28560.117,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "k-vert",
+   "started": "2026-11-27 11:45:40",
+   "console": "series-x",
+   "exe": "victory-kinds.exe",
+   "build": "+ title commands by kind, VICTORY_SKIP_KINDS (84895b2)",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 3.0",
+   "switches": {
+    "VICTORY_SKIP_KINDS": "draw,indexed,idraw,iindexed",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 668.5,
+    "preparing_ms": 141.6,
+    "gpu_ms": 463.6,
+    "copy_back_ms": 28.5,
+    "draws": 2427.0,
+    "reports": 21
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 81,
+    "frame_ms": {
+     "avg": 651.04,
+     "median": 624.187,
+     "p95": 970.543,
+     "p99": 1222.051,
+     "low_5pct_fps": 0.862,
+     "low_1pct_fps": 0.676
+    },
+    "draws": {
+     "avg": 2398.7,
+     "min": 0,
+     "max": 10222
+    },
+    "zero_draw_world_frames": 57,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 3942.0,
+    "vram_budget_mb": 106168.344,
+    "ram_private_commit_peak_mb": 143076.91,
+    "ram_working_set_peak_mb": 28911.355,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "l-cold",
+   "started": "2026-11-27 13:32:50",
+   "console": "series-x",
+   "exe": "victory-m6.exe",
+   "build": "+ 2^20 lock words, VICTORY_DUMP_PROGRAMS",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 4.0 beta 3",
+   "switches": {
+    "VICTORY_DUMP_PROGRAMS": "b6df66af105d8b2d,2f03a2df10503cef,63381c3250b287fa,db875f50a166bd91,6016f52cd61f30f6",
+    "VICTORY_NAME_PROGRAMS": "1",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 696.6,
+    "preparing_ms": 140.4,
+    "gpu_ms": 519.9,
+    "copy_back_ms": 26.9,
+    "draws": 5000.5,
+    "reports": 30
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 64,
+    "frame_ms": {
+     "avg": 767.713,
+     "median": 697.787,
+     "p95": 942.669,
+     "p99": 1159.6,
+     "low_5pct_fps": 0.521,
+     "low_1pct_fps": 0.22
+    },
+    "draws": {
+     "avg": 4934.317,
+     "min": 534,
+     "max": 13376
+    },
+    "zero_draw_world_frames": 0,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 19048.25,
+    "vram_budget_mb": 53084.172,
+    "ram_private_commit_peak_mb": 140616.383,
+    "ram_working_set_peak_mb": 23542.211,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "l-locks",
+   "started": "2026-11-27 13:38:27",
+   "console": "series-x",
+   "exe": "victory-m6.exe",
+   "build": "+ 2^20 lock words, VICTORY_DUMP_PROGRAMS",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 4.0 beta 3",
+   "switches": {
+    "VICTORY_DUMP_PROGRAMS": "b6df66af105d8b2d,2f03a2df10503cef,63381c3250b287fa,db875f50a166bd91,6016f52cd61f30f6",
+    "VICTORY_BENCH_WARM_DRAWS": "3500",
+    "VICTORY_NAME_PROGRAMS": "1",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 691.0,
+    "preparing_ms": 143.4,
+    "gpu_ms": 513.5,
+    "copy_back_ms": 25.7,
+    "draws": 4967.0,
+    "reports": 22
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 60,
+    "frame_ms": {
+     "avg": 655.396,
+     "median": 685.771,
+     "p95": 779.674,
+     "p99": 1009.371,
+     "low_5pct_fps": 1.054,
+     "low_1pct_fps": 0.824
+    },
+    "draws": {
+     "avg": 4416.704,
+     "min": 1021,
+     "max": 10595
+    },
+    "zero_draw_world_frames": 0,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 20072.234,
+    "vram_budget_mb": 53084.172,
+    "ram_private_commit_peak_mb": 142206.324,
+    "ram_working_set_peak_mb": 24652.105,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "n-cold",
+   "started": "2026-11-27 11:54:01",
+   "console": "series-x",
+   "exe": "victory-m1.exe",
+   "build": "+ lock early-out for covered 64-bit min/max, #587, #588 merged",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 3.0",
+   "switches": {
+    "VICTORY_CLAMP_SYNC": "1",
+    "VICTORY_CAPTURE_WORLD": "400",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 824.8,
+    "preparing_ms": 183.7,
+    "gpu_ms": 578.1,
+    "copy_back_ms": 30.2,
+    "draws": 4997.0,
+    "reports": 39
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 79,
+    "frame_ms": {
+     "avg": 821.893,
+     "median": 788.043,
+     "p95": 1110.229,
+     "p99": 1233.976,
+     "low_5pct_fps": 0.804,
+     "low_1pct_fps": 0.671
+    },
+    "draws": {
+     "avg": 5001.413,
+     "min": 0,
+     "max": 10569
+    },
+    "zero_draw_world_frames": 25,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 70.0,
+    "vram_budget_mb": 106168.344,
+    "ram_private_commit_peak_mb": 142435.547,
+    "ram_working_set_peak_mb": 27131.188,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "n-skip",
+   "started": "2026-11-27 13:18:26",
+   "console": "series-x",
+   "exe": "victory-m5.exe",
+   "build": "+ VICTORY_NAME_PROGRAMS",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 4.0 beta 3",
+   "switches": {
+    "VICTORY_RAY_SKIP": "1",
+    "VICTORY_NAME_PROGRAMS": "1",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 722.0,
+    "preparing_ms": 143.0,
+    "gpu_ms": 542.8,
+    "copy_back_ms": 25.7,
+    "draws": 5005.0,
+    "reports": 23
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 60,
+    "frame_ms": {
+     "avg": 698.623,
+     "median": 717.931,
+     "p95": 851.094,
+     "p99": 1005.262,
+     "low_5pct_fps": 1.008,
+     "low_1pct_fps": 0.815
+    },
+    "draws": {
+     "avg": 4542.146,
+     "min": 1043,
+     "max": 8953
+    },
+    "zero_draw_world_frames": 0,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 19631.406,
+    "vram_budget_mb": 53084.172,
+    "ram_private_commit_peak_mb": 141092.375,
+    "ram_working_set_peak_mb": 23941.621,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "n-sync",
+   "started": "2026-11-27 12:01:21",
+   "console": "series-x",
+   "exe": "victory-m1.exe",
+   "build": "+ lock early-out for covered 64-bit min/max, #587, #588 merged",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 3.0",
+   "switches": {
+    "VICTORY_CLAMP_SYNC": "1",
+    "VICTORY_CAPTURE_WORLD": "250",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 759.5,
+    "preparing_ms": 148.6,
+    "gpu_ms": 554.9,
+    "copy_back_ms": 26.4,
+    "draws": 4919.0,
+    "reports": 20
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 67,
+    "frame_ms": {
+     "avg": 667.72,
+     "median": 712.95,
+     "p95": 1004.176,
+     "p99": 1179.652,
+     "low_5pct_fps": 0.909,
+     "low_1pct_fps": 0.818
+    },
+    "draws": {
+     "avg": 3702.367,
+     "min": 0,
+     "max": 10268
+    },
+    "zero_draw_world_frames": 63,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 3942.0,
+    "vram_budget_mb": 106168.344,
+    "ram_private_commit_peak_mb": 142724.164,
+    "ram_working_set_peak_mb": 29234.758,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "p-sync",
+   "started": "2026-11-27 14:42:15",
+   "console": "series-x",
+   "exe": "victory-m9.exe",
+   "build": "+ heap sync on four workers, VICTORY_SYNC_THREADS (a90f5e6): the best build at 14:45",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 4.0 beta 3",
+   "switches": {
+    "VICTORY_DUMP_PROGRAMS": "b6df66af105d8b2d,2f03a2df10503cef,63381c3250b287fa,db875f50a166bd91,6016f52cd61f30f6",
+    "VICTORY_BENCH_WARM_DRAWS": "3500",
+    "VICTORY_NAME_PROGRAMS": "1",
+    "VICTORY_ATOMIC_RACY": "1",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 669.5,
+    "preparing_ms": 149.6,
+    "gpu_ms": 489.9,
+    "copy_back_ms": 25.0,
+    "draws": 4961.0,
+    "reports": 33
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 146,
+    "frame_ms": {
+     "avg": 670.294,
+     "median": 670.042,
+     "p95": 695.856,
+     "p99": 707.476,
+     "low_5pct_fps": 1.423,
+     "low_1pct_fps": 1.402
+    },
+    "draws": {
+     "avg": 4973.246,
+     "min": 4851,
+     "max": 5656
+    },
+    "zero_draw_world_frames": 0,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 20389.734,
+    "vram_budget_mb": 53084.172,
+    "ram_private_commit_peak_mb": 142226.781,
+    "ram_working_set_peak_mb": 23484.996,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "p-sync2",
+   "started": "2026-11-27 14:47:42",
+   "console": "series-x",
+   "exe": "victory-m9.exe",
+   "build": "+ heap sync on four workers, VICTORY_SYNC_THREADS (a90f5e6): the best build at 14:45",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 4.0 beta 3",
+   "switches": {
+    "VICTORY_DUMP_PROGRAMS": "b6df66af105d8b2d,2f03a2df10503cef,63381c3250b287fa,db875f50a166bd91,6016f52cd61f30f6",
+    "VICTORY_BENCH_WARM_DRAWS": "3500",
+    "VICTORY_NAME_PROGRAMS": "1",
+    "VICTORY_ATOMIC_RACY": "1",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 672.5,
+    "preparing_ms": 150.5,
+    "gpu_ms": 491.1,
+    "copy_back_ms": 25.5,
+    "draws": 4982.0,
+    "reports": 33
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 150,
+    "frame_ms": {
+     "avg": 671.508,
+     "median": 670.96,
+     "p95": 696.599,
+     "p99": 712.546,
+     "low_5pct_fps": 1.421,
+     "low_1pct_fps": 1.4
+    },
+    "draws": {
+     "avg": 4991.337,
+     "min": 4960,
+     "max": 5678
+    },
+    "zero_draw_world_frames": 0,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 20556.781,
+    "vram_budget_mb": 53084.172,
+    "ram_private_commit_peak_mb": 142640.828,
+    "ram_working_set_peak_mb": 23906.828,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "r-cold",
+   "started": "2026-11-27 12:46:17",
+   "console": "series-x",
+   "exe": "victory-m4.exe",
+   "build": "+ VICTORY_ROV_ATOMICS (reverted after: no gain)",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 4.0 beta 3",
+   "switches": {
+    "VICTORY_ROV_ATOMICS": "1",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 684.2,
+    "preparing_ms": 147.2,
+    "gpu_ms": 504.1,
+    "copy_back_ms": 24.6,
+    "draws": 4954.5,
+    "reports": 22
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 60,
+    "frame_ms": {
+     "avg": 659.384,
+     "median": 681.865,
+     "p95": 823.355,
+     "p99": 994.091,
+     "low_5pct_fps": 1.05,
+     "low_1pct_fps": 0.845
+    },
+    "draws": {
+     "avg": 4453.25,
+     "min": 1033,
+     "max": 9179
+    },
+    "zero_draw_world_frames": 0,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 19482.453,
+    "vram_budget_mb": 53084.172,
+    "ram_private_commit_peak_mb": 141429.496,
+    "ram_working_set_peak_mb": 23581.582,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "s-low",
+   "started": "2026-11-27 12:51:56",
+   "console": "series-x",
+   "exe": "victory-m3.exe",
+   "build": "+ VICTORY_TITLE_SYNC, VICTORY_GPU_SPLIT, #584 merged (60663b7)",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 4.0 beta 3",
+   "switches": {
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 732.1,
+    "preparing_ms": 152.8,
+    "gpu_ms": 544.2,
+    "copy_back_ms": 26.3,
+    "draws": 4977.0,
+    "reports": 23
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 60,
+    "frame_ms": {
+     "avg": 694.167,
+     "median": 725.274,
+     "p95": 832.117,
+     "p99": 1047.351,
+     "low_5pct_fps": 1.026,
+     "low_1pct_fps": 0.829
+    },
+    "draws": {
+     "avg": 4501.438,
+     "min": 1046,
+     "max": 9128
+    },
+    "zero_draw_world_frames": 0,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 21427.719,
+    "vram_budget_mb": 53084.172,
+    "ram_private_commit_peak_mb": 142226.203,
+    "ram_working_set_peak_mb": 24450.75,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "s-ss2",
+   "started": "2026-11-27 13:13:38",
+   "console": "series-s",
+   "exe": "victory-m3.exe",
+   "build": "+ VICTORY_TITLE_SYNC, VICTORY_GPU_SPLIT, #584 merged (60663b7)",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 4.0 beta 3",
+   "switches": {
+    "VICTORY_UPSCALER": "6",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 680.6,
+    "preparing_ms": 134.9,
+    "gpu_ms": 515.4,
+    "copy_back_ms": 20.9,
+    "draws": 4560.0,
+    "reports": 23
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 60,
+    "frame_ms": {
+     "avg": 658.372,
+     "median": 674.657,
+     "p95": 824.603,
+     "p99": 1081.736,
+     "low_5pct_fps": 1.014,
+     "low_1pct_fps": 0.795
+    },
+    "draws": {
+     "avg": 4123.371,
+     "min": 1000,
+     "max": 8689
+    },
+    "zero_draw_world_frames": 0,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 18370.891,
+    "vram_budget_mb": 53084.172,
+    "ram_private_commit_peak_mb": 116455.949,
+    "ram_working_set_peak_mb": 21634.555,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "soak-walk",
+   "started": "2026-11-27 09:52:00",
+   "console": "series-x",
+   "exe": "victory-main.exe",
+   "build": "main d1609d9 + 7 M1 Max commits + WIP (m1max/branch-on-main-1127): the best build at 08:40",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 3.0",
+   "switches": {
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 713.6,
+    "preparing_ms": 130.3,
+    "gpu_ms": 538.1,
+    "copy_back_ms": 24.7,
+    "draws": 4892.0,
+    "reports": 59
+   },
+   "bench": {
+    "world_frames": 540,
+    "warmup_frames": 71,
+    "frame_ms": {
+     "avg": 674.231,
+     "median": 693.814,
+     "p95": 928.964,
+     "p99": 1113.017,
+     "low_5pct_fps": 0.936,
+     "low_1pct_fps": 0.782
+    },
+    "draws": {
+     "avg": 4321.787,
+     "min": 0,
+     "max": 10357
+    },
+    "zero_draw_world_frames": 77,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 3686.0,
+    "vram_budget_mb": 106168.344,
+    "ram_private_commit_peak_mb": 142719.43,
+    "ram_working_set_peak_mb": 27162.125,
+    "input_script_sha256": "393321c484f9ecb8a1e1b64c6464921f18f0d2766961f3bce4dd4de827d92ffe"
+   }
+  },
+  {
+   "label": "u-cold",
+   "started": "2026-11-27 13:43:03",
+   "console": "series-x",
+   "exe": "victory-m6.exe",
+   "build": "+ 2^20 lock words, VICTORY_DUMP_PROGRAMS",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 4.0 beta 3",
+   "switches": {
+    "VICTORY_DUMP_PROGRAMS": "b6df66af105d8b2d,2f03a2df10503cef,63381c3250b287fa,db875f50a166bd91,6016f52cd61f30f6",
+    "VICTORY_BENCH_WARM_DRAWS": "3500",
+    "VICTORY_NAME_PROGRAMS": "1",
+    "VICTORY_ATOMIC_UMAX": "1",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 689.0,
+    "preparing_ms": 139.7,
+    "gpu_ms": 514.6,
+    "copy_back_ms": 25.4,
+    "draws": 4976.5,
+    "reports": 26
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 63,
+    "frame_ms": {
+     "avg": 689.567,
+     "median": 689.986,
+     "p95": 813.588,
+     "p99": 1059.775,
+     "low_5pct_fps": 0.966,
+     "low_1pct_fps": 0.691
+    },
+    "draws": {
+     "avg": 4729.613,
+     "min": 1191,
+     "max": 11195
+    },
+    "zero_draw_world_frames": 0,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 19730.969,
+    "vram_budget_mb": 53084.172,
+    "ram_private_commit_peak_mb": 141638.234,
+    "ram_working_set_peak_mb": 23816.246,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "u-umax",
+   "started": "2026-11-27 13:48:13",
+   "console": "series-x",
+   "exe": "victory-m6.exe",
+   "build": "+ 2^20 lock words, VICTORY_DUMP_PROGRAMS",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 4.0 beta 3",
+   "switches": {
+    "VICTORY_DUMP_PROGRAMS": "b6df66af105d8b2d,2f03a2df10503cef,63381c3250b287fa,db875f50a166bd91,6016f52cd61f30f6",
+    "VICTORY_BENCH_WARM_DRAWS": "3500",
+    "VICTORY_NAME_PROGRAMS": "1",
+    "VICTORY_ATOMIC_UMAX": "1",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 686.5,
+    "preparing_ms": 136.8,
+    "gpu_ms": 519.0,
+    "copy_back_ms": 26.2,
+    "draws": 4972.0,
+    "reports": 23
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 60,
+    "frame_ms": {
+     "avg": 651.518,
+     "median": 684.574,
+     "p95": 824.995,
+     "p99": 969.124,
+     "low_5pct_fps": 1.044,
+     "low_1pct_fps": 0.833
+    },
+    "draws": {
+     "avg": 4412.6,
+     "min": 1003,
+     "max": 9818
+    },
+    "zero_draw_world_frames": 0,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 18593.031,
+    "vram_budget_mb": 53084.172,
+    "ram_private_commit_peak_mb": 140947.055,
+    "ram_working_set_peak_mb": 22978.504,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "v-all3",
+   "started": "2026-11-27 14:15:57",
+   "console": "series-x",
+   "exe": "victory-m7-diag.exe",
+   "build": "victory-m7.exe with --features diagnostics",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 4.0 beta 3",
+   "switches": {
+    "VICTORY_DUMP_PROGRAMS": "b6df66af105d8b2d,2f03a2df10503cef,63381c3250b287fa,db875f50a166bd91,6016f52cd61f30f6",
+    "VICTORY_LEAVE_OUT": "CS_DepthProcessingHBO,CS_SpatialFilter_Std,CS_VisHair",
+    "VICTORY_BENCH_WARM_DRAWS": "3500",
+    "VICTORY_CAPTURE_WORLD": "200,260",
+    "VICTORY_NAME_PROGRAMS": "1",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 563.6,
+    "preparing_ms": 207.6,
+    "gpu_ms": 322.6,
+    "copy_back_ms": 24.9,
+    "draws": 5014.0,
+    "reports": 15
+   },
+   "bench": {
+    "world_frames": 120,
+    "warmup_frames": 150,
+    "frame_ms": {
+     "avg": 562.076,
+     "median": 557.006,
+     "p95": 591.305,
+     "p99": 674.885,
+     "low_5pct_fps": 1.567,
+     "low_1pct_fps": 1.429
+    },
+    "draws": {
+     "avg": 5028.825,
+     "min": 4985,
+     "max": 5243
+    },
+    "zero_draw_world_frames": 0,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 20556.297,
+    "vram_budget_mb": 53084.172,
+    "ram_private_commit_peak_mb": 143351.141,
+    "ram_working_set_peak_mb": 23606.82,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "v-none",
+   "started": "2026-11-27 14:19:57",
+   "console": "series-x",
+   "exe": "victory-m7-diag.exe",
+   "build": "victory-m7.exe with --features diagnostics",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 4.0 beta 3",
+   "switches": {
+    "VICTORY_DUMP_PROGRAMS": "b6df66af105d8b2d,2f03a2df10503cef,63381c3250b287fa,db875f50a166bd91,6016f52cd61f30f6",
+    "VICTORY_BENCH_WARM_DRAWS": "3500",
+    "VICTORY_CAPTURE_WORLD": "200,260",
+    "VICTORY_NAME_PROGRAMS": "1",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 756.2,
+    "preparing_ms": 201.5,
+    "gpu_ms": 520.9,
+    "copy_back_ms": 26.9,
+    "draws": 5017.0,
+    "reports": 19
+   },
+   "bench": {
+    "world_frames": 120,
+    "warmup_frames": 143,
+    "frame_ms": {
+     "avg": 755.67,
+     "median": 754.382,
+     "p95": 778.981,
+     "p99": 856.227,
+     "low_5pct_fps": 1.235,
+     "low_1pct_fps": 1.165
+    },
+    "draws": {
+     "avg": 5022.067,
+     "min": 4986,
+     "max": 5670
+    },
+    "zero_draw_world_frames": 0,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 20189.75,
+    "vram_budget_mb": 53084.172,
+    "ram_private_commit_peak_mb": 142384.406,
+    "ram_working_set_peak_mb": 23423.16,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "v-racy",
+   "started": "2026-11-27 14:37:27",
+   "console": "series-x",
+   "exe": "victory-m8-diag.exe",
+   "build": "victory-m8.exe with --features diagnostics",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 4.0 beta 3",
+   "switches": {
+    "VICTORY_DUMP_PROGRAMS": "b6df66af105d8b2d,2f03a2df10503cef,63381c3250b287fa,db875f50a166bd91,6016f52cd61f30f6",
+    "VICTORY_BENCH_WARM_DRAWS": "3500",
+    "VICTORY_CAPTURE_WORLD": "200,260",
+    "VICTORY_NAME_PROGRAMS": "1",
+    "VICTORY_ATOMIC_RACY": "1",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 739.5,
+    "preparing_ms": 205.8,
+    "gpu_ms": 496.4,
+    "copy_back_ms": 27.4,
+    "draws": 4964.0,
+    "reports": 19
+   },
+   "bench": {
+    "world_frames": 120,
+    "warmup_frames": 146,
+    "frame_ms": {
+     "avg": 736.057,
+     "median": 733.829,
+     "p95": 764.256,
+     "p99": 840.952,
+     "low_5pct_fps": 1.259,
+     "low_1pct_fps": 1.187
+    },
+    "draws": {
+     "avg": 4975.375,
+     "min": 4927,
+     "max": 5651
+    },
+    "zero_draw_world_frames": 0,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 20500.219,
+    "vram_budget_mb": 53084.172,
+    "ram_private_commit_peak_mb": 143226.008,
+    "ram_working_set_peak_mb": 23714.203,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "x-base",
+   "started": "2026-11-27 11:36:31",
+   "console": "series-x",
+   "exe": "victory-base.exe",
+   "build": "victory-main.exe's source as one commit (25fe8e3)",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 3.0",
+   "switches": {
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 783.0,
+    "preparing_ms": 148.6,
+    "gpu_ms": 561.7,
+    "copy_back_ms": 27.6,
+    "draws": 4963.5,
+    "reports": 20
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 68,
+    "frame_ms": {
+     "avg": 661.605,
+     "median": 712.405,
+     "p95": 1004.494,
+     "p99": 1104.27,
+     "low_5pct_fps": 0.935,
+     "low_1pct_fps": 0.894
+    },
+    "draws": {
+     "avg": 3883.0,
+     "min": 0,
+     "max": 11113
+    },
+    "zero_draw_world_frames": 56,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 3942.0,
+    "vram_budget_mb": 106168.344,
+    "ram_private_commit_peak_mb": 142497.301,
+    "ram_working_set_peak_mb": 27734.711,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "x-filt",
+   "started": "2026-11-27 13:59:06",
+   "console": "series-x",
+   "exe": "victory-m7.exe",
+   "build": "+ VICTORY_LEAVE_OUT, VICTORY_TRACE_DISPATCH, VICTORY_BENCH_WARM_DRAWS",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 4.0 beta 3",
+   "switches": {
+    "VICTORY_DUMP_PROGRAMS": "b6df66af105d8b2d,2f03a2df10503cef,63381c3250b287fa,db875f50a166bd91,6016f52cd61f30f6",
+    "VICTORY_LEAVE_OUT": "CS_SpatialFilter_Std",
+    "VICTORY_BENCH_WARM_DRAWS": "3500",
+    "VICTORY_NAME_PROGRAMS": "1",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 650.1,
+    "preparing_ms": 150.8,
+    "gpu_ms": 465.4,
+    "copy_back_ms": 26.0,
+    "draws": 4983.0,
+    "reports": 33
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 160,
+    "frame_ms": {
+     "avg": 649.295,
+     "median": 648.72,
+     "p95": 670.32,
+     "p99": 684.229,
+     "low_5pct_fps": 1.468,
+     "low_1pct_fps": 1.44
+    },
+    "draws": {
+     "avg": 4997.617,
+     "min": 4962,
+     "max": 5803
+    },
+    "zero_draw_world_frames": 0,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 20275.672,
+    "vram_budget_mb": 53084.172,
+    "ram_private_commit_peak_mb": 142233.207,
+    "ram_working_set_peak_mb": 23091.551,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "x-hair",
+   "started": "2026-11-27 14:04:31",
+   "console": "series-x",
+   "exe": "victory-m7.exe",
+   "build": "+ VICTORY_LEAVE_OUT, VICTORY_TRACE_DISPATCH, VICTORY_BENCH_WARM_DRAWS",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 4.0 beta 3",
+   "switches": {
+    "VICTORY_DUMP_PROGRAMS": "b6df66af105d8b2d,2f03a2df10503cef,63381c3250b287fa,db875f50a166bd91,6016f52cd61f30f6",
+    "VICTORY_LEAVE_OUT": "CS_VisHair",
+    "VICTORY_BENCH_WARM_DRAWS": "3500",
+    "VICTORY_NAME_PROGRAMS": "1",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 548.9,
+    "preparing_ms": 154.3,
+    "gpu_ms": 359.4,
+    "copy_back_ms": 26.2,
+    "draws": 4943.5,
+    "reports": 28
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 154,
+    "frame_ms": {
+     "avg": 547.004,
+     "median": 546.919,
+     "p95": 567.713,
+     "p99": 579.206,
+     "low_5pct_fps": 1.74,
+     "low_1pct_fps": 1.721
+    },
+    "draws": {
+     "avg": 4950.363,
+     "min": 4920,
+     "max": 5090
+    },
+    "zero_draw_world_frames": 0,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 19875.734,
+    "vram_budget_mb": 53084.172,
+    "ram_private_commit_peak_mb": 141694.805,
+    "ram_working_set_peak_mb": 22827.023,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "x-hbo",
+   "started": "2026-11-27 13:53:27",
+   "console": "series-x",
+   "exe": "victory-m7.exe",
+   "build": "+ VICTORY_LEAVE_OUT, VICTORY_TRACE_DISPATCH, VICTORY_BENCH_WARM_DRAWS",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 4.0 beta 3",
+   "switches": {
+    "VICTORY_DUMP_PROGRAMS": "b6df66af105d8b2d,2f03a2df10503cef,63381c3250b287fa,db875f50a166bd91,6016f52cd61f30f6",
+    "VICTORY_LEAVE_OUT": "CS_DepthProcessingHBO",
+    "VICTORY_BENCH_WARM_DRAWS": "3500",
+    "VICTORY_NAME_PROGRAMS": "1",
+    "VICTORY_TRACE_DISPATCH": "2f03a2df10503cef,b6df66af105d8b2d,63381c3250b287fa",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 684.4,
+    "preparing_ms": 149.8,
+    "gpu_ms": 499.3,
+    "copy_back_ms": 26.8,
+    "draws": 4979.0,
+    "reports": 34
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 152,
+    "frame_ms": {
+     "avg": 684.348,
+     "median": 683.097,
+     "p95": 707.676,
+     "p99": 719.742,
+     "low_5pct_fps": 1.398,
+     "low_1pct_fps": 1.38
+    },
+    "draws": {
+     "avg": 4995.442,
+     "min": 4953,
+     "max": 5712
+    },
+    "zero_draw_world_frames": 0,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 18653.859,
+    "vram_budget_mb": 53084.172,
+    "ram_private_commit_peak_mb": 141600.094,
+    "ram_working_set_peak_mb": 21815.609,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "x-none",
+   "started": "2026-11-27 14:09:35",
+   "console": "series-x",
+   "exe": "victory-m7.exe",
+   "build": "+ VICTORY_LEAVE_OUT, VICTORY_TRACE_DISPATCH, VICTORY_BENCH_WARM_DRAWS",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 4.0 beta 3",
+   "switches": {
+    "VICTORY_DUMP_PROGRAMS": "b6df66af105d8b2d,2f03a2df10503cef,63381c3250b287fa,db875f50a166bd91,6016f52cd61f30f6",
+    "VICTORY_BENCH_WARM_DRAWS": "3500",
+    "VICTORY_NAME_PROGRAMS": "1",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 700.9,
+    "preparing_ms": 151.9,
+    "gpu_ms": 517.0,
+    "copy_back_ms": 27.1,
+    "draws": 4958.0,
+    "reports": 33
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 152,
+    "frame_ms": {
+     "avg": 701.035,
+     "median": 700.767,
+     "p95": 718.941,
+     "p99": 732.985,
+     "low_5pct_fps": 1.373,
+     "low_1pct_fps": 1.352
+    },
+    "draws": {
+     "avg": 4967.883,
+     "min": 4937,
+     "max": 5114
+    },
+    "zero_draw_world_frames": 0,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 19560.25,
+    "vram_budget_mb": 53084.172,
+    "ram_private_commit_peak_mb": 141575.777,
+    "ram_working_set_peak_mb": 22900.02,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "y-cold",
+   "started": "2026-11-27 14:25:16",
+   "console": "series-x",
+   "exe": "victory-m8.exe",
+   "build": "+ VICTORY_ATOMIC_RACY (0893a65)",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 4.0 beta 3",
+   "switches": {
+    "VICTORY_DUMP_PROGRAMS": "b6df66af105d8b2d,2f03a2df10503cef,63381c3250b287fa,db875f50a166bd91,6016f52cd61f30f6",
+    "VICTORY_BENCH_WARM_DRAWS": "3500",
+    "VICTORY_NAME_PROGRAMS": "1",
+    "VICTORY_ATOMIC_RACY": "1",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 689.0,
+    "preparing_ms": 152.0,
+    "gpu_ms": 501.2,
+    "copy_back_ms": 26.0,
+    "draws": 4974.0,
+    "reports": 38
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 137,
+    "frame_ms": {
+     "avg": 689.56,
+     "median": 687.367,
+     "p95": 713.666,
+     "p99": 737.0,
+     "low_5pct_fps": 1.374,
+     "low_1pct_fps": 1.354
+    },
+    "draws": {
+     "avg": 4970.188,
+     "min": 4949,
+     "max": 5000
+    },
+    "zero_draw_world_frames": 0,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 18365.844,
+    "vram_budget_mb": 53084.172,
+    "ram_private_commit_peak_mb": 140497.191,
+    "ram_working_set_peak_mb": 21413.504,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  },
+  {
+   "label": "y-racy",
+   "started": "2026-11-27 14:31:41",
+   "console": "series-x",
+   "exe": "victory-m8.exe",
+   "build": "+ VICTORY_ATOMIC_RACY (0893a65)",
+   "wine_and_d3dmetal": "CrossOver 26.3 + view-tree wineserver, D3DMetal 4.0 beta 3",
+   "switches": {
+    "VICTORY_DUMP_PROGRAMS": "b6df66af105d8b2d,2f03a2df10503cef,63381c3250b287fa,db875f50a166bd91,6016f52cd61f30f6",
+    "VICTORY_BENCH_WARM_DRAWS": "3500",
+    "VICTORY_NAME_PROGRAMS": "1",
+    "VICTORY_ATOMIC_RACY": "1",
+    "WINEMSYNC": "1"
+   },
+   "world_reports": {
+    "frame_ms": 682.3,
+    "preparing_ms": 161.0,
+    "gpu_ms": 487.9,
+    "copy_back_ms": 24.8,
+    "draws": 4964.0,
+    "reports": 33
+   },
+   "bench": {
+    "world_frames": 240,
+    "warmup_frames": 142,
+    "frame_ms": {
+     "avg": 681.788,
+     "median": 680.069,
+     "p95": 710.524,
+     "p99": 729.282,
+     "low_5pct_fps": 1.385,
+     "low_1pct_fps": 1.36
+    },
+    "draws": {
+     "avg": 4967.283,
+     "min": 4937,
+     "max": 5055
+    },
+    "zero_draw_world_frames": 0,
+    "black_frames": 0,
+    "device_removed": false,
+    "vram_used_peak_mb": 20588.781,
+    "vram_budget_mb": 53084.172,
+    "ram_private_commit_peak_mb": 142760.641,
+    "ram_working_set_peak_mb": 23874.508,
+    "input_script_sha256": "75f81edc56b568910e38753de27e6c04bff16ff54d74e1bfa27e75bbcf008009"
+   }
+  }
+ ]
+}

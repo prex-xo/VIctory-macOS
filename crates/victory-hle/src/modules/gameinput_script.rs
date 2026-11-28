@@ -9,10 +9,12 @@
 //!   gamepad sticks/buttons stay neutral while keyboard and scripted keys pass
 //!   through so menu navigation (`VICTORY_KEYS`) still reaches the world; once
 //!   `world_frame() >= 1`, the replay script takes over deterministically.
+//!
+//! If both are set, the recording must use a different file from the replay.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, ErrorKind, Write};
 use std::path::Path;
 use std::time::Instant;
 
@@ -221,20 +223,49 @@ struct Recorder {
 }
 
 impl Recorder {
-    fn create(path: &Path) -> Result<Self, String> {
+    fn create(path: &Path, replay_path: Option<&Path>) -> Result<Self, String> {
         victory_gpu::bench::ensure_outside_repo(path)?;
+        let same_input = "VICTORY_INPUT_RECORD points to the same file as VICTORY_INPUT_REPLAY";
+        if replay_path == Some(path) {
+            return Err(same_input.to_owned());
+        }
+        let replay_file = match replay_path.map(same_file::Handle::from_path).transpose() {
+            Ok(handle) => handle,
+            Err(err) if err.kind() == ErrorKind::NotFound => None,
+            Err(err) => {
+                return Err(format!(
+                    "cannot check the identity of VICTORY_INPUT_REPLAY: {err}"
+                ));
+            }
+        };
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("cannot create parent dir for {}: {e}", path.display()))?;
         }
+        let open_error = |err| format!("cannot open {} for input recording: {err}", path.display());
         let file = OpenOptions::new()
             .create(true)
             .write(true)
-            .truncate(true)
+            .truncate(replay_file.is_none())
             .open(path)
-            .map_err(|e| format!("cannot open {} for input recording: {e}", path.display()))?;
+            .map_err(open_error)?;
+        if let Some(replay_file) = replay_file {
+            // Compare the open files before truncating so aliases cannot erase the replay.
+            let recording_file =
+                same_file::Handle::from_file(file.try_clone().map_err(open_error)?)
+                    .map_err(open_error)?;
+            if recording_file == replay_file {
+                return Err(same_input.to_owned());
+            }
+            file.set_len(0).map_err(|err| {
+                format!(
+                    "cannot truncate {} for input recording: {err}",
+                    path.display()
+                )
+            })?;
+        }
         Ok(Self {
             writer: BufWriter::new(file),
             started: Instant::now(),
@@ -399,34 +430,42 @@ pub(crate) fn wrap(source: Box<dyn Source>) -> Box<dyn Source> {
         .map(|v| v.to_string_lossy().trim().to_owned())
         .filter(|s| !s.is_empty());
 
-    if replay_path.is_none() && record_path.is_none() {
-        return source;
-    }
+    wrap_with_paths(
+        source,
+        replay_path.as_deref().map(Path::new),
+        record_path.as_deref().map(Path::new),
+    )
+}
 
-    let replay = replay_path.and_then(|path| match std::fs::read(&path) {
+fn wrap_with_paths(
+    source: Box<dyn Source>,
+    replay_path: Option<&Path>,
+    record_path: Option<&Path>,
+) -> Box<dyn Source> {
+    let replay = replay_path.and_then(|path| match std::fs::read(path) {
         Ok(bytes) => match parse_replay(&bytes, victory_gpu::bench::register_input_script) {
             Ok((script, sha)) => {
-                tracing::info!(path, sha256 = %sha, "replaying scripted world-frame inputs");
+                tracing::info!(path = %path.display(), sha256 = %sha, "replaying scripted world-frame inputs");
                 Some(script)
             }
             Err(err) => {
-                tracing::error!(path, error = %err, "failed to parse VICTORY_INPUT_REPLAY");
+                tracing::error!(path = %path.display(), error = %err, "failed to parse VICTORY_INPUT_REPLAY");
                 None
             }
         },
         Err(err) => {
-            tracing::error!(path, error = %err, "failed to read VICTORY_INPUT_REPLAY");
+            tracing::error!(path = %path.display(), error = %err, "failed to read VICTORY_INPUT_REPLAY");
             None
         }
     });
 
-    let recorder = record_path.and_then(|path| match Recorder::create(Path::new(&path)) {
+    let recorder = record_path.and_then(|path| match Recorder::create(path, replay_path) {
         Ok(rec) => {
-            tracing::info!(path, "recording world-frame inputs");
+            tracing::info!(path = %path.display(), "recording world-frame inputs");
             Some(rec)
         }
         Err(err) => {
-            tracing::error!(path, error = %err, "failed to open VICTORY_INPUT_RECORD");
+            tracing::error!(path = %path.display(), error = %err, "failed to open VICTORY_INPUT_RECORD");
             None
         }
     });
@@ -748,6 +787,44 @@ mod tests {
         fn rumble(&mut self, _: usize, _: u16, _: u16) {}
     }
 
+    #[test]
+    fn recording_does_not_overwrite_the_replay_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let replay = dir.path().join("replay.jsonl");
+        let trace = br#"{"from":1,"to":2,"buttons":16}"#;
+        std::fs::write(&replay, trace).unwrap();
+        let source = Box::new(MockSource(Arc::default()));
+        drop(wrap_with_paths(source, Some(&replay), Some(&replay)));
+        assert_eq!(std::fs::read(&replay).unwrap(), trace);
+    }
+
+    #[test]
+    fn recording_does_not_overwrite_a_hard_link_to_a_rejected_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let replay = dir.path().join("replay.jsonl");
+        let record = dir.path().join("record.jsonl");
+        let trace = b"not a valid replay";
+        std::fs::write(&replay, trace).unwrap();
+        std::fs::hard_link(&replay, &record).unwrap();
+        let source = Box::new(MockSource(Arc::default()));
+        drop(wrap_with_paths(source, Some(&replay), Some(&record)));
+        assert_eq!(std::fs::read(&replay).unwrap(), trace);
+    }
+
+    #[test]
+    fn recording_can_overwrite_a_separate_output_file_while_replaying() {
+        let dir = tempfile::tempdir().unwrap();
+        let replay = dir.path().join("replay.jsonl");
+        let record = dir.path().join("record.jsonl");
+        let trace = br#"{"from":1,"to":2,"buttons":16}"#;
+        std::fs::write(&replay, trace).unwrap();
+        std::fs::write(&record, trace).unwrap();
+        let source = Box::new(MockSource(Arc::default()));
+        drop(wrap_with_paths(source, Some(&replay), Some(&record)));
+        assert_eq!(std::fs::read(&replay).unwrap(), trace);
+        assert!(std::fs::read(&record).unwrap().is_empty());
+    }
+
     static TEST_WFRAME: AtomicU64 = AtomicU64::new(0);
     fn test_world_frame() -> u64 {
         TEST_WFRAME.load(Ordering::Relaxed)
@@ -759,7 +836,7 @@ mod tests {
         let path = dir.path().join("trace.jsonl");
         let host = Arc::new(Mutex::new(MockHost::default()));
 
-        let rec = Recorder::create(&path).unwrap();
+        let rec = Recorder::create(&path, None).unwrap();
         let mut src = ScriptedSource::with_fn(
             Box::new(MockSource(Arc::clone(&host))),
             None,
@@ -858,7 +935,7 @@ mod tests {
 
         // Recording rejects paths inside any `.victory-root` repository tree.
         let inside = Path::new(env!("CARGO_MANIFEST_DIR")).join("input-trace.jsonl");
-        assert!(Recorder::create(&inside).is_err());
+        assert!(Recorder::create(&inside, None).is_err());
 
         // Multi-byte UTF-8 characters inside JSON strings decode without Latin-1 corruption.
         let utf8_script =

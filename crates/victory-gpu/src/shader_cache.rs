@@ -51,6 +51,13 @@ pub fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
+/// What tells one set of translations from another ([`build`]). The warming
+/// of host pipelines keeps it beside them, so that a change of the
+/// translator makes the warmed ones stale.
+pub(crate) fn translation() -> [u8; 32] {
+    *build()
+}
+
 /// What a translation depends on besides its container: the translator
 /// (`victory_shader::SOURCE_HASH`: its sources, manifest, the lock file and
 /// the compiler), the entry's encoding (this file's text) and the
@@ -136,6 +143,23 @@ fn atomic_umax() -> bool {
     static UMAX: OnceLock<bool> = OnceLock::new();
     *UMAX.get_or_init(|| {
         atomic_lock_rounds() && std::env::var("VICTORY_ATOMIC_UMAX").as_deref() == Ok("1")
+    })
+}
+
+/// Whether a compute or mesh program's glc-clear 64-bit min or max runs
+/// without its lock (`victory_shader::emit::Options::racy_minmax`):
+/// `VICTORY_ATOMIC_RACY=1`, opt-in. On an M1 Max the hair visibility pass
+/// (`CS_VisHair`) costs ~158 ms of a ~517 ms GPU frame (leaving the pass
+/// out), and without the locks the frame took ~29 ms less GPU
+/// (docs/m1-max.md, 2026-11-27). Only with [`atomic_locks`].
+fn racy_minmax() -> bool {
+    static RACY: OnceLock<bool> = OnceLock::new();
+    *RACY.get_or_init(|| {
+        let on = atomic_locks() && crate::switch::on("VICTORY_ATOMIC_RACY");
+        if on {
+            tracing::info!("VICTORY_ATOMIC_RACY=1: compute programs' 64-bit min/max without locks");
+        }
+        on
     })
 }
 
@@ -273,6 +297,7 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
     let narrow = options.narrow_waves;
     let rounds = locks && options.atomic_lock_rounds;
     let umax = rounds && options.atomic_umax;
+    let racy = locks && options.racy_minmax;
     let uav_level0 = options.uav_size_level0;
     let no_literal = options.host_wave32 && options.disable_literal_halves;
     // Only where programs run in halves does the rendezvous change them.
@@ -290,7 +315,7 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
     {
         return build();
     }
-    static BUILDS: [OnceLock<[u8; 32]>; 1024] = [const { OnceLock::new() }; 1024];
+    static BUILDS: [OnceLock<[u8; 32]>; 2048] = [const { OnceLock::new() }; 2048];
     let n = usize::from(locks)
         | usize::from(bias) << 1
         | usize::from(narrow) << 2
@@ -300,7 +325,8 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         | usize::from(uav_level0) << 6
         | usize::from(apart) << 7
         | usize::from(cap_barriers) << 8
-        | usize::from(limits) << 9;
+        | usize::from(limits) << 9
+        | usize::from(racy) << 10;
     BUILDS[n].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build());
@@ -312,6 +338,9 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         }
         if umax {
             h.update(b"atomic umax");
+        }
+        if racy {
+            h.update(b"racy minmax");
         }
         if bias {
             h.update(b"bias as gradients");
@@ -349,6 +378,7 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
         atomic_locks: atomic_locks(),
         atomic_lock_rounds: atomic_lock_rounds(),
         atomic_umax: atomic_umax(),
+        racy_minmax: racy_minmax(),
         bias_as_gradients: bias_as_gradients(),
         host_wave32: host_wave32(),
         narrow_waves: narrow_waves(),
